@@ -1,0 +1,12 @@
+{
+  "reserve_hbm_bytes": 1073741824,
+  "prefill_tokens_per_ms": 80.0,
+  "pcie_bandwidth_gbps": 24.0,
+  "transfer_overhead_ms": 0.08,
+  "decode_protection_ms": 80.0,
+  "prefetch_slack_ms": 25.0,
+  "offload_min_benefit_ms": 2.0,
+  "default_reuse_probability": 0.05,
+  "min_branch_probability": 0.03,
+  "high_hbm_pressure": 0.82
+}
