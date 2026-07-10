@@ -24,8 +24,8 @@ For development tools:
 
 ```bash
 cd /home/longhao/experiment/BeliefKV
-conda env create -f environment-dev.yml
-conda activate beliefkv-dev
+conda activate beliefkv
+python -m pip install -e ".[dev]"
 python -m unittest discover -s tests
 ```
 
@@ -33,12 +33,6 @@ If the environment already exists:
 
 ```bash
 conda env update -f environment.yml --prune
-```
-
-or:
-
-```bash
-conda env update -f environment-dev.yml --prune
 ```
 
 ## Runtime Environment
@@ -49,7 +43,7 @@ are involved.
 
 Recommended workflow:
 
-1. Keep `beliefkv` or `beliefkv-dev` for policy development and replay tools.
+1. Keep `beliefkv` for policy development and replay tools.
 2. Use a separate runtime conda environment for SGLang 0.5.2rc1 and model
    serving.
 3. Install BeliefKV editable into that runtime environment:

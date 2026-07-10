@@ -43,7 +43,6 @@ tests/         unit tests for policy and trace logic
 experiments/   raw traces, normalized traces, and result tables
 third_party/   optional local runtime checkouts, ignored by git
 environment.yml      lightweight conda environment
-environment-dev.yml  development conda environment
 ```
 
 ## Setup
@@ -87,16 +86,3 @@ keeps algorithm experiments testable without starting a model server.
 4. Add ablation switches for belief prediction, migration-cost awareness,
    workflow fairness, and decode protection.
 5. Keep a separate branch for later portability testing on newer SGLang.
-
-## Git Plan
-
-This directory is ready to become a standalone git repository:
-
-```bash
-cd /home/longhao/experiment/BeliefKV
-git init
-git add .
-git commit -m "Initialize BeliefKV system scaffold"
-```
-
-Do this after the initial scaffold is reviewed.
