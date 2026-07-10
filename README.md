@@ -42,15 +42,16 @@ scripts/       local helper scripts
 tests/         unit tests for policy and trace logic
 experiments/   raw traces, normalized traces, and result tables
 third_party/   optional local runtime checkouts, ignored by git
+environment.yml      lightweight conda environment
+environment-dev.yml  development conda environment
 ```
 
 ## Setup
 
 ```bash
 cd /home/longhao/experiment/BeliefKV
-conda create -n beliefkv python=3.10 -y
+conda env create -f environment.yml
 conda activate beliefkv
-python -m pip install -e .
 python -m unittest discover -s tests
 ```
 
@@ -59,6 +60,8 @@ Run the standalone planner example:
 ```bash
 python -m beliefkv.cli plan examples/simple_snapshot.json
 ```
+
+For detailed environment choices, see [docs/setup.md](docs/setup.md).
 
 ## Runtime Baseline
 

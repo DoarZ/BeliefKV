@@ -1,0 +1,10 @@
+name: beliefkv-dev
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - setuptools>=61.0
+  - wheel
+  - pip:
+      - -e .[dev]
