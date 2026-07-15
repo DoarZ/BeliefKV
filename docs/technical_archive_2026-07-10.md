@@ -1,5 +1,12 @@
 # BeliefKV Technical Archive
 
+> Historical note: this archive records the design as of 2026-07-10 and is no
+> longer the current specification. See
+> [`beliefkv_design_2026-07-14_zh.md`](beliefkv_design_2026-07-14_zh.md) for the
+> current Chinese design covering the runtime causal graph, Radix ownership
+> bridge, reactive policy, remaining-time predictor, and Prepare-Commit KV
+> migration.
+
 Date: 2026-07-10
 
 This document archives the design decisions, module boundaries, and technical

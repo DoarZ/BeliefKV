@@ -1,0 +1,87 @@
+digraph BeliefKVPhaseStatus {
+  graph [
+    rankdir=TB,
+    newrank=true,
+    splines=ortho,
+    nodesep=0.34,
+    ranksep=0.54,
+    pad=0.25,
+    bgcolor="#FFFFFF",
+    fontname="Noto Sans CJK SC",
+    fontsize=20,
+    fontcolor="#17212B",
+    labelloc=t,
+    label="宏观系统设计 Phase 0-6 与当前实现成熟度"
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Noto Sans CJK SC",
+    fontsize=11,
+    margin="0.16,0.12",
+    width=2.75,
+    penwidth=1.5,
+    fontcolor="#17212B"
+  ];
+  edge [color="#65727E", penwidth=1.4, arrowsize=0.7];
+
+  phase0 [
+    label="Phase 0  Trace + Simulator\n\n完成\n事件 schema / RCCG reducer\nnormalizer + strict validator\n确定性 page simulator",
+    fillcolor="#E5F4EA",
+    color="#2D7A4B"
+  ];
+  phase1 [
+    label="Phase 1  Reactive Baseline\n\n代码完成，退出条件未满足\nresidency / causal frontier\nreactive D2H/H2D / admission / fairness\n缺：并发 replay + offline oracle gap",
+    fillcolor="#FFF3D6",
+    color="#A66A00"
+  ];
+  phase2 [
+    label="Phase 2  Metadata + Ownership\n\n机制完成\nidentity 传播 / ownership mirror\ngeneration / shared charge / locks\n精确版本 patch + CUDA metadata smoke",
+    fillcolor="#E5F4EA",
+    color="#2D7A4B"
+  ];
+  phase3 [
+    label="Phase 3  HiCache Migration\n\n部分完成\ncommand backend / ACK / closure\nfake HiCache 故障路径已测\n缺：真实 GPU pressure / OOM / host exhaustion",
+    fillcolor="#FFF3D6",
+    color="#A66A00"
+  ];
+  phase4 [
+    label="Phase 4  Prepare-Commit Shadow\n\n部分完成\nDUAL_CLEAN / urgent-shadow queue\n干扰反馈 API / cancel semantics\n缺：真实 telemetry + 可控 node 内分块 + 收益验证",
+    fillcolor="#FFF3D6",
+    color="#A66A00"
+  ];
+  phase5 [
+    label="Phase 5  Remaining-Time Predictor\n\n部分完成\nsurvival / context tree / service cost\nartifact / OOD / online calibration\n缺：跨 workload 训练、校准、regret 与开销实验",
+    fillcolor="#FFF3D6",
+    color="#A66A00"
+  ];
+  phase6 [
+    label="Phase 6  Top-tier Evaluation\n\n起步\nmini-SWE-agent + 官方 evaluator\n单 workflow 固定 trace 已验证\n缺：并发 baseline / oracle / 压力与干扰实验",
+    fillcolor="#FFF3D6",
+    color="#A66A00"
+  ];
+
+  { rank=same; phase0; phase1; phase2; phase3; }
+  { rank=same; phase4; phase5; phase6; }
+  phase0 -> phase1 -> phase2 -> phase3;
+  phase3 -> phase4;
+  phase4 -> phase5 -> phase6;
+
+  evidence [
+    label="当前可声称的证据\n完整单元/回归测试\npatch contract + wheel\nQwen2.5-7B SWE-bench 机制 pilot\n36-event fixed trace 可重放",
+    fillcolor="#E8F0FA",
+    color="#34699A",
+    width=3.0
+  ];
+  claim_boundary [
+    label="当前不能声称\n真实 workload 性能收益\n高 HBM pressure 下稳定性\n跨 workload predictor 泛化\nOSDI 级 baseline superiority",
+    fillcolor="#FDE7E9",
+    color="#B23A48",
+    width=3.0
+  ];
+
+  { rank=same; evidence; claim_boundary; }
+  phase2 -> evidence [style=dotted, color="#34699A"];
+  phase6 -> claim_boundary [style=dashed, color="#B23A48"];
+}

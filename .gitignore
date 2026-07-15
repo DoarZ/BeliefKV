@@ -20,3 +20,10 @@ experiments/results/*
 
 third_party/*
 !third_party/README.md
+
+# Local benchmark data and immutable run artifacts are kept outside git.
+workloads/raw/*
+workloads/frozen/*
+workloads/runtime/*
+!workloads/raw/.gitkeep
+!workloads/frozen/.gitkeep

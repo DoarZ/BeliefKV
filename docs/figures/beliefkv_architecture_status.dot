@@ -1,0 +1,211 @@
+digraph BeliefKVArchitectureStatus {
+  graph [
+    rankdir=TB,
+    newrank=true,
+    compound=true,
+    splines=polyline,
+    nodesep=0.30,
+    ranksep=0.50,
+    pad=0.25,
+    bgcolor="#FFFFFF",
+    fontname="Noto Sans CJK SC",
+    fontsize=20,
+    fontcolor="#17212B",
+    labelloc=t,
+    label="BeliefKV 当前架构与实现状态（2026-07-15）"
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Noto Sans CJK SC",
+    fontsize=11,
+    margin="0.13,0.09",
+    penwidth=1.4,
+    color="#52606D",
+    fillcolor="#FFFFFF",
+    fontcolor="#17212B"
+  ];
+
+  edge [
+    fontname="Noto Sans CJK SC",
+    fontsize=9,
+    color="#52606D",
+    fontcolor="#3C4855",
+    penwidth=1.25,
+    arrowsize=0.7
+  ];
+
+  subgraph cluster_sources {
+    label="A. 工作负载与运行时事件源";
+    color="#AAB4BF";
+    penwidth=1.1;
+    style="rounded";
+    margin=14;
+
+    agent_hooks [
+      label="Agent Framework Hooks\nmini-SWE-agent adapter + Unix event channel 已验证\n其他 subagent / peer framework adapter 缺失",
+      fillcolor="#FFF3D6",
+      color="#A66A00"
+    ];
+    request_metadata [
+      label="SGLang Request Metadata\nworkflow / invocation / context / parent\n已完成真实 root + spawn smoke",
+      fillcolor="#E5F4EA",
+      color="#2D7A4B"
+    ];
+    trace_source [
+      label="ClawTrace / Runtime Trace\nnormalizer + strict validator + replay 已实现\nSWE-bench fixed trace 已通过，跨 workload 覆盖不足",
+      fillcolor="#FFF3D6",
+      color="#A66A00"
+    ];
+
+    { rank=same; agent_hooks; request_metadata; trace_source; }
+  }
+
+  subgraph cluster_control {
+    label="B. BeliefKV 逻辑控制面（BeliefKV 拥有）";
+    color="#7C8B99";
+    penwidth=1.2;
+    style="rounded";
+    margin=16;
+
+    event_protocol [
+      label="事件协议与批处理\n校验 identity / epoch / 幂等",
+      fillcolor="#E5F4EA",
+      color="#2D7A4B"
+    ];
+    rccg [
+      label="Runtime Causal Context Graph\nCALL / SPAWN / JOIN / MESSAGE / TOOL\n增量、原子、允许 peer cycle",
+      fillcolor="#E5F4EA",
+      color="#2D7A4B",
+      penwidth=2.0
+    ];
+    predictor [
+      label="Remaining-Time Predictor\nKaplan-Meier + semi-Markov context tree\nservice cost / OOD / calibration\n算法与训练代码已有，跨 workload 验证缺失",
+      fillcolor="#FFF3D6",
+      color="#A66A00"
+    ];
+    frontier [
+      label="Causal Frontier + Residency\nPINNED / IMMINENT / PARKED / DEAD\nblocking chain / join / message working set",
+      fillcolor="#E5F4EA",
+      color="#2D7A4B"
+    ];
+    admission [
+      label="Workflow Admission + Memory Fairness\n按 root workflow 准入与物理 HBM charge\n等待真实释放 ACK",
+      fillcolor="#E5F4EA",
+      color="#2D7A4B"
+    ];
+    queue_scheduler [
+      label="两级请求调度（部分）\ntagged waiting queue: workflow + frontier\n运行中 decode 时间片 / agent-native SLO 未实现",
+      fillcolor="#FFF3D6",
+      color="#A66A00"
+    ];
+    reactive [
+      label="Reactive Transfer Planner\npressure D2H / clean COMMIT / imminent H2D\n无预测安全基线",
+      fillcolor="#E5F4EA",
+      color="#2D7A4B"
+    ];
+    shadow [
+      label="Prepare-Commit Shadow Controller\nGPU_ONLY -> DUAL_CLEAN -> CPU_ONLY\n策略与反馈 API 已有，真实干扰闭环未接通",
+      fillcolor="#FFF3D6",
+      color="#A66A00"
+    ];
+    audit [
+      label="Runtime Audit + Metrics\nrun-scoped JSONL / hash-locked artifact / replay check\n不记录 prompt 与 command 内容",
+      fillcolor="#E5F4EA",
+      color="#2D7A4B"
+    ];
+
+    { rank=same; predictor; frontier; }
+    { rank=same; admission; queue_scheduler; }
+    { rank=same; reactive; shadow; audit; }
+  }
+
+  subgraph cluster_bridge {
+    label="C. SGLang 物理桥接（共同维护一致性）";
+    color="#7C8B99";
+    penwidth=1.2;
+    style="rounded";
+    margin=16;
+
+    ownership [
+      label="PageOwnershipIndex + Radix Mirror\ncontext <-> node extent，多 owner 物理计费\nallocation generation / engine + semantic lock",
+      fillcolor="#E5F4EA",
+      color="#2D7A4B"
+    ];
+    arbiter [
+      label="Radix Arbiter + Command Queue\nshared-owner 保护 / stale reject\nD2H leaf closure / H2D ancestor closure",
+      fillcolor="#E5F4EA",
+      color="#2D7A4B"
+    ];
+    sglang_patch [
+      label="SGLang 0.5.2rc1 窄补丁\nmetadata / admission / abort / safe point\nobserver / queue reorder / HiCache backend",
+      fillcolor="#E5F4EA",
+      color="#2D7A4B",
+      penwidth=2.0
+    ];
+    telemetry_gap [
+      label="真实资源 Telemetry\nPCIe utilization / GPU compute / slowdown\n尚未接入 controller.update_signals()",
+      fillcolor="#FDE7E9",
+      color="#B23A48"
+    ];
+
+    { rank=same; ownership; arbiter; }
+    { rank=same; sglang_patch; telemetry_gap; }
+  }
+
+  subgraph cluster_engine {
+    label="D. Serving 与物理数据面（SGLang / 硬件拥有）";
+    color="#AAB4BF";
+    penwidth=1.1;
+    style="rounded";
+    margin=14;
+
+    sglang [
+      label="SGLang Scheduler + RadixCache + HiCache\nallocator / tensor location / lock / DMA 的唯一真相源",
+      fillcolor="#E8F0FA",
+      color="#34699A"
+    ];
+    hardware [
+      label="单 GPU HBM  <--- PCIe --->  CPU DRAM\nQwen2.5-7B SWE-bench 机制 pilot 已通过\n并发高压力与长时间迁移未验证",
+      fillcolor="#FFF3D6",
+      color="#A66A00"
+    ];
+  }
+
+  agent_hooks -> event_protocol [label="RuntimeEvent"];
+  trace_source -> event_protocol [label="normalize / replay"];
+  request_metadata -> event_protocol [label="patched request path"];
+  event_protocol -> rccg;
+  rccg -> predictor [label="state / history"];
+  rccg -> frontier [label="causal state"];
+  predictor -> reactive [label="optional ranking", style=dashed];
+  predictor -> shadow [label="resume distribution", style=dashed];
+  frontier -> admission;
+  frontier -> queue_scheduler;
+  frontier -> reactive;
+  frontier -> shadow;
+  ownership -> frontier [label="physical residency", constraint=false];
+  ownership -> admission [label="marginal bytes", constraint=false];
+  admission -> sglang_patch [label="admit / defer"];
+  queue_scheduler -> sglang_patch [label="tagged reorder"];
+  reactive -> arbiter [label="urgent intent"];
+  shadow -> arbiter [label="prepare intent"];
+  arbiter -> sglang_patch [label="resolved command"];
+  sglang_patch -> sglang [label="scheduler safe point"];
+  sglang -> hardware [label="allocate / prefill / decode / DMA"];
+  sglang -> ownership [label="Radix + HiCache observer", color="#2D7A4B", constraint=false];
+  sglang_patch -> arbiter [label="ACK / actual bytes", color="#2D7A4B", style=dashed, constraint=false];
+  hardware -> telemetry_gap [label="需要采样", color="#B23A48", style=dashed, constraint=false];
+  telemetry_gap -> shadow [label="缺失反馈", color="#B23A48", style=dashed, constraint=false];
+  event_protocol -> audit [style=dotted, arrowhead=none, constraint=false];
+  sglang_patch -> audit [style=dotted, arrowhead=none, constraint=false];
+
+  legend [
+    label="图例：绿色 = 已实现并通过机制测试    黄色 = 代码存在但真实信号/验证不足    红色 = 尚未接入    蓝色 = SGLang 外部真相源",
+    fillcolor="#F7F9FB",
+    color="#7C8B99",
+    fontsize=10
+  ];
+  hardware -> legend [style=invis, weight=20];
+}

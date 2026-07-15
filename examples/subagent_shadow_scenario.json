@@ -1,0 +1,114 @@
+{
+  "name": "subagent-shadow-pressure",
+  "seed": 0,
+  "config": {
+    "hbm_capacity_bytes": 1073741824,
+    "host_capacity_bytes": 4294967296,
+    "reserve_hbm_bytes": 268435456,
+    "pcie_bandwidth_gbps": 24.0,
+    "transfer_overhead_ms": 0.08,
+    "urgent_chunk_bytes": 536870912,
+    "shadow_chunk_bytes": 536870912,
+    "shadow_min_parked_ms": 0.0,
+    "shadow_slowdown_budget": 0.02,
+    "planning_interval_ms": 5.0,
+    "kv_bytes_per_token": 57344,
+    "predictor_enabled": false,
+    "shadow_enabled": true
+  },
+  "metadata": {
+    "description": "Parent waits on a tool, creates a CPU shadow, then admission pressure commits it."
+  },
+  "events": [
+    {
+      "ts_ms": 0.0,
+      "kind": "runtime",
+      "event": {
+        "event_id": "workflow-start",
+        "ts_ms": 0.0,
+        "kind": "workflow_start",
+        "workflow_id": "wf-1"
+      }
+    },
+    {
+      "ts_ms": 1.0,
+      "kind": "runtime",
+      "event": {
+        "event_id": "parent-create",
+        "ts_ms": 1.0,
+        "kind": "invocation_create",
+        "workflow_id": "wf-1",
+        "invocation_id": "parent",
+        "context_id": "ctx-parent",
+        "context_epoch": 0,
+        "agent_definition_id": "researcher",
+        "agent_instance_id": "researcher-1"
+      }
+    },
+    {
+      "ts_ms": 2.0,
+      "kind": "runtime",
+      "event": {
+        "event_id": "tool-start",
+        "ts_ms": 2.0,
+        "kind": "tool_start",
+        "workflow_id": "wf-1",
+        "invocation_id": "parent",
+        "tool_family": "search"
+      }
+    },
+    {
+      "ts_ms": 3.0,
+      "kind": "cache_insert",
+      "page_id": 1,
+      "generation": 0,
+      "size_bytes": 536870912,
+      "radix_depth": 1,
+      "bindings": [
+        {
+          "context_id": "ctx-parent",
+          "context_epoch": 0
+        }
+      ]
+    },
+    {
+      "ts_ms": 100.0,
+      "kind": "request_submit",
+      "request_id": "child-request",
+      "workflow_id": "wf-1",
+      "invocation_id": "parent",
+      "context_id": "ctx-parent",
+      "context_epoch": 0,
+      "submitted_ts_ms": 100.0,
+      "uncached_prompt_tokens": 4096,
+      "expected_output_tokens": 2048,
+      "kv_bytes_per_token": 57344
+    },
+    {
+      "ts_ms": 140.0,
+      "kind": "admission_ack",
+      "request_id": "child-request"
+    },
+    {
+      "ts_ms": 500.0,
+      "kind": "runtime",
+      "event": {
+        "event_id": "tool-end",
+        "ts_ms": 500.0,
+        "kind": "tool_end",
+        "workflow_id": "wf-1",
+        "invocation_id": "parent"
+      }
+    },
+    {
+      "ts_ms": 600.0,
+      "kind": "runtime",
+      "event": {
+        "event_id": "workflow-end",
+        "ts_ms": 600.0,
+        "kind": "workflow_end",
+        "workflow_id": "wf-1"
+      }
+    }
+  ]
+}

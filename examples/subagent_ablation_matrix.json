@@ -1,0 +1,32 @@
+{
+  "name": "subagent-ablation",
+  "scenarios": [
+    "subagent_shadow_scenario.json"
+  ],
+  "variants": [
+    {
+      "name": "reactive",
+      "config": {
+        "predictor_enabled": false,
+        "shadow_enabled": false
+      }
+    },
+    {
+      "name": "heuristic-shadow",
+      "config": {
+        "predictor_enabled": false,
+        "shadow_enabled": true
+      }
+    },
+    {
+      "name": "beliefkv-full",
+      "config": {
+        "predictor_enabled": true,
+        "shadow_enabled": true
+      }
+    }
+  ],
+  "metadata": {
+    "purpose": "deterministic control-plane smoke ablation; not a paper result"
+  }
+}

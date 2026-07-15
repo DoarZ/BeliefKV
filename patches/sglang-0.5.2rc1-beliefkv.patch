@@ -1,0 +1,505 @@
+diff --git a/python/sglang/srt/entrypoints/openai/protocol.py b/python/sglang/srt/entrypoints/openai/protocol.py
+index 3a53dff..a4852ee 100644
+--- a/python/sglang/srt/entrypoints/openai/protocol.py
++++ b/python/sglang/srt/entrypoints/openai/protocol.py
+@@ -437,6 +437,8 @@ class ChatCompletionRequest(BaseModel):
+     temperature: float = 0.7
+     top_p: float = 1.0
+     user: Optional[str] = None
++    # Non-standard request extension used only by the optional BeliefKV runtime.
++    beliefkv_metadata: Optional[Dict[str, Any]] = None
+     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
+         default="auto", examples=["none"]
+diff --git a/python/sglang/srt/entrypoints/openai/serving_chat.py b/python/sglang/srt/entrypoints/openai/serving_chat.py
+index 4043203..2259b00 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -140,6 +140,7 @@ class OpenAIServingChat(OpenAIServingBase):
+             bootstrap_room=request.bootstrap_room,
+             return_hidden_states=request.return_hidden_states,
+             rid=request.rid,
++            beliefkv_metadata=request.beliefkv_metadata,
+         )
+ 
+         return adapted_request, request
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 1a99e0b..b8b4991 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -128,6 +128,10 @@ class GenerateReqInput:
+     # For background responses (OpenAI responses API)
+     background: bool = False
+ 
++    # Optional BeliefKV causal identity. Requests without this field retain
++    # upstream scheduling behavior.
++    beliefkv_metadata: Optional[Union[List[Dict], Dict]] = None
++
+     def contains_mm_input(self) -> bool:
+         return (
+             has_valid_data(self.image_data)
+@@ -258,6 +262,7 @@ class GenerateReqInput:
+         self._normalize_sampling_params(num)
+         self._normalize_logprob_params(num)
+         self._normalize_custom_logit_processor(num)
++        self._normalize_beliefkv_metadata(num)
+ 
+     def _expand_inputs(self, num):
+         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
+@@ -421,6 +426,22 @@ class GenerateReqInput:
+                 "Cannot use list custom_logit_processor with parallel_sample_num > 1"
+             )
+ 
++    def _normalize_beliefkv_metadata(self, num):
++        if self.beliefkv_metadata is None:
++            self.beliefkv_metadata = [None] * num
++        elif isinstance(self.beliefkv_metadata, dict):
++            self.beliefkv_metadata = [self.beliefkv_metadata] * num
++        elif isinstance(self.beliefkv_metadata, list):
++            if len(self.beliefkv_metadata) != self.batch_size:
++                raise ValueError(
++                    "beliefkv_metadata length must match the request batch size"
++                )
++            self.beliefkv_metadata = (
++                self.beliefkv_metadata * self.parallel_sample_num
++            )
++        else:
++            raise ValueError("beliefkv_metadata must be a dict or list of dicts")
++
+     def _validate_session_params(self):
+         """Validate that session parameters are properly formatted."""
+         if self.session_params is not None:
+@@ -479,6 +500,11 @@ class GenerateReqInput:
+             data_parallel_rank=(
+                 self.data_parallel_rank if self.data_parallel_rank is not None else None
+             ),
++            beliefkv_metadata=(
++                self.beliefkv_metadata[i]
++                if isinstance(self.beliefkv_metadata, list)
++                else self.beliefkv_metadata
++            ),
+         )
+ 
+ 
+@@ -532,6 +558,9 @@ class TokenizedGenerateReqInput:
+     # For dp balance
+     dp_balance_id: int = -1
+ 
++    # Optional BeliefKV causal identity propagated without interpretation.
++    beliefkv_metadata: Optional[Dict] = None
++
+ 
+ @dataclass
+ class BatchTokenizedGenerateReqInput:
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index a35ba02..ed1bcfc 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -434,6 +434,7 @@ class Req:
+         bootstrap_room: Optional[int] = None,
+         data_parallel_rank: Optional[int] = None,
+         vocab_size: Optional[int] = None,
++        beliefkv_metadata: Optional[dict] = None,
+     ):
+         # Input and output info
+         self.rid = rid
+@@ -484,6 +485,7 @@ class Req:
+         self.stream = stream
+         self.eos_token_ids = eos_token_ids
+         self.vocab_size = vocab_size
++        self.beliefkv_metadata = beliefkv_metadata
+ 
+         # For incremental decoding
+         # ----- | --------- read_ids -------|
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index af24f94..339da89 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -554,6 +554,14 @@ class Scheduler(
+ 
+         self.recv_dp_balance_id_this_term = []
+ 
++        self.beliefkv_runtime = None
++        if server_args.enable_beliefkv:
++            from beliefkv.runtime.sglang_v052rc1 import EmbeddedSGLangRuntime
++
++            self.beliefkv_runtime = EmbeddedSGLangRuntime(
++                self, config_path=server_args.beliefkv_config
++            )
++
+     def init_tokenizer(self):
+         server_args = self.server_args
+         self.is_generation = self.model_config.is_generation
+@@ -1167,6 +1175,7 @@ class Scheduler(
+                 bootstrap_room=recv_req.bootstrap_room,
+                 data_parallel_rank=recv_req.data_parallel_rank,
+                 vocab_size=self.model_config.vocab_size,
++                beliefkv_metadata=recv_req.beliefkv_metadata,
+             )
+             req.tokenizer = self.tokenizer
+ 
+@@ -1299,6 +1308,13 @@ class Scheduler(
+             self.handle_generate_request(tokenized_req)
+ 
+     def _add_request_to_queue(self, req: Req):
++        if self.beliefkv_runtime is not None and self.beliefkv_runtime.defer_request(
++            req
++        ):
++            return
++        self._add_admitted_beliefkv_request(req)
++
++    def _add_admitted_beliefkv_request(self, req: Req):
+         req.queue_time_start = time.perf_counter()
+         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+             self._prefetch_kvcache(req)
+@@ -1513,6 +1529,9 @@ class Scheduler(
+         )
+ 
+     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
++        if self.beliefkv_runtime is not None:
++            self.beliefkv_runtime.scheduler_step()
++
+         # Merge the prefill batch into the running batch
+         chunked_req_to_exclude = set()
+         if self.chunked_req:
+@@ -1575,6 +1594,8 @@ class Scheduler(
+                 self.handle_dp_balance_data(ret)
+             ret = self.prepare_mlp_sync_batch(ret)
+ 
++        if self.beliefkv_runtime is not None:
++            self.beliefkv_runtime.on_batch_selected(ret)
+         return ret
+ 
+     def get_num_allocatable_reqs(self, running_bs):
+@@ -1609,6 +1630,8 @@ class Scheduler(
+ 
+         # Get priority queue
+         self.policy.calc_priority(self.waiting_queue)
++        if self.beliefkv_runtime is not None:
++            self.beliefkv_runtime.reorder_waiting_queue(self.waiting_queue)
+ 
+         # Prefill policy
+         adder = PrefillAdder(
+@@ -2391,6 +2414,9 @@ class Scheduler(
+         return RpcReqOutput(success, "" if not exec else str(exec))
+ 
+     def abort_request(self, recv_req: AbortReq):
++        if self.beliefkv_runtime is not None:
++            self.beliefkv_runtime.on_abort_request(recv_req)
++
+         # Delete requests in the waiting queue
+         to_del = []
+         for i, req in enumerate(self.waiting_queue):
+@@ -2645,6 +2671,7 @@ def run_scheduler_process(
+         set_gpu_proc_affinity(server_args.tp_size, server_args.nnodes, gpu_id)
+ 
+     # Create a scheduler and run the event loop
++    scheduler = None
+     try:
+         scheduler = Scheduler(
+             server_args,
+@@ -2691,3 +2718,11 @@ def run_scheduler_process(
+         traceback = get_exception_traceback()
+         logger.error(f"Scheduler hit an exception: {traceback}")
+         parent_process.send_signal(signal.SIGQUIT)
++    finally:
++        beliefkv_runtime = (
++            getattr(scheduler, "beliefkv_runtime", None)
++            if scheduler is not None
++            else None
++        )
++        if beliefkv_runtime is not None:
++            beliefkv_runtime.close()
+diff --git a/python/sglang/srt/managers/session_controller.py b/python/sglang/srt/managers/session_controller.py
+index 5f041be..e73f292 100644
+--- a/python/sglang/srt/managers/session_controller.py
++++ b/python/sglang/srt/managers/session_controller.py
+@@ -144,6 +144,7 @@ class Session:
+             return_logprob=req.return_logprob,
+             top_logprobs_num=req.top_logprobs_num,
+             token_ids_logprob=req.token_ids_logprob,
++            beliefkv_metadata=req.beliefkv_metadata,
+         )
+         if last_req is not None:
+             new_req.multimodal_inputs = last_req.multimodal_inputs
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 53c6a80..84a1dfd 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -731,6 +731,7 @@ class TokenizerManager:
+                 custom_logit_processor=obj.custom_logit_processor,
+                 return_hidden_states=obj.return_hidden_states,
+                 data_parallel_rank=obj.data_parallel_rank,
++                beliefkv_metadata=obj.beliefkv_metadata,
+             )
+         elif isinstance(obj, EmbeddingReqInput):
+             tokenized_obj = TokenizedEmbeddingReqInput(
+diff --git a/python/sglang/srt/mem_cache/hiradix_cache.py b/python/sglang/srt/mem_cache/hiradix_cache.py
+index ff45646..4367e26 100644
+--- a/python/sglang/srt/mem_cache/hiradix_cache.py
++++ b/python/sglang/srt/mem_cache/hiradix_cache.py
+@@ -146,6 +146,7 @@ class HiRadixCache(RadixCache):
+             node.host_value = host_indices
+             assert len(node.host_value) > 0
+             self.ongoing_write_through[node.id] = node
++            self._beliefkv_notify("on_radix_mutation")
+             if not write_back:
+                 # no need to lock nodes if write back
+                 self.inc_lock_ref(node)
+@@ -175,9 +176,12 @@ class HiRadixCache(RadixCache):
+     def writing_check(self, write_back=False):
+         if write_back:
+             # blocking till all write back complete
++            changed = len(self.ongoing_write_through) > 0
+             while len(self.ongoing_write_through) > 0:
+                 ack_id = self.cache_controller.ack_write_queue.get()
+                 del self.ongoing_write_through[ack_id]
++            if changed:
++                self._beliefkv_notify("on_radix_mutation")
+             return
+         queue_size = torch.tensor(
+             self.cache_controller.ack_write_queue.qsize(), dtype=torch.int
+@@ -196,8 +200,11 @@ class HiRadixCache(RadixCache):
+             del self.ongoing_write_through[ack_id]
+             if self.enable_storage:
+                 self.write_backup_storage(backuped_node)
++        if queue_size.item() > 0:
++            self._beliefkv_notify("on_radix_mutation")
+ 
+     def loading_check(self):
++        changed = False
+         while not self.cache_controller.ack_load_queue.empty():
+             try:
+                 ack_id = self.cache_controller.ack_load_queue.get_nowait()
+@@ -209,8 +216,11 @@ class HiRadixCache(RadixCache):
+                     end_node = end_node.parent
+                 # clear the reference
+                 del self.ongoing_load_back[ack_id]
++                changed = True
+             except Exception:
+                 break
++        if changed:
++            self._beliefkv_notify("on_radix_mutation")
+ 
+     def evictable_size(self):
+         return self.evictable_size_
+@@ -258,6 +268,7 @@ class HiRadixCache(RadixCache):
+         assert num_evicted > 0
+         self.evictable_size_ -= num_evicted
+         node.value = None
++        self._beliefkv_notify("on_radix_mutation")
+         return num_evicted
+ 
+     def _evict_regular(self, node: TreeNode):
+@@ -293,6 +304,8 @@ class HiRadixCache(RadixCache):
+ 
+             if len(x.parent.children) == 0 and x.parent.evicted:
+                 heapq.heappush(leaves, x.parent)
++        if num_evicted > 0:
++            self._beliefkv_notify("on_radix_mutation")
+ 
+     def load_back(
+         self, node: TreeNode, mem_quota: Optional[int] = None
+@@ -343,6 +356,7 @@ class HiRadixCache(RadixCache):
+             node.loading = True
+         self.evictable_size_ += len(device_indices)
+         self.inc_lock_ref(last_hit_node)
++        self._beliefkv_notify("on_radix_mutation")
+ 
+         return device_indices
+ 
+@@ -622,6 +636,7 @@ class HiRadixCache(RadixCache):
+             new_node.host_value = host_value
+             new_node.hash_value = hash_value
+             node.children[child_key] = new_node
++            self._beliefkv_notify("on_radix_mutation")
+         return matched_length
+ 
+     def _match_prefix_helper(self, node: TreeNode, key: List):
+@@ -676,6 +691,7 @@ class HiRadixCache(RadixCache):
+         child.parent = new_node
+         child.key = child.key[split_len:]
+         new_node.parent.children[self.get_child_key_fn(key)] = new_node
++        self._beliefkv_notify("on_radix_mutation")
+         return new_node
+ 
+     def insert(self, key: List, value, chunked=False):
+@@ -683,6 +699,7 @@ class HiRadixCache(RadixCache):
+             return 0
+ 
+         node = self.root_node
++        mutated = False
+         child_key = self.get_child_key_fn(key)
+         total_prefix_length = 0
+ 
+@@ -698,6 +715,7 @@ class HiRadixCache(RadixCache):
+                     node.value = value[:prefix_len]
+                     self.token_to_kv_pool_host.update_synced(node.host_value)
+                     self.evictable_size_ += len(node.value)
++                    mutated = True
+                 else:
+                     self._inc_hit_count(node, chunked)
+                     total_prefix_length += prefix_len
+@@ -708,6 +726,7 @@ class HiRadixCache(RadixCache):
+                     new_node.value = value[:prefix_len]
+                     self.token_to_kv_pool_host.update_synced(new_node.host_value)
+                     self.evictable_size_ += len(new_node.value)
++                    mutated = True
+                 else:
+                     self._inc_hit_count(new_node, chunked)
+                     total_prefix_length += prefix_len
+@@ -726,6 +745,7 @@ class HiRadixCache(RadixCache):
+             new_node.value = value
+             node.children[child_key] = new_node
+             self.evictable_size_ += len(value)
++            mutated = True
+ 
+             if self.enable_storage:
+                 last_hash = node.get_last_hash_value()
+@@ -744,6 +764,8 @@ class HiRadixCache(RadixCache):
+ 
+             if self.cache_controller.write_policy != "write_back":
+                 self._inc_hit_count(new_node, chunked)
++        if mutated:
++            self._beliefkv_notify("on_radix_mutation")
+         return total_prefix_length
+ 
+     def _collect_leaves_device(self):
+diff --git a/python/sglang/srt/mem_cache/radix_cache.py b/python/sglang/srt/mem_cache/radix_cache.py
+index b0cf0bb..0893ba0 100644
+--- a/python/sglang/srt/mem_cache/radix_cache.py
++++ b/python/sglang/srt/mem_cache/radix_cache.py
+@@ -156,6 +156,15 @@ class RadixCache(BasePrefixCache):
+         self.evictable_size_ = 0
+         self.protected_size_ = 0
+         self._record_all_cleared_event()
++        observer = getattr(self, "beliefkv_observer", None)
++        if observer is not None:
++            observer.on_cache_reset()
++
++    def _beliefkv_notify(self, method, *args):
++        observer = getattr(self, "beliefkv_observer", None)
++        callback = getattr(observer, method, None) if observer is not None else None
++        if callback is not None:
++            callback(*args)
+ 
+     def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
+         """Find the matching prefix from the radix tree.
+@@ -238,6 +247,9 @@ class RadixCache(BasePrefixCache):
+         # Remove req slot release the cache lock
+         self.req_to_token_pool.free(req.req_pool_idx)
+         self.dec_lock_ref(req.last_node)
++        observer = getattr(self, "beliefkv_observer", None)
++        if observer is not None:
++            observer.on_cache_finished(req, token_ids)
+ 
+     def cache_unfinished_req(self, req: Req, chunked=False):
+         """Cache request when it is unfinished."""
+@@ -285,6 +297,9 @@ class RadixCache(BasePrefixCache):
+         else:
+             req.prefix_indices = new_indices
+         req.last_node = new_last_node
++        observer = getattr(self, "beliefkv_observer", None)
++        if observer is not None:
++            observer.on_cache_unfinished(req, page_aligned_token_ids)
+ 
+     def pretty_print(self):
+         self._print_helper(self.root_node, 0)
+@@ -322,6 +337,7 @@ class RadixCache(BasePrefixCache):
+         if self.disable:
+             return 0
+ 
++        start_node = node
+         delta = 0
+         while node != self.root_node:
+             if node.lock_ref == 0:
+@@ -330,12 +346,14 @@ class RadixCache(BasePrefixCache):
+                 delta -= len(node.value)
+             node.lock_ref += 1
+             node = node.parent
++        self._beliefkv_notify("on_lock_change", start_node)
+         return delta
+ 
+     def dec_lock_ref(self, node: TreeNode):
+         if self.disable:
+             return 0
+ 
++        start_node = node
+         delta = 0
+         while node != self.root_node:
+             if node.lock_ref == 1:
+@@ -344,6 +362,7 @@ class RadixCache(BasePrefixCache):
+                 delta += len(node.value)
+             node.lock_ref -= 1
+             node = node.parent
++        self._beliefkv_notify("on_lock_change", start_node)
+         return delta
+ 
+     def evictable_size(self):
+@@ -407,6 +426,7 @@ class RadixCache(BasePrefixCache):
+ 
+         self._record_store_event(new_node)
+         self._record_store_event(child)
++        self._beliefkv_notify("on_radix_mutation")
+ 
+         return new_node
+ 
+@@ -441,6 +461,7 @@ class RadixCache(BasePrefixCache):
+             node.children[child_key] = new_node
+             self.evictable_size_ += len(value)
+             self._record_store_event(new_node)
++            self._beliefkv_notify("on_radix_mutation")
+         return total_prefix_length
+ 
+     def _print_helper(self, node: TreeNode, indent: int):
+@@ -467,6 +488,7 @@ class RadixCache(BasePrefixCache):
+                 break
+         del node.parent.children[k]
+         self.evictable_size_ -= len(node.key)
++        self._beliefkv_notify("on_radix_mutation")
+ 
+     def _total_size_helper(self):
+         total_size = 0
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index eaf4a58..0224a98 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -295,6 +295,10 @@ class ServerArgs:
+     hicache_storage_prefetch_policy: str = "best_effort"
+     hicache_storage_backend_extra_config: Optional[str] = None
+ 
++    # BeliefKV overlay (requires HiCache)
++    enable_beliefkv: bool = False
++    beliefkv_config: Optional[str] = None
++
+     # Double Sparsity
+     enable_double_sparsity: bool = False
+     ds_channel_config_path: Optional[str] = None
+@@ -812,6 +816,9 @@ class ServerArgs:
+                 "and cannot be used at the same time. Please use only one of them."
+             )
+ 
++        if self.enable_beliefkv and not self.enable_hierarchical_cache:
++            raise ValueError("BeliefKV requires --enable-hierarchical-cache")
++
+     @staticmethod
+     def add_cli_args(parser: argparse.ArgumentParser):
+         # Model and tokenizer
+@@ -1698,6 +1705,17 @@ class ServerArgs:
+             default=ServerArgs.hicache_storage_backend_extra_config,
+             help="A dictionary in JSON string format containing extra configuration for the storage backend.",
+         )
++        parser.add_argument(
++            "--enable-beliefkv",
++            action="store_true",
++            help="Enable the BeliefKV scheduler overlay (requires HiCache).",
++        )
++        parser.add_argument(
++            "--beliefkv-config",
++            type=str,
++            default=ServerArgs.beliefkv_config,
++            help="Path to the BeliefKV JSON configuration file.",
++        )
+ 
+         # Double Sparsity
+         parser.add_argument(

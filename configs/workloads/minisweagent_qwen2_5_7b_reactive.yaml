@@ -1,0 +1,23 @@
+agent:
+  step_limit: 12
+  cost_limit: 0.0
+  wall_time_limit_seconds: 900
+  max_consecutive_format_errors: 3
+
+environment:
+  timeout: 120
+  pull_timeout: 600
+
+model:
+  model_class: litellm
+  model_name: openai/Qwen2.5-7B-Instruct
+  cost_tracking: ignore_errors
+  model_kwargs:
+    api_base: http://127.0.0.1:18000/v1
+    api_key: EMPTY
+    custom_llm_provider: openai
+    temperature: 0.0
+    max_tokens: 1024
+    seed: 0
+    drop_params: true
+    parallel_tool_calls: false

@@ -1,0 +1,17 @@
+{
+  "hbm_capacity_bytes": 15032385536,
+  "host_capacity_bytes": 17179869184,
+  "reserve_hbm_bytes": 536870912,
+  "pcie_bandwidth_gbps": 24.0,
+  "transfer_overhead_ms": 0.08,
+  "urgent_chunk_bytes": 67108864,
+  "shadow_chunk_bytes": 16777216,
+  "shadow_min_parked_ms": 25.0,
+  "shadow_slowdown_budget": 0.02,
+  "planning_interval_ms": 5.0,
+  "kv_bytes_per_token": 12288,
+  "predictor_enabled": false,
+  "predictor_model_path": null,
+  "shadow_enabled": true,
+  "runtime_audit_path": "/tmp/beliefkv-qwen2.5-0.5b-smoke.jsonl"
+}

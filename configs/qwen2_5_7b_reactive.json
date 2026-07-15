@@ -1,0 +1,14 @@
+{
+  "pcie_bandwidth_gbps": 24.0,
+  "transfer_overhead_ms": 0.08,
+  "urgent_chunk_bytes": 268435456,
+  "shadow_chunk_bytes": 67108864,
+  "shadow_min_parked_ms": 25.0,
+  "shadow_slowdown_budget": 0.02,
+  "planning_interval_ms": 5.0,
+  "kv_bytes_per_token": 57344,
+  "predictor_enabled": false,
+  "predictor_model_path": null,
+  "shadow_enabled": false,
+  "runtime_audit_path": null
+}

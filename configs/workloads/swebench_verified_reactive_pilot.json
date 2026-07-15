@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "benchmark": "SWE-bench Verified",
+  "instance_id": "sympy__sympy-20590",
+  "dataset_revision": "91aa3ed51b709be6457e12d00300a6a596d4c6a3",
+  "model": {
+    "name": "Qwen2.5-7B-Instruct",
+    "path": "/opt/downloaded_models/Qwen/Qwen2.5-7B-Instruct"
+  },
+  "runtime": {
+    "sglang_version": "0.5.2rc1",
+    "sglang_commit": "18f91eb639084825717c0e3c3c7273492812ab71",
+    "predictor_enabled": false,
+    "shadow_enabled": false
+  },
+  "source_run_id": "swebench-sympy-20590-reactive-s0",
+  "raw_run_path": "experiments/raw/swebench-sympy-20590-reactive-s0",
+  "frozen_trace_path": "workloads/frozen/swebench_verified_reactive_qwen2_5_7b/sympy__sympy-20590/reactive-s0-pilot-v2",
+  "frozen_manifest_sha256": "447c438a0e3432b65b0fa73246fdb535efc3f44ea576609f349116d27c91adbd",
+  "result": {
+    "mechanism_valid": true,
+    "controller_replay_valid": true,
+    "agent_exit_status": "Submitted",
+    "task_outcome": "empty_patch",
+    "task_resolved": false,
+    "event_count": 36,
+    "llm_call_count": 8,
+    "tool_call_count": 8
+  },
+  "allowed_uses": [
+    "runtime event integration regression",
+    "deterministic control-plane replay"
+  ],
+  "disallowed_claims": [
+    "SWE-bench task accuracy",
+    "concurrent workflow scheduling benefit",
+    "KV offload performance benefit"
+  ],
+  "provenance_limit": "BeliefKV source was hashed after this pilot rather than snapshotted at server startup."
+}

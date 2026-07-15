@@ -1,0 +1,8 @@
+{"event_id":"wf-start","ts_ms":0,"kind":"workflow_start","workflow_id":"wf-smoke"}
+{"event_id":"inv-create","ts_ms":1,"kind":"invocation_create","workflow_id":"wf-smoke","invocation_id":"agent","context_id":"ctx","context_epoch":0}
+{"event_id":"llm-start","ts_ms":2,"kind":"llm_submit","workflow_id":"wf-smoke","invocation_id":"agent","request_id":"req","model":"qwen-smoke","prompt_tokens":128,"cache_hit_tokens":32,"context_tokens":128}
+{"event_id":"llm-end","ts_ms":8,"kind":"llm_result","workflow_id":"wf-smoke","invocation_id":"agent","request_id":"req","output_tokens":4,"queue_ms":1,"prefill_ms":2,"decode_ms":3}
+{"event_id":"tool-start","ts_ms":10,"kind":"tool_start","workflow_id":"wf-smoke","invocation_id":"agent","tool_call_id":"tool-1","tool_name":"web_search","tool_family":"search","backend_class":"example.com"}
+{"event_id":"tool-end","ts_ms":30,"kind":"tool_end","workflow_id":"wf-smoke","invocation_id":"agent","tool_call_id":"tool-1"}
+{"event_id":"return","ts_ms":35,"kind":"return","workflow_id":"wf-smoke","invocation_id":"agent"}
+{"event_id":"wf-end","ts_ms":40,"kind":"workflow_end","workflow_id":"wf-smoke"}

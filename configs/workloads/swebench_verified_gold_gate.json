@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "name": "swebench_verified_gold_gate",
+  "dataset": {
+    "repository": "SWE-bench/SWE-bench_Verified",
+    "revision": "91aa3ed51b709be6457e12d00300a6a596d4c6a3",
+    "split": "test",
+    "expected_rows": 500,
+    "datasets_fingerprint": "9d518432c7bc51b6"
+  },
+  "harness": {
+    "repository": "https://github.com/SWE-bench/SWE-bench.git",
+    "commit": "f7bbbb2ccdf479001d6467c9e34af59e44a840f9",
+    "version": "4.1.0"
+  },
+  "selection": {
+    "instance_ids": [
+      "sympy__sympy-20590"
+    ],
+    "rationale": "Official SWE-bench README gold-validation smoke instance"
+  },
+  "local_artifacts": {
+    "raw_dataset_path": "workloads/raw/swebench_verified-91aa3ed",
+    "raw_arrow_sha256": "0d119efe73413554335bd410a04d82fd4a586bfd312cee677ee40af5de2ac46e",
+    "dataset_info_sha256": "338f326bee5f38e6a42fb1ccc7c94348dd4f40f5383dad8008d0836f9b43b161",
+    "gold_gate_path": "workloads/frozen/swebench_verified_gold_gate/instances.jsonl",
+    "gold_gate_sha256": "b56ca736296ea06bcd1d3e5962f6f8df7c1e712d8c40dc99d7e258ca8c15c559"
+  },
+  "evaluation": {
+    "predictions_path": "gold",
+    "max_workers": 1,
+    "timeout_seconds": 1800,
+    "cache_level": "env",
+    "run_id": "swebench-verified-gold-gate"
+  }
+}

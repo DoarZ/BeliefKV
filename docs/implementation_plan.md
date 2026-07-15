@@ -1,63 +1,91 @@
-# Implementation Plan
+# Implementation And Evaluation Plan
 
-## Phase 0: Standalone Policy Engine
+Status date: 2026-07-14.
 
-- Keep the policy independent of model serving.
-- Normalize traces into `ContinuationBelief`, `KVObjectMeta`, and
-  `RuntimeSnapshot`.
-- Validate decisions with unit tests and replay simulation.
+## Completed In Repository
 
-Exit criteria:
+### Phase 0: Event And Simulation Foundation
 
-- `python -m unittest discover -s tests` passes.
-- `python -m beliefkv.cli plan examples/simple_snapshot.json` emits stable
-  actions.
+- framework-neutral, strictly validated `RuntimeEvent` schema;
+- atomic RCCG reducer with nested call/spawn/join/message transitions;
+- ClawTrace normalizer with race repair and deterministic replay;
+- page-level HBM/host/PCIe simulator and immutable artifacts.
 
-## Phase 1: Runtime Metadata Plumbing
+### Phase 1: Reactive Baseline
 
-- Add optional request fields for workflow and branch metadata.
-- Store metadata in request objects after tokenization.
-- Attach metadata to prefix-cache nodes when KV is created or reused.
-- Export a scheduler snapshot every planning interval.
+- four-class semantic residency and terminal owner release;
+- continuation ancestor and message-driven frontier ordering;
+- root-workflow memory admission and attained-service fairness;
+- pressure-driven drop/offload and event-driven prefetch.
 
-Exit criteria:
+### Phase 2: Ownership And SGLang Bridge
 
-- Requests without BeliefKV fields behave exactly like the baseline.
-- Requests with fields are visible in scheduler and cache metadata.
+- context/page many-to-many ownership and generation checks;
+- shared physical charge, engine lock, semantic pin, and active-reader rules;
+- incremental Radix/HiCache dirty observer;
+- exact SGLang 0.5.2rc1 source contract and distributable patch.
 
-## Phase 2: Residency Actions
+### Phase 3: Controlled Migration
 
-- Implement GPU keep protection for active decode workflows.
-- Implement CPU offload for far-future KV objects under HBM pressure.
-- Implement CPU-to-GPU prefetch when predicted next use enters the transfer
-  window.
-- Implement recompute-only action for low-survival branches.
+- scheduler-owned urgent/shadow command queues;
+- asynchronous start/partial/reject/cancel/complete ACK protocol;
+- prepare/commit shadow states and non-preemptible chunk cancellation semantics;
+- H2D ancestor and D2H leaf closure;
+- abort and cache-reset cleanup.
 
-Exit criteria:
+### Phase 4: Prediction And Experiments
 
-- Action counters match planner output.
-- No request observes invalid KV handles after migration or recompute.
+- censored hierarchical Kaplan-Meier tool model;
+- variable-order semi-Markov action context tree;
+- online LLM queue/prefill/decode cost buckets;
+- model artifact training/loading, online structured features, OOD fallback, and
+  interval calibration;
+- configurable ablation matrix, run manifests, CSV summaries, and bootstrap CI.
 
-## Phase 3: Trace Replay and Baselines
+## Required Before Paper Evaluation
 
-- Build a trace runner for coding, search, and research workloads.
-- Compare against default prefix cache, LRU-like eviction, and agent-step
-  policies under identical SGLang 0.5.2rc1 backend conditions.
-- Store every run as JSONL events plus a CSV summary.
+### Phase 5: Real Runtime Validation
 
-Exit criteria:
+1. Build the separate SGLang/CUDA conda environment.
+2. Run a small model smoke test with metadata disabled and enabled.
+3. Verify page bytes and allocator state against GPU/host measurements.
+4. Inject request abort, cache reset, rejected host allocation, stale epoch, and
+   simultaneous pressure/wakeup failures.
+5. Measure patched-disabled overhead against exact upstream.
 
-- Every result records git commit, model, GPU, SGLang version, config, workload,
-  and random seed.
+Exit criteria: no OOM, stale handle, leaked reservation, location divergence,
+or deadlock in long mixed-workload runs.
 
-## Phase 4: Ablation and Portability
+### Phase 6: Baselines And Real Workloads
 
-- Disable belief prediction.
-- Disable migration-cost awareness.
-- Disable decode protection.
-- Disable workflow fairness.
-- Port the narrow adapter to a newer SGLang branch for portability testing.
+- coding, browser/research, peer collaboration, recursive subagent, and mixed
+  root-workflow traces;
+- upstream SGLang LRU/Radix, HiCache write policies, reactive BeliefKV,
+  heuristic shadow, direct predicted offload, full BeliefKV, and offline oracle;
+- KVFlow/TokenCake/AgentServe-style policies only where code and assumptions can
+  be reproduced fairly;
+- identical model, backend commit, quantization, request trace, and GPU settings.
 
-Exit criteria:
+Every run must record repository commit, dirty state, model, GPU, SGLang commit,
+configuration hash, workload, seed, events, and final RCCG.
 
-- The paper can separate algorithm gain from backend-version gain.
+### Phase 7: Predictor Generalization
+
+- group split by project/session;
+- temporal holdout;
+- leave-one-workload-family-out and leave-one-tool-family-out;
+- unseen agent-role evaluation;
+- survival NLL/Brier/coverage plus end-to-end migration regret.
+
+Do not tune on the test workload or randomly split events from one workflow.
+
+### Phase 8: Ablation And Portability
+
+- disable prediction, shadow, causal ordering, fairness, and interference
+  feedback independently;
+- report useful and wasted shadow bytes, not only PCIe utilization;
+- compare reactive and full policy with a full-future oracle;
+- port only after the pinned-version experiment is stable.
+
+The implementation is ready for Phase 5. It is not yet evidence that the final
+algorithm improves real GPU workflow completion time.
