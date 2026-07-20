@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from beliefkv.control.causal_graph import GraphDelta, RuntimeCausalContextGraph
@@ -11,15 +11,19 @@ from beliefkv.policy.admission import (
     AdmissionDecision,
     AdmissionRequest,
 )
+from beliefkv.policy.leases import CausalLeaseProjector
 from beliefkv.policy.causal_frontier import CausalFrontierScheduler
 from beliefkv.policy.residency import ResidencyClassifier
 from beliefkv.policy.shadow_controller import ShadowConfig, ShadowController, ShadowSignals
 from beliefkv.policy.transfer_cost import PCIeCostModel
+from beliefkv.policy.transfer_guard import TransferAttemptGuard, TransferGuardEvent
+from beliefkv.policy.service_curve import TransferServiceCurve
 from beliefkv.policy.transfer_planner import ReactiveTransferPlanner, TransferPlannerConfig
 from beliefkv.policy.workflow_fairness import WorkflowFairScheduler
 from beliefkv.predictor.composer import RemainingTimePredictor
 from beliefkv.predictor.types import RemainingTimePrediction
 from beliefkv.runtime.command_queue import TransferCommandQueue
+from beliefkv.runtime.bundles import BundlePreviewEvent, PhysicalBundleBuilder
 from beliefkv.runtime.page_index import PageIndexError, PageOwnershipIndex
 from beliefkv.runtime.protocol import (
     CommandAck,
@@ -30,6 +34,9 @@ from beliefkv.runtime.protocol import (
     PhysicalPageAction,
     ResolvedCommand,
     TransferDirection,
+    TransferBlocker,
+    TransferBlockerCode,
+    TransferTelemetry,
 )
 from beliefkv.runtime.radix_arbiter import ArbitrationConfig, RadixArbiter
 
@@ -43,6 +50,8 @@ class ControllerTickResult:
     local_acks: tuple[CommandAck, ...] = ()
     stalled_command_ids: tuple[str, ...] = ()
     predictions: dict[str, RemainingTimePrediction] = field(default_factory=dict)
+    transfer_guard_events: tuple[TransferGuardEvent, ...] = ()
+    bundle_preview_events: tuple[BundlePreviewEvent, ...] = ()
 
 
 @dataclass
@@ -88,6 +97,25 @@ class BeliefKVController:
                 host_reserve_bytes=min(1 << 30, self.config.host_capacity_bytes // 8),
             ),
         )
+        self.lease_projector = CausalLeaseProjector(self.graph)
+        self.bundle_builder = PhysicalBundleBuilder(
+            self.graph,
+            self.page_index,
+            self.lease_projector,
+        )
+        self.transfer_guard = TransferAttemptGuard(
+            self.graph,
+            self.page_index,
+            enabled=self.config.transfer_retry_guard_enabled,
+            max_same_snapshot_attempts=(
+                self.config.transfer_retry_max_same_snapshot_attempts
+            ),
+            unknown_base_ms=self.config.transfer_retry_unknown_base_ms,
+            unknown_max_ms=self.config.transfer_retry_unknown_max_ms,
+            unknown_circuit_breaker_failures=(
+                self.config.transfer_retry_unknown_circuit_breaker_failures
+            ),
+        )
         self.transfer_planner = ReactiveTransferPlanner(
             self.graph,
             self.page_index,
@@ -100,6 +128,8 @@ class BeliefKVController:
                 prefetch_chunk_bytes=self.config.urgent_chunk_bytes,
                 prefetch_enabled=self.config.prefetch_enabled,
             ),
+            retry_guard=self.transfer_guard,
+            bundle_builder=self.bundle_builder,
         )
         self.command_queue = TransferCommandQueue()
         self.arbiter = RadixArbiter(
@@ -109,6 +139,7 @@ class BeliefKVController:
                 shadow_chunk_bytes=self.config.shadow_chunk_bytes,
                 urgent_chunk_bytes=self.config.urgent_chunk_bytes,
             ),
+            bundle_builder=self.bundle_builder,
         )
         self.predictor = predictor or (
             RemainingTimePredictor.load(Path(self.config.predictor_model_path))
@@ -118,6 +149,11 @@ class BeliefKVController:
         self.cost_model = PCIeCostModel(
             bandwidth_gbps=self.config.pcie_bandwidth_gbps,
             overhead_ms=self.config.transfer_overhead_ms,
+        )
+        self.service_curve = TransferServiceCurve(
+            self.cost_model,
+            window=self.config.service_curve_window,
+            min_samples=self.config.service_curve_min_samples,
         )
         self.now_ms = 0.0
         self.signals = ShadowSignals(
@@ -131,13 +167,20 @@ class BeliefKVController:
         self._inflight: dict[str, _InFlightCommand] = {}
         self._queued_by_context: dict[str, str] = {}
         self._pending_cancellations: set[str] = set()
-        self._blocked_context_epochs: set[tuple[str, int]] = set()
         self.command_history: list[ControlCommand] = []
         self.ack_history: list[CommandAck] = []
+        self._acked_command_ids: set[str] = set()
+        self.transfer_telemetry_history: list[TransferTelemetry] = []
         self._reported_hbm_used_bytes: int | None = None
         self._engine_request_count: int | None = None
+        self._running_request_count: int | None = None
         self._external_workflow_charges: dict[str, float] = {}
         self._last_predictions: dict[str, RemainingTimePrediction] = {}
+        self._drop_unowned_blocked = False
+        self._native_admission_request_id: str | None = None
+        self._native_admission_capacity_bytes = 0
+        self._pcie_utilization_observed = False
+        self._gpu_compute_utilization_observed = False
 
     def process_runtime_event(self, event: RuntimeEvent) -> GraphDelta:
         self.now_ms = max(self.now_ms, event.ts_ms)
@@ -157,6 +200,7 @@ class BeliefKVController:
         return deltas
 
     def _after_runtime_event(self, event: RuntimeEvent, delta: GraphDelta) -> None:
+        self.notify_resource_state_changed()
         if self.config.predictor_enabled:
             self.predictor.observe_event(event)
         if event.kind == RuntimeEventKind.WORKFLOW_START:
@@ -169,7 +213,9 @@ class BeliefKVController:
                 )
             elif self.page_index.context_epoch(context_id) != context.epoch:
                 self.page_index.update_context_epoch(context_id, context.epoch)
-            self._blocked_context_epochs.discard((context_id, context.epoch))
+            self.transfer_guard.invalidate_context(
+                context_id, now_ms=self.now_ms, keep_epoch=context.epoch
+            )
         for invocation_id in delta.awakened_invocations:
             context_id = self.graph.invocations[invocation_id].context_id
             prediction = self._last_predictions.pop(context_id, None)
@@ -204,6 +250,10 @@ class BeliefKVController:
                 raise ValueError(f"{field_name} must be in [0, 1]")
             return value
 
+        if pcie_utilization is not None:
+            self._pcie_utilization_observed = True
+        if gpu_compute_utilization is not None:
+            self._gpu_compute_utilization_observed = True
         self.signals = ShadowSignals(
             urgent_queue_depth=self.command_queue.urgent_count,
             pcie_utilization=(
@@ -244,10 +294,42 @@ class BeliefKVController:
                 raise ValueError("workflow HBM charges must be non-negative")
             self._external_workflow_charges = dict(workflow_charges)
 
-    def report_engine_activity(self, request_count: int) -> None:
+    def report_engine_activity(
+        self,
+        request_count: int,
+        *,
+        running_request_count: int | None = None,
+    ) -> None:
         if request_count < 0:
             raise ValueError("engine request count must be non-negative")
+        running = request_count if running_request_count is None else running_request_count
+        if running < 0 or running > request_count:
+            raise ValueError(
+                "running request count must be between zero and engine request count"
+            )
         self._engine_request_count = request_count
+        self._running_request_count = running
+
+    def notify_resource_state_changed(self) -> None:
+        """Allow a previously impossible global reclaim to be reconsidered."""
+
+        self._drop_unowned_blocked = False
+        self._native_admission_request_id = None
+        self._native_admission_capacity_bytes = 0
+
+    def report_native_admission_capacity(
+        self,
+        request_id: str | None,
+        capacity_bytes: int = 0,
+    ) -> None:
+        """Publish a request-specific, scheduler-verified reclaim budget."""
+
+        if capacity_bytes < 0:
+            raise ValueError("native admission capacity must be non-negative")
+        if request_id is None and capacity_bytes != 0:
+            raise ValueError("capacity without a request id is invalid")
+        self._native_admission_request_id = request_id
+        self._native_admission_capacity_bytes = capacity_bytes
 
     @property
     def actual_hbm_used_bytes(self) -> int:
@@ -283,6 +365,16 @@ class BeliefKVController:
             ):
                 liveness_target = oldest
 
+        reserved_liveness_target = None
+        reserved_requests = self.admission.reserved_requests()
+        if self._running_request_count == 0 and reserved_requests:
+            oldest_reserved = reserved_requests[0]
+            if (
+                self.now_ms - oldest_reserved.submitted_ts_ms
+                >= self.config.admission_liveness_timeout_ms
+            ):
+                reserved_liveness_target = oldest_reserved
+
         allow_reserve_borrow = (
             self._engine_request_count == 0
             and self.admission.reserved_bytes == 0
@@ -290,13 +382,15 @@ class BeliefKVController:
             and len(self.command_queue) == 0
         )
         stalled_command_ids = self._stalled_command_ids()
-        force_preferred_progress = bool(
+        native_reclaim_ready = bool(
             liveness_target is not None
             and self._engine_request_count == 0
             and self.admission.reserved_bytes == 0
-            and (not self._inflight or stalled_command_ids)
+            and not self._inflight
+            and len(self.command_queue) == 0
             and self.now_ms - liveness_target.submitted_ts_ms
             >= self.config.admission_force_progress_timeout_ms
+            and self._native_admission_request_id == liveness_target.request_id
         )
         admission = self.admission.decide_next(
             self.config.hbm_capacity_bytes,
@@ -306,7 +400,11 @@ class BeliefKVController:
             preferred_request_id=(
                 liveness_target.request_id if liveness_target is not None else None
             ),
-            force_preferred_progress=force_preferred_progress,
+            native_reclaim_capacity_bytes=(
+                self._native_admission_capacity_bytes
+                if native_reclaim_ready
+                else None
+            ),
         )
         required = 0
         protected_context_id = None
@@ -319,28 +417,41 @@ class BeliefKVController:
                 required = request.estimated_incremental_bytes
                 if liveness_target is not None:
                     protected_context_id = request.context_id
+        elif reserved_liveness_target is not None:
+            required = reserved_liveness_target.estimated_incremental_bytes
+            protected_context_id = reserved_liveness_target.context_id
 
-        if not self._inflight:
+        delegated_native_reclaim = bool(
+            admission is not None
+            and admission.admitted
+            and admission.reason == "admission_liveness_native_reclaim"
+        )
+        self.transfer_guard.update_resources(
+            device_available_bytes=max(
+                0,
+                self.config.hbm_capacity_bytes
+                - self.actual_hbm_used_bytes
+                - self.admission.reserved_bytes,
+            ),
+            host_available_bytes=self.signals.host_free_bytes,
+            now_ms=self.now_ms,
+        )
+        if not self._inflight and not delegated_native_reclaim:
             planned = self.transfer_planner.plan_next(
                 now_ms=self.now_ms,
                 hbm_capacity_bytes=self.config.hbm_capacity_bytes,
                 actual_hbm_used_bytes=self.actual_hbm_used_bytes,
+                reserved_hbm_bytes=self.admission.reserved_bytes,
                 admission_required_bytes=required,
                 protected_context_id=protected_context_id,
                 allow_frontier_spill=protected_context_id is not None,
-                blocked_context_epochs=set(self._blocked_context_epochs),
+                drop_unowned_enabled=not self._drop_unowned_blocked,
                 signals=self.signals,
                 predictions=predictions,
             )
             if (
                 planned is not None
                 and (self.config.shadow_enabled or planned.kind != CommandKind.SHADOW_CONTEXT)
-                and (
-                planned.context_id is None
-                or planned.context_epoch is None
-                or (planned.context_id, planned.context_epoch)
-                not in self._blocked_context_epochs
-                )
             ):
                 self._enqueue_if_new(planned)
 
@@ -355,6 +466,8 @@ class BeliefKVController:
             local_acks=(local_ack,) if local_ack is not None else (),
             stalled_command_ids=stalled_command_ids,
             predictions=predictions,
+            transfer_guard_events=self.transfer_guard.drain_events(),
+            bundle_preview_events=self.transfer_planner.drain_bundle_events(),
         )
 
     def _stalled_command_ids(self) -> tuple[str, ...]:
@@ -387,12 +500,8 @@ class BeliefKVController:
                 self.page_index.begin_transfer(handle, TransferDirection.H2D)
             inflight.started_handles.add(handle)
 
-    def unblock_context(self, context_id: str) -> None:
-        self._blocked_context_epochs = {
-            item for item in self._blocked_context_epochs if item[0] != context_id
-        }
-
     def acknowledge_command(self, ack: CommandAck) -> None:
+        self.now_ms = max(self.now_ms, ack.completed_ts_ms)
         inflight = self._require_inflight(ack.command_id)
         actions = {item.handle: item for item in inflight.resolved.page_actions}
         completed = set(ack.page_handles)
@@ -447,29 +556,99 @@ class BeliefKVController:
                     self.page_index.pages[handle].semantic_pin_contexts.discard(context_id)
 
         command = inflight.resolved.command
+        if ack.status in {
+            CommandStatus.REJECTED,
+            CommandStatus.PARTIAL,
+            CommandStatus.STALE,
+        }:
+            blockers = ack.blockers
+            if not blockers:
+                blockers = (
+                    TransferBlocker(
+                        TransferBlockerCode.STALE_GENERATION
+                        if ack.status == CommandStatus.STALE
+                        else TransferBlockerCode.UNKNOWN_BACKEND,
+                        detail=ack.reason,
+                    ),
+                )
+            required_retry_bytes = inflight.resolved.resolved_bytes
+            if ack.status == CommandStatus.PARTIAL:
+                failed_handles = {
+                    item.page_handle
+                    for item in blockers
+                    if item.page_handle is not None
+                }
+                failed_action_bytes = sum(
+                    action.size_bytes
+                    for handle, action in actions.items()
+                    if handle in failed_handles
+                )
+                if failed_action_bytes > 0:
+                    required_retry_bytes = failed_action_bytes
+            self.transfer_guard.record_failure(
+                ack.command_id,
+                blockers=blockers,
+                required_bytes=required_retry_bytes,
+                now_ms=ack.completed_ts_ms,
+            )
+        elif ack.status == CommandStatus.COMPLETED:
+            self.transfer_guard.record_success(
+                ack.command_id, now_ms=ack.completed_ts_ms
+            )
+        else:
+            self.transfer_guard.cancel_attempt(ack.command_id)
         self._inflight.pop(ack.command_id)
         if command.context_id is not None:
             self._queued_by_context.pop(command.context_id, None)
         self.ack_history.append(ack)
+        self._acked_command_ids.add(ack.command_id)
+        self.notify_resource_state_changed()
         self.page_index.assert_consistent()
         self.update_signals()
+
+    def observe_transfer_telemetry(self, telemetry: TransferTelemetry) -> None:
+        """Update performance models after the correctness ACK was committed."""
+
+        if telemetry.command_id not in self._acked_command_ids:
+            raise ValueError(
+                f"transfer telemetry arrived before ACK: {telemetry.command_id}"
+            )
+        self.service_curve.observe(telemetry)
+        self.transfer_telemetry_history.append(telemetry)
 
     def _dispatch_next(
         self,
     ) -> tuple[ResolvedCommand | None, CommandAck | None]:
         if self._inflight:
             return None, None
-        command = self.command_queue.pop(allow_shadow=self.config.shadow_enabled)
-        if command is None:
-            return None, None
+        while True:
+            command = self.command_queue.pop(allow_shadow=self.config.shadow_enabled)
+            if command is None:
+                return None, None
+            if self.transfer_guard.command_is_eligible(command, now_ms=self.now_ms):
+                break
+            if command.context_id is not None:
+                self._queued_by_context.pop(command.context_id, None)
+        closure_fingerprint = self.transfer_guard.begin_attempt(
+            command, now_ms=self.now_ms
+        )
         resolved = self.arbiter.resolve(command)
+        if closure_fingerprint:
+            resolved = replace(
+                resolved, closure_fingerprint=closure_fingerprint
+            )
         self.command_history.append(command)
         if not resolved.page_actions:
+            if command.kind == CommandKind.DROP_UNOWNED:
+                self._drop_unowned_blocked = True
             if command.context_id is not None and command.context_epoch is not None:
-                self._blocked_context_epochs.add(
-                    (command.context_id, command.context_epoch)
-                )
                 self._queued_by_context.pop(command.context_id, None)
+            self.transfer_guard.record_failure(
+                command.command_id,
+                blockers=resolved.blockers,
+                required_bytes=max(resolved.resolved_bytes, command.target_bytes),
+                now_ms=self.now_ms,
+            )
             ack = CommandAck(
                 command_id=command.command_id,
                 status=(
@@ -480,11 +659,15 @@ class BeliefKVController:
                 completed_ts_ms=self.now_ms,
                 actual_bytes=0,
                 reason=resolved.reason,
+                blockers=resolved.blockers,
             )
             self.ack_history.append(ack)
             return None, ack
         self._inflight[command.command_id] = _InFlightCommand(resolved)
         return resolved, None
+
+    def reset_transfer_attempts(self) -> None:
+        self.transfer_guard.reset(now_ms=self.now_ms)
 
     def _enqueue_if_new(self, command: ControlCommand) -> bool:
         if command.context_id is not None:

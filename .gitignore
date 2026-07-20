@@ -15,8 +15,12 @@ experiments/raw/*
 experiments/processed/*
 experiments/results/*
 !experiments/raw/.gitkeep
+!experiments/raw/README.md
 !experiments/processed/.gitkeep
 !experiments/results/.gitkeep
+experiments/archive/*
+experiments/calibration/*
+!experiments/archive/README.md
 
 third_party/*
 !third_party/README.md

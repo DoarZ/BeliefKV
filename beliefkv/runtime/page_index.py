@@ -343,8 +343,13 @@ class PageOwnershipIndex:
 
     def commit_cpu(self, handle: PageHandle) -> None:
         page = self.require_page(handle)
+        if page.residency == PhysicalResidency.CPU_ONLY:
+            return
         if page.residency != PhysicalResidency.DUAL_CLEAN:
-            raise PageIndexError("commit requires a clean CPU shadow")
+            raise PageIndexError(
+                "commit requires DUAL_CLEAN or the CPU_ONLY postcondition, "
+                f"got {page.residency} for {handle}"
+            )
         page.residency = PhysicalResidency.CPU_ONLY
 
     def drop_page(self, handle: PageHandle) -> None:

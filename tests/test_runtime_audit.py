@@ -27,7 +27,7 @@ class RuntimeAuditLogTest(unittest.TestCase):
             self.assertEqual([item["sequence"] for item in records], [1, 2, 1])
             self.assertEqual([item["run_id"] for item in records], ["run-a", "run-a", "run-b"])
             self.assertEqual(records[0]["request_id"], "req-1")
-            self.assertEqual(records[0]["schema_version"], 1)
+            self.assertEqual(records[0]["schema_version"], 2)
 
     def test_rejects_non_finite_json_values(self):
         with tempfile.TemporaryDirectory() as temporary:

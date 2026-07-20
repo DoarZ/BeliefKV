@@ -326,7 +326,7 @@ def _validate_audit(
     initialized = 0
 
     for sequence, record in enumerate(records, start=1):
-        if record.get("schema_version") != 1:
+        if record.get("schema_version") not in {1, 2}:
             raise RuntimeTraceValidationError(
                 f"audit record {sequence}: unsupported schema_version"
             )

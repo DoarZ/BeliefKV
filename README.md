@@ -18,6 +18,8 @@ simulator, experiment artifacts, and a narrow versioned SGLang patch.
 - root-workflow admission and attained-service fairness with causal-frontier
   ordering;
 - reactive D2H/H2D, page-safe Radix arbitration, and explicit asynchronous ACKs;
+- typed physical blockers and an event-gated transfer-attempt ledger that
+  suppresses unchanged closure/capacity/lock retry storms;
 - non-destructive `GPU_ONLY -> MIRRORING -> DUAL_CLEAN -> CPU_ONLY`
   prepare/commit migration;
 - hierarchical Kaplan-Meier tool survival, variable-order semi-Markov action
@@ -78,6 +80,38 @@ Set `predictor_model_path` in the BeliefKV config to load the artifact. Relative
 paths in an SGLang runtime config are resolved relative to that config file.
 Set `runtime_audit_path` to a JSONL path when validating an integration. It is
 disabled by default and records identifiers and resource counts, not prompts.
+When runtime audit is enabled, the pinned SGLang adapter also records measured
+HBM/Host KV occupancy. Set `transfer_telemetry_path` for a dedicated stream of
+D2H/H2D submit, observable start, completion, physical bytes, and status events.
+
+Render a self-contained KV migration timeline after a run:
+
+```bash
+beliefkv render-transfer-timeline \
+  RUN_DIR/server/runtime_audit.jsonl \
+  RUN_DIR/kv_transfer_timeline.html
+```
+
+The report writes a sibling JSON data artifact. Physical D2H/H2D lanes only
+count operations with observed non-zero DMA bytes; zero-byte rejects remain in
+the audit table and appear on a separate `No DMA` lane. Legacy runs can add
+`--metrics-jsonl`, `--kv-bytes-per-token`, and `--hbm-capacity-bytes` to recover
+the sampled HBM curve; Host occupancy remains explicitly unavailable when it
+was not measured by the original run.
+
+Validate command ordering, allocator/PageOwnershipIndex consistency, the
+chronological service-curve holdout, and controller timing after a real run:
+
+```bash
+beliefkv validate-transfer-telemetry \
+  RUN_DIR/server/runtime_audit.jsonl \
+  --config RUN_DIR/server/beliefkv_config.json \
+  --output RUN_DIR/transfer_validation.json
+```
+
+Only completed physical operations train the service curve. Partial/rejected
+outcomes are retained in a separate rolling rejection window and cannot evict
+valid bandwidth samples.
 
 ## SGLang Integration
 
@@ -123,6 +157,21 @@ The rendered implementation-status diagrams are in
 The first real SWE-bench pilot, its exact scope, and reproduction commands are
 documented in
 [docs/swebench_pilot_2026-07-15_zh.md](docs/swebench_pilot_2026-07-15_zh.md).
+The local Qwen3-Coder-30B-A3B-FP8 and Qwen Code parent/subagent protocol smoke,
+including the autonomous-delegation failures, is documented in
+[docs/experiments/qwen3_coder_qwencode_smoke_2026-07-16_zh.md](docs/experiments/qwen3_coder_qwencode_smoke_2026-07-16_zh.md).
+The corrected KV-capacity boundary, context-window policy, and disposable
+tool-sandbox validation are documented in
+[docs/experiments/qwen3_coder_capacity_sandbox_calibration_2026-07-16_zh.md](docs/experiments/qwen3_coder_capacity_sandbox_calibration_2026-07-16_zh.md).
+The fixed-model Qwen Code versus Codex runtime gate, including the corrected
+resident-KV pressure and autonomous-spawn negative result, is documented in
+[docs/experiments/qwen3_coder_runtime_pair_gate_2026-07-16_zh.md](docs/experiments/qwen3_coder_runtime_pair_gate_2026-07-16_zh.md).
+The `recursion_limit=200` paired gate, structured completion protocol, and
+progress-guard results are documented in
+[docs/experiments/agent_loop_termination_gate_2026-07-17_zh.md](docs/experiments/agent_loop_termination_gate_2026-07-17_zh.md).
+The P1.5 retry-guard implementation, frozen 268-retry replay, real-pressure
+mechanism result, and remaining paired-performance gate are documented in
+[docs/experiments/beliefkv_p1_5_retry_guard_2026-07-19_zh.md](docs/experiments/beliefkv_p1_5_retry_guard_2026-07-19_zh.md).
 The older technical archive is historical and not the implementation contract.
 
 ## Research Boundary

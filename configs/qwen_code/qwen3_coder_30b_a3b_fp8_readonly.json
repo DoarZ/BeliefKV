@@ -1,0 +1,67 @@
+{
+  "env": {
+    "OPENAI_API_KEY": "not-needed"
+  },
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "Qwen3-Coder-30B-A3B-Instruct-FP8",
+        "name": "Local Qwen3-Coder 30B A3B FP8",
+        "description": "Qwen Code served by the local BeliefKV SGLang runtime",
+        "envKey": "OPENAI_API_KEY",
+        "baseUrl": "__OPENAI_BASE_URL__",
+        "generationConfig": {
+          "timeout": 300000,
+          "maxRetries": 1,
+          "contextWindowSize": 163840,
+          "toolResultContentFormat": "parts",
+          "samplingParams": {
+            "temperature": 0.0,
+            "top_p": 0.8,
+            "top_k": 20,
+            "repetition_penalty": 1.05
+          }
+        }
+      }
+    ]
+  },
+  "security": {
+    "auth": {
+      "selectedType": "openai"
+    }
+  },
+  "permissions": {
+    "allow": [
+      "Agent",
+      "Read(/**)"
+    ],
+    "deny": [
+      "Bash",
+      "Edit",
+      "Write",
+      "WebFetch"
+    ]
+  },
+  "tools": {
+    "computerUse": {
+      "enabled": false
+    }
+  },
+  "memory": {
+    "enableManagedAutoMemory": false,
+    "enableManagedAutoDream": false,
+    "enableAutoSkill": false
+  },
+  "agents": {
+    "builtin": {
+      "exploreModel": "inherit"
+    }
+  },
+  "model": {
+    "name": "Qwen3-Coder-30B-A3B-Instruct-FP8",
+    "maxSubagentDepth": 3,
+    "skipLoopDetection": false,
+    "enableOpenAILogging": true,
+    "openAILoggingDir": "__OPENAI_LOG_DIR__"
+  }
+}

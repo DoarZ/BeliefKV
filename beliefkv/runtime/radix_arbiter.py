@@ -3,14 +3,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from beliefkv.control.causal_graph import InvocationState, RuntimeCausalContextGraph
+from beliefkv.runtime.bundles import PhysicalBundleBuilder
 from beliefkv.runtime.page_index import PageIndexError, PageOwnershipIndex, PhysicalPageRecord
 from beliefkv.runtime.protocol import (
     CommandKind,
     ControlCommand,
+    PageHandle,
     PhysicalPageAction,
     PhysicalResidency,
     ResolvedCommand,
     ResolvedPageAction,
+    TransferBlocker,
+    TransferBlockerCode,
 )
 
 
@@ -28,27 +32,56 @@ class RadixArbiter:
         graph: RuntimeCausalContextGraph,
         page_index: PageOwnershipIndex,
         config: ArbitrationConfig | None = None,
+        bundle_builder: PhysicalBundleBuilder | None = None,
     ) -> None:
         self.graph = graph
         self.page_index = page_index
         self.config = config or ArbitrationConfig()
+        self.bundle_builder = bundle_builder or PhysicalBundleBuilder(graph, page_index)
 
     def resolve(self, command: ControlCommand) -> ResolvedCommand:
         if command.kind == CommandKind.DROP_UNOWNED:
             return self._resolve_drop_unowned(command)
         if command.context_id is None or command.context_epoch is None:
-            return ResolvedCommand(command, (), 0, "missing_context_identity")
+            return ResolvedCommand(
+                command,
+                (),
+                0,
+                "missing_context_identity",
+                (TransferBlocker(TransferBlockerCode.STALE_GENERATION),),
+            )
         context = self.graph.contexts.get(command.context_id)
         if context is None:
-            return ResolvedCommand(command, (), 0, "unknown_context")
+            return ResolvedCommand(
+                command,
+                (),
+                0,
+                "unknown_context",
+                (TransferBlocker(TransferBlockerCode.STALE_GENERATION),),
+            )
         try:
             self.page_index.validate_context_epoch(
                 command.context_id, command.context_epoch
             )
         except PageIndexError:
-            return ResolvedCommand(command, (), 0, "stale_context_epoch")
+            return ResolvedCommand(
+                command,
+                (),
+                0,
+                "stale_context_epoch",
+                (TransferBlocker(TransferBlockerCode.STALE_GENERATION),),
+            )
         if context.epoch != command.context_epoch:
-            return ResolvedCommand(command, (), 0, "graph_page_epoch_divergence")
+            return ResolvedCommand(
+                command,
+                (),
+                0,
+                "graph_page_epoch_divergence",
+                (TransferBlocker(TransferBlockerCode.STALE_GENERATION),),
+            )
+
+        if command.physical_bundle is not None:
+            return self._resolve_physical_bundle(command)
 
         if command.kind == CommandKind.OFFLOAD_CONTEXT:
             return self._resolve_offload(command, shadow=False)
@@ -71,6 +104,85 @@ class RadixArbiter:
             )
         return ResolvedCommand(command, (), 0, "command_not_page_resident")
 
+    def _resolve_physical_bundle(self, command: ControlCommand) -> ResolvedCommand:
+        assert command.context_id is not None
+        assert command.context_epoch is not None
+        intent = command.physical_bundle
+        assert intent is not None
+        preview = self.bundle_builder.find_intent_preview(
+            command.kind,
+            command.context_id,
+            command.context_epoch,
+            intent.bundle_id,
+            now_ms=command.created_ts_ms,
+            allow_ready_owners=bool(command.metadata.get("allow_ready_owners", False)),
+            protected_context_id=command.metadata.get("protected_context_id"),
+        )
+        if preview is None:
+            return ResolvedCommand(
+                command,
+                (),
+                0,
+                "physical_bundle_no_longer_exists",
+                (
+                    TransferBlocker(
+                        TransferBlockerCode.EXTENT_MUTATED,
+                        detail="bundle closure is absent from the authoritative mirror",
+                    ),
+                ),
+                closure_fingerprint=intent.generation_fingerprint,
+            )
+        if preview.bundle.generation_fingerprint != intent.generation_fingerprint:
+            blockers = preview.blockers or (
+                TransferBlocker(
+                    TransferBlockerCode.EXTENT_MUTATED,
+                    detail="physical bundle fingerprint changed before execution",
+                ),
+            )
+            return ResolvedCommand(
+                command,
+                (),
+                0,
+                "physical_bundle_fingerprint_changed",
+                blockers,
+                closure_fingerprint=preview.bundle.generation_fingerprint,
+            )
+        if preview.blockers:
+            return ResolvedCommand(
+                command,
+                (),
+                0,
+                "physical_bundle_blocked",
+                preview.blockers,
+                closure_fingerprint=preview.bundle.generation_fingerprint,
+            )
+        if (
+            preview.bundle.handles != intent.closure_handles
+            or preview.page_actions != intent.page_actions
+            or preview.bundle.closure_bytes != intent.closure_bytes
+        ):
+            return ResolvedCommand(
+                command,
+                (),
+                0,
+                "physical_bundle_intent_diverged",
+                (
+                    TransferBlocker(
+                        TransferBlockerCode.EXTENT_MUTATED,
+                        detail="resolved physical actions differ from the selected intent",
+                    ),
+                ),
+                closure_fingerprint=preview.bundle.generation_fingerprint,
+            )
+        return ResolvedCommand(
+            command,
+            preview.page_actions,
+            preview.bundle.closure_bytes,
+            "physical_bundle_resolved",
+            (),
+            closure_fingerprint=preview.bundle.generation_fingerprint,
+        )
+
     def _resolve_offload(
         self, command: ControlCommand, *, shadow: bool
     ) -> ResolvedCommand:
@@ -84,14 +196,25 @@ class RadixArbiter:
         allow_ready_owners = bool(command.metadata.get("allow_ready_owners", False))
         protected_context_id = command.metadata.get("protected_context_id")
         candidates: list[tuple[PhysicalPageRecord, PhysicalPageAction]] = []
+        blockers: list[TransferBlocker] = []
         for page in pages:
-            if not self._transfer_eligible(page):
+            page_blockers = self._page_transfer_blockers(page)
+            if page_blockers:
+                blockers.extend(page_blockers)
                 continue
             if self._page_has_active_owner(
                 page,
                 allow_ready_owners=allow_ready_owners,
                 protected_context_id=protected_context_id,
             ):
+                blockers.append(
+                    TransferBlocker(
+                        TransferBlockerCode.ENGINE_BUSY,
+                        page.handle,
+                        page.size_bytes,
+                        "active context owner",
+                    )
+                )
                 continue
             if page.residency == PhysicalResidency.DUAL_CLEAN and not shadow:
                 candidates.append((page, PhysicalPageAction.COMMIT_CPU))
@@ -113,23 +236,66 @@ class RadixArbiter:
             if resolved_bytes >= limit:
                 break
             if not self._leaf_closure_allows(page, selected_handles):
+                blockers.append(
+                    TransferBlocker(
+                        TransferBlockerCode.DESCENDANT_CLOSURE,
+                        page.handle,
+                        page.size_bytes,
+                        "GPU-resident descendant is outside the selected bundle",
+                    )
+                )
                 continue
             selected.append(ResolvedPageAction(page.handle, action, page.size_bytes))
             selected_handles.add(page.handle)
             resolved_bytes += page.size_bytes
         reason = "resolved" if selected else "no_migratable_marginal_pages"
-        return ResolvedCommand(command, tuple(selected), resolved_bytes, reason)
+        return ResolvedCommand(
+            command,
+            tuple(selected),
+            resolved_bytes,
+            reason,
+            self._deduplicate_blockers(blockers) if not selected else (),
+        )
 
     def _resolve_prefetch(self, command: ControlCommand) -> ResolvedCommand:
         assert command.context_id is not None
         limit = command.target_bytes or self.config.urgent_chunk_bytes
-        pages = [
-            page
-            for page in self.page_index.context_pages(command.context_id)
-            if page.residency == PhysicalResidency.CPU_ONLY
-            and page.transfer_idle
-            and page.sealed
-        ]
+        context_pages = self.page_index.context_pages(command.context_id)
+        blockers: list[TransferBlocker] = []
+        pages: list[PhysicalPageRecord] = []
+        for page in context_pages:
+            if page.residency != PhysicalResidency.CPU_ONLY:
+                if page.residency == PhysicalResidency.PREFETCHING:
+                    blockers.append(
+                        TransferBlocker(
+                            TransferBlockerCode.NODE_LOADING,
+                            page.handle,
+                            page.size_bytes,
+                            "page is already prefetching",
+                        )
+                    )
+                continue
+            if not page.transfer_idle:
+                blockers.append(
+                    TransferBlocker(
+                        TransferBlockerCode.INFLIGHT,
+                        page.handle,
+                        page.size_bytes,
+                        "page has an in-flight transfer",
+                    )
+                )
+                continue
+            if not page.sealed:
+                blockers.append(
+                    TransferBlocker(
+                        TransferBlockerCode.UNSEALED,
+                        page.handle,
+                        page.size_bytes,
+                        "page extent is not sealed",
+                    )
+                )
+                continue
+            pages.append(page)
         pages.sort(key=lambda page: (page.radix_depth, page.handle))
         selected: list[ResolvedPageAction] = []
         selected_handles: set[PageHandle] = set()
@@ -138,6 +304,14 @@ class RadixArbiter:
             if resolved_bytes >= limit:
                 break
             if not self._prefetch_closure_allows(page, selected_handles):
+                blockers.append(
+                    TransferBlocker(
+                        TransferBlockerCode.ANCESTOR_CLOSURE,
+                        page.handle,
+                        page.size_bytes,
+                        "GPU ancestor closure is incomplete",
+                    )
+                )
                 continue
             selected.append(
                 ResolvedPageAction(
@@ -151,6 +325,7 @@ class RadixArbiter:
             tuple(selected),
             resolved_bytes,
             "resolved" if selected else "no_cpu_pages",
+            self._deduplicate_blockers(blockers) if not selected else (),
         )
 
     def _resolve_drop_unowned(self, command: ControlCommand) -> ResolvedCommand:
@@ -191,6 +366,75 @@ class RadixArbiter:
             and not page.semantic_pin_contexts
             and page.active_reader_count == 0
             and page.transfer_idle
+        )
+
+    @staticmethod
+    def _page_transfer_blockers(
+        page: PhysicalPageRecord,
+    ) -> tuple[TransferBlocker, ...]:
+        blockers: list[TransferBlocker] = []
+        if not page.sealed:
+            blockers.append(
+                TransferBlocker(
+                    TransferBlockerCode.UNSEALED,
+                    page.handle,
+                    page.size_bytes,
+                    "page extent is not sealed",
+                )
+            )
+        if page.engine_lock_ref > 0 or page.active_reader_count > 0:
+            blockers.append(
+                TransferBlocker(
+                    TransferBlockerCode.NODE_LOCKED,
+                    page.handle,
+                    page.size_bytes,
+                    "page has an engine lock or active reader",
+                )
+            )
+        if page.semantic_pin_contexts:
+            blockers.append(
+                TransferBlocker(
+                    TransferBlockerCode.SEMANTIC_PIN,
+                    page.handle,
+                    page.size_bytes,
+                    "page is semantically pinned",
+                )
+            )
+        if not page.transfer_idle:
+            code = (
+                TransferBlockerCode.NODE_LOADING
+                if page.residency == PhysicalResidency.PREFETCHING
+                else TransferBlockerCode.INFLIGHT
+            )
+            blockers.append(
+                TransferBlocker(
+                    code,
+                    page.handle,
+                    page.size_bytes,
+                    "page has an in-flight transfer",
+                )
+            )
+        return tuple(blockers)
+
+    @staticmethod
+    def _deduplicate_blockers(
+        blockers: list[TransferBlocker],
+    ) -> tuple[TransferBlocker, ...]:
+        unique = {
+            (item.code, item.page_handle, item.required_bytes, item.detail): item
+            for item in blockers
+        }
+        return tuple(
+            unique[key]
+            for key in sorted(
+                unique,
+                key=lambda item: (
+                    item[0].value,
+                    item[1] or PageHandle(0, 0),
+                    item[2],
+                    item[3],
+                ),
+            )
         )
 
     def _page_has_active_owner(

@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "name": "qwen3-coder-runtime-prompt-structure-paired",
+  "model": "Qwen3-Coder-30B-A3B-Instruct-FP8",
+  "repository": "/home/longhao/experiment/BeliefKV",
+  "runtimes": [
+    "qwen_code",
+    "codex"
+  ],
+  "policies": {
+    "natural": "",
+    "policy_guided": "Before using repository tools, decompose the task into branches. If at least two branches can be investigated independently and each is likely to require multiple searches or file reads, delegate those branches with the runtime's available subagent mechanism in one turn. Choose the number of subagents from the decomposition at runtime; do not use a fixed count. Keep direct lookups and dependency-ordered work in the main agent. Wait for every delegated result before synthesizing the answer."
+  },
+  "common_suffix": "You are operating in a disposable sandbox cloned from a fixed Git commit. Use any available repository tool, including shell commands, edits, and tests, when it is useful for the task; no confirmation is required. Do not access paths outside the workspace or external networks. Inspect the repository rather than relying on prior knowledge. Return no more than 350 words. Every requested hop or section must cite an exact repository-relative file path and symbol.",
+  "tasks": [
+    {
+      "id": "lifecycle_sequential",
+      "block": "runtime_kv_lifecycle",
+      "structure": "sequential",
+      "prompt": "Trace one Codex root request through BeliefKV in strict causal order. Begin at the method that consumes Codex app-server notifications. Use the event emitted by that method to locate the control-plane method that applies it. Then use the resulting controller command path to locate the scheduler-owned method that submits a physical HiCache transfer. A later hop must be selected from the concrete symbol found in the previous hop, so do not investigate the hops independently. Return exactly three numbered hops and one cross-hop correctness invariant.",
+      "required_marker_groups": [
+        [
+          "beliefkv/runtime/codex_adapter.py",
+          "CodexRuntimeAdapter"
+        ],
+        [
+          "beliefkv/control/controller.py",
+          "BeliefKVController"
+        ],
+        [
+          "beliefkv/runtime/sglang_v052rc1.py",
+          "HiCacheNodeCommandBackend"
+        ]
+      ]
+    },
+    {
+      "id": "lifecycle_parallel",
+      "block": "runtime_kv_lifecycle",
+      "structure": "parallelizable",
+      "prompt": "Conduct three independent audits and then synthesize them: (A) Codex app-server notification to causal runtime event translation, (B) application of runtime events to control-plane graph and controller state, and (C) execution of physical D2H/H2D operations through the SGLang HiCache backend. Each audit must identify the central symbol and one correctness invariant or concrete failure risk. The three audits do not depend on one another. Return sections A, B, C, followed by a three-sentence synthesis.",
+      "required_marker_groups": [
+        [
+          "beliefkv/runtime/codex_adapter.py",
+          "CodexRuntimeAdapter"
+        ],
+        [
+          "beliefkv/control/controller.py",
+          "BeliefKVController"
+        ],
+        [
+          "beliefkv/runtime/sglang_v052rc1.py",
+          "HiCacheNodeCommandBackend"
+        ]
+      ]
+    },
+    {
+      "id": "pressure_parallel",
+      "block": "pressure_decision_path",
+      "structure": "parallelizable",
+      "prompt": "Conduct three independent audits and then synthesize them: (A) pending-request admission and workflow charging, (B) HBM-pressure victim and transfer-command planning, and (C) validation of a logical context command against physical radix-page ownership and closure constraints. For each audit, identify the central class and decision method, one liveness or correctness invariant, and one plausible rejection path. The audits do not depend on one another. Return sections A, B, C, followed by a three-sentence synthesis.",
+      "required_marker_groups": [
+        [
+          "beliefkv/policy/admission.py",
+          "AdmissionController"
+        ],
+        [
+          "beliefkv/policy/transfer_planner.py",
+          "ReactiveTransferPlanner"
+        ],
+        [
+          "beliefkv/runtime/radix_arbiter.py",
+          "RadixArbiter"
+        ]
+      ]
+    },
+    {
+      "id": "pressure_sequential",
+      "block": "pressure_decision_path",
+      "structure": "sequential",
+      "prompt": "Trace one pending request that cannot initially fit in HBM through the decision path in strict order. Begin at the method that chooses whether the oldest pending request can be admitted. Carry its concrete decision fields into the controller tick that computes required reclamation. Follow the exact logical command produced under pressure, then trace that command into physical radix-page actions. Each hop must use the concrete output or symbol from the previous hop, so do not investigate the stages independently. Return exactly four numbered hops and one end-to-end liveness invariant.",
+      "required_marker_groups": [
+        [
+          "beliefkv/policy/admission.py",
+          "AdmissionController"
+        ],
+        [
+          "beliefkv/control/controller.py",
+          "BeliefKVController"
+        ],
+        [
+          "beliefkv/policy/transfer_planner.py",
+          "ReactiveTransferPlanner"
+        ],
+        [
+          "beliefkv/runtime/radix_arbiter.py",
+          "RadixArbiter"
+        ]
+      ]
+    }
+  ]
+}

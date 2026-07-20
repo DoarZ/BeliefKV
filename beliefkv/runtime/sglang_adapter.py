@@ -8,7 +8,12 @@ from pathlib import Path
 from typing import Protocol
 
 from beliefkv.control.controller import BeliefKVController, ControllerTickResult
-from beliefkv.runtime.protocol import CommandAck, PageHandle, ResolvedCommand
+from beliefkv.runtime.protocol import (
+    CommandAck,
+    PageHandle,
+    ResolvedCommand,
+    TransferTelemetry,
+)
 
 
 BASE_SGLANG_VERSION = "0.5.2rc1"
@@ -140,6 +145,24 @@ class BackendSubmission:
     started_handles: tuple[PageHandle, ...]
 
 
+@dataclass(frozen=True)
+class HiCacheCapabilities:
+    """Version-specific HiCache features observable by the BeliefKV adapter."""
+
+    operation_merge: bool
+    layer_completion_events: bool
+    page_first_host_layout: bool
+    proactive_load_trigger: bool
+    max_inflight_operations: int
+    physical_unit: str
+
+    def __post_init__(self) -> None:
+        if self.max_inflight_operations <= 0:
+            raise ValueError("max_inflight_operations must be positive")
+        if self.physical_unit not in {"node_extent", "page"}:
+            raise ValueError("physical_unit must be node_extent or page")
+
+
 class SGLangCommandBackend(Protocol):
     """Interface implemented inside the patched SGLang scheduler process."""
 
@@ -150,6 +173,13 @@ class SGLangCommandBackend(Protocol):
         ...
 
     def poll_acks(self) -> list[CommandAck]:
+        ...
+
+    def poll_transfer_telemetry(self) -> list[TransferTelemetry]:
+        ...
+
+    @property
+    def capabilities(self) -> HiCacheCapabilities:
         ...
 
 
@@ -173,6 +203,7 @@ class SGLangSchedulerBridge:
     ) -> ControllerTickResult:
         if drain_acks:
             self.drain_acks()
+            self.drain_transfer_telemetry()
         tick = self.controller.tick(now_ms)
         for command_id in tick.cancel_command_ids:
             self.backend.cancel(command_id)
@@ -190,6 +221,13 @@ class SGLangSchedulerBridge:
         for ack in acks:
             self.controller.acknowledge_command(ack)
         return acks
+
+    def drain_transfer_telemetry(self) -> tuple[TransferTelemetry, ...]:
+        poll = getattr(self.backend, "poll_transfer_telemetry", None)
+        telemetry = tuple(poll()) if poll is not None else ()
+        for observation in telemetry:
+            self.controller.observe_transfer_telemetry(observation)
+        return telemetry
 
 
 @dataclass(frozen=True)
@@ -225,6 +263,7 @@ class SGLangSourceContract:
                 "get_next_batch_to_run",
                 "get_new_batch_prefill",
                 "_add_admitted_beliefkv_request",
+                "move_ready_grammar_requests",
             ),
         },
         "python/sglang/srt/managers/schedule_batch.py": {
@@ -245,8 +284,11 @@ class SGLangSourceContract:
             "HiRadixCache": (
                 "write_backup",
                 "writing_check",
+                "loading_check",
                 "_evict_backuped",
                 "load_back",
+                "ready_to_load_host_cache",
+                "take_beliefkv_callback_errors",
                 "check_hicache_events",
             ),
         },
@@ -270,6 +312,12 @@ class SGLangSourceContract:
         ),
         "python/sglang/srt/managers/scheduler.py": (
             "beliefkv_runtime.close()",
+            "ready_requests = self.grammar_queue[:num_ready_reqs]",
+        ),
+        "python/sglang/srt/mem_cache/hiradix_cache.py": (
+            "force: bool = False",
+            "allow_eviction: bool = True",
+            "beliefkv_callback_errors",
         ),
     }
 

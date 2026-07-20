@@ -283,7 +283,7 @@ class FairAdmissionTest(unittest.TestCase):
         self.assertEqual(admitted.request_id, "target")
         self.assertEqual(admitted.reason, "admission_liveness_target")
 
-    def test_idle_liveness_can_delegate_reclaim_to_native_radix_allocator(self):
+    def test_idle_liveness_requires_proven_native_reclaim_capacity(self):
         h = Harness()
         h.workflow("wf")
         h.invocation("wf", "inv", "ctx")
@@ -308,17 +308,52 @@ class FairAdmissionTest(unittest.TestCase):
             )
         )
 
+        unproven = controller.decide_next(
+            1000,
+            actual_hbm_used_bytes=950,
+            allow_reserve_borrow=True,
+            preferred_request_id="target",
+        )
+        self.assertFalse(unproven.admitted)
+        self.assertEqual(unproven.reason, "insufficient_actual_hbm")
+
         decision = controller.decide_next(
             1000,
             actual_hbm_used_bytes=950,
             allow_reserve_borrow=True,
             preferred_request_id="target",
-            force_preferred_progress=True,
+            native_reclaim_capacity_bytes=301,
         )
 
         self.assertTrue(decision.admitted)
         self.assertEqual(decision.reason, "admission_liveness_native_reclaim")
         self.assertEqual(decision.reserved_bytes, 300)
+        self.assertEqual(decision.native_reclaim_capacity_bytes, 301)
+
+    def test_native_reclaim_rejects_equality_as_sglang_no_token(self):
+        h = Harness()
+        h.workflow("wf")
+        h.invocation("wf", "inv", "ctx")
+        controller = AdmissionController(
+            h.index,
+            WorkflowFairScheduler(),
+            CausalFrontierScheduler(h.graph),
+            reserve_hbm_bytes=100,
+        )
+        controller.enqueue(
+            AdmissionRequest("target", "wf", "inv", "ctx", 0, 0, 2, 1, 100)
+        )
+
+        decision = controller.decide_next(
+            1000,
+            actual_hbm_used_bytes=950,
+            preferred_request_id="target",
+            native_reclaim_capacity_bytes=300,
+        )
+
+        self.assertFalse(decision.admitted)
+        self.assertEqual(decision.reason, "insufficient_native_reclaim_capacity")
+        self.assertEqual(decision.required_bytes, 300)
 
     def test_native_reclaim_rejects_a_request_larger_than_the_kv_pool(self):
         h = Harness()
@@ -350,7 +385,7 @@ class FairAdmissionTest(unittest.TestCase):
             actual_hbm_used_bytes=950,
             allow_reserve_borrow=True,
             preferred_request_id="oversized",
-            force_preferred_progress=True,
+            native_reclaim_capacity_bytes=1001,
         )
 
         self.assertFalse(decision.admitted)
@@ -454,6 +489,54 @@ class TransferPolicyTest(unittest.TestCase):
         self.assertTrue(command.metadata["allow_ready_owners"])
         self.assertEqual(command.metadata["protected_context_id"], "ctx-a")
 
+    def test_idle_liveness_does_not_spill_cross_context_bundle(self):
+        h = Harness()
+        for workflow_id in ("target", "first", "second"):
+            h.workflow(workflow_id)
+            h.invocation(
+                workflow_id,
+                f"inv-{workflow_id}",
+                f"ctx-{workflow_id}",
+            )
+        shared = PageHandle(1, 0)
+        h.index.register_page(shared, size_bytes=400)
+        h.index.bind_pages("ctx-first", 0, [shared])
+        h.index.bind_pages("ctx-second", 0, [shared])
+        classifier = ResidencyClassifier(h.graph, h.index)
+        frontier = CausalFrontierScheduler(h.graph)
+        shadow = ShadowController(
+            h.graph,
+            h.index,
+            classifier,
+            frontier,
+            ShadowConfig(min_parked_ms=0, host_reserve_bytes=0),
+        )
+        planner = ReactiveTransferPlanner(
+            h.graph,
+            h.index,
+            classifier,
+            frontier,
+            shadow,
+            TransferPlannerConfig(
+                reserve_hbm_bytes=100,
+                urgent_chunk_bytes=1000,
+                prefetch_enabled=False,
+            ),
+        )
+
+        command = planner.plan_next(
+            now_ms=2000,
+            hbm_capacity_bytes=1000,
+            actual_hbm_used_bytes=950,
+            admission_required_bytes=300,
+            protected_context_id="ctx-target",
+            allow_frontier_spill=True,
+            drop_unowned_enabled=False,
+            signals=self.signals,
+        )
+
+        self.assertIsNone(command)
+
     def test_prefetch_can_be_disabled_without_changing_cpu_residency(self):
         handle = PageHandle(1, 0)
         self.h.index.register_page(
@@ -485,6 +568,46 @@ class TransferPolicyTest(unittest.TestCase):
             self.h.index.pages[handle].residency,
             PhysicalResidency.CPU_ONLY,
         )
+
+    def test_prefetch_capacity_excludes_outstanding_admission_reservations(self):
+        handle = PageHandle(1, 0)
+        self.h.index.register_page(
+            handle,
+            size_bytes=100,
+            residency=PhysicalResidency.CPU_ONLY,
+        )
+        self.h.index.bind_pages("ctx-child", 0, [handle])
+        planner = ReactiveTransferPlanner(
+            self.h.graph,
+            self.h.index,
+            self.classifier,
+            self.frontier,
+            self.shadow,
+            TransferPlannerConfig(
+                reserve_hbm_bytes=100,
+                prefetch_enabled=True,
+                prefetch_chunk_bytes=1000,
+            ),
+        )
+
+        blocked = planner.plan_next(
+            now_ms=10,
+            hbm_capacity_bytes=1000,
+            actual_hbm_used_bytes=0,
+            reserved_hbm_bytes=850,
+            signals=self.signals,
+        )
+        eligible = planner.plan_next(
+            now_ms=11,
+            hbm_capacity_bytes=1000,
+            actual_hbm_used_bytes=0,
+            reserved_hbm_bytes=700,
+            signals=self.signals,
+        )
+
+        self.assertIsNone(blocked)
+        self.assertIsNotNone(eligible)
+        self.assertEqual(eligible.kind, CommandKind.PREFETCH_CONTEXT)
 
     def test_idle_window_prepares_non_destructive_shadow(self):
         handle = PageHandle(1, 0)

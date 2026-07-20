@@ -147,6 +147,16 @@ class RuntimeTraceValidationTest(unittest.TestCase):
             [0.0, 1.0, 2.0, 5.0, 6.0, 10.0, 11.0, 12.0],
         )
 
+    def test_schema_two_runtime_audit_is_backward_compatible(self):
+        for record in self.audit:
+            record["schema_version"] = 2
+        _write_jsonl(self.events_path, self.events)
+        _write_jsonl(self.audit_path, self.audit)
+
+        summary = validate_runtime_trace(self.events_path, self.audit_path)
+
+        self.assertTrue(summary.controller_replay_valid)
+
     def test_unmatched_tool_identity_is_rejected(self):
         self.events[5]["attributes"]["tool_call_id"] = "tool-2"
         _write_jsonl(self.events_path, self.events)

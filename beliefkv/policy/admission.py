@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from beliefkv.policy.causal_frontier import CausalFrontierScheduler
 from beliefkv.policy.workflow_fairness import WorkflowFairScheduler
@@ -70,6 +70,8 @@ class AdmissionDecision:
     admitted: bool
     reason: str
     reserved_bytes: int = 0
+    required_bytes: int = 0
+    native_reclaim_capacity_bytes: int = 0
 
 
 class AdmissionController:
@@ -94,7 +96,7 @@ class AdmissionController:
         self.reserve_hbm_bytes = reserve_hbm_bytes
         self.max_borrow_fraction = max_borrow_fraction
         self._pending: dict[str, AdmissionRequest] = {}
-        self._reserved: dict[str, int] = {}
+        self._reserved: dict[str, AdmissionRequest] = {}
 
     def enqueue(self, request: AdmissionRequest) -> None:
         if request.request_id in self._pending or request.request_id in self._reserved:
@@ -106,9 +108,39 @@ class AdmissionController:
         self._pending.pop(request_id, None)
         self._reserved.pop(request_id, None)
 
+    def update_pending_estimate(
+        self,
+        request_id: str,
+        *,
+        uncached_prompt_tokens: int,
+    ) -> AdmissionRequest:
+        """Refresh a deferred request after the physical prefix tree changes."""
+
+        if uncached_prompt_tokens < 0:
+            raise ValueError("uncached_prompt_tokens must be non-negative")
+        try:
+            request = self._pending[request_id]
+        except KeyError as exc:
+            raise KeyError(f"request is not pending: {request_id}") from exc
+        updated = replace(
+            request,
+            uncached_prompt_tokens=uncached_prompt_tokens,
+        )
+        self._pending[request_id] = updated
+        return updated
+
     @property
     def reserved_bytes(self) -> int:
-        return sum(self._reserved.values())
+        return sum(
+            request.estimated_incremental_bytes
+            for request in self._reserved.values()
+        )
+
+    def reserved_requests(self) -> list[AdmissionRequest]:
+        return sorted(
+            self._reserved.values(),
+            key=lambda item: (item.submitted_ts_ms, item.request_id),
+        )
 
     @property
     def pending_count(self) -> int:
@@ -122,10 +154,15 @@ class AdmissionController:
         external_workflow_charges: dict[str, float] | None = None,
         allow_reserve_borrow: bool = False,
         preferred_request_id: str | None = None,
-        force_preferred_progress: bool = False,
+        native_reclaim_capacity_bytes: int | None = None,
     ) -> AdmissionDecision | None:
         if not self._pending:
             return None
+        if (
+            native_reclaim_capacity_bytes is not None
+            and native_reclaim_capacity_bytes < 0
+        ):
+            raise ValueError("native reclaim capacity must be non-negative or null")
         allocatable = max(0, hbm_capacity_bytes - self.reserve_hbm_bytes)
         physical_used = max(
             self.page_index.gpu_bytes,
@@ -165,39 +202,55 @@ class AdmissionController:
                 )
                 preferred_reason = "admission_liveness_reserve_borrow"
             if preferred.estimated_incremental_bytes > preferred_free:
-                if (
-                    force_preferred_progress
-                    and preferred.estimated_working_set_bytes <= hbm_capacity_bytes
-                ):
-                    self._pending.pop(preferred.request_id)
-                    self._reserved[preferred.request_id] = (
+                if native_reclaim_capacity_bytes is not None:
+                    if preferred.estimated_working_set_bytes > hbm_capacity_bytes:
+                        return AdmissionDecision(
+                            preferred.request_id,
+                            False,
+                            "request_exceeds_hbm_capacity",
+                            required_bytes=preferred.estimated_incremental_bytes,
+                            native_reclaim_capacity_bytes=(
+                                native_reclaim_capacity_bytes
+                            ),
+                        )
+                    # SGLang's PrefillAdder rejects equality as NO_TOKEN.
+                    if (
                         preferred.estimated_incremental_bytes
-                    )
+                        < native_reclaim_capacity_bytes
+                    ):
+                        self._pending.pop(preferred.request_id)
+                        self._reserved[preferred.request_id] = preferred
+                        return AdmissionDecision(
+                            preferred.request_id,
+                            True,
+                            "admission_liveness_native_reclaim",
+                            preferred.estimated_incremental_bytes,
+                            required_bytes=preferred.estimated_incremental_bytes,
+                            native_reclaim_capacity_bytes=(
+                                native_reclaim_capacity_bytes
+                            ),
+                        )
                     return AdmissionDecision(
                         preferred.request_id,
-                        True,
-                        "admission_liveness_native_reclaim",
-                        preferred.estimated_incremental_bytes,
+                        False,
+                        "insufficient_native_reclaim_capacity",
+                        required_bytes=preferred.estimated_incremental_bytes,
+                        native_reclaim_capacity_bytes=native_reclaim_capacity_bytes,
                     )
                 return AdmissionDecision(
                     preferred.request_id,
                     False,
-                    (
-                        "request_exceeds_hbm_capacity"
-                        if force_preferred_progress
-                        and preferred.estimated_working_set_bytes > hbm_capacity_bytes
-                        else "insufficient_actual_hbm"
-                    ),
+                    "insufficient_actual_hbm",
+                    required_bytes=preferred.estimated_incremental_bytes,
                 )
             self._pending.pop(preferred.request_id)
-            self._reserved[preferred.request_id] = (
-                preferred.estimated_incremental_bytes
-            )
+            self._reserved[preferred.request_id] = preferred
             return AdmissionDecision(
                 preferred.request_id,
                 True,
                 preferred_reason,
                 preferred.estimated_incremental_bytes,
+                required_bytes=preferred.estimated_incremental_bytes,
             )
 
         fitting_by_workflow = fitting_requests(free)
@@ -214,7 +267,12 @@ class AdmissionController:
                 self._pending.values(),
                 key=lambda item: (item.submitted_ts_ms, item.request_id),
             )
-            return AdmissionDecision(request.request_id, False, "insufficient_actual_hbm")
+            return AdmissionDecision(
+                request.request_id,
+                False,
+                "insufficient_actual_hbm",
+                required_bytes=request.estimated_incremental_bytes,
+            )
 
         eligible_workflows = set(fitting_by_workflow)
         under_soft_share = {
@@ -262,7 +320,7 @@ class AdmissionController:
             ),
         )
         self._pending.pop(selected.request_id)
-        self._reserved[selected.request_id] = selected.estimated_incremental_bytes
+        self._reserved[selected.request_id] = selected
         return AdmissionDecision(
             selected.request_id,
             True,
@@ -272,11 +330,12 @@ class AdmissionController:
                 else "workflow_fair_causal_frontier"
             ),
             selected.estimated_incremental_bytes,
+            required_bytes=selected.estimated_incremental_bytes,
         )
 
     def acknowledge(self, request_id: str) -> int:
         try:
-            return self._reserved.pop(request_id)
+            return self._reserved.pop(request_id).estimated_incremental_bytes
         except KeyError as exc:
             raise KeyError(f"request has no admission reservation: {request_id}") from exc
 

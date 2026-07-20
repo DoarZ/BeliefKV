@@ -228,8 +228,13 @@ class UnixDatagramRuntimeEventSink:
             raise ValueError("serialized event batch exceeds datagram limit")
 
         with self._lock:
+            last_error: OSError | None = None
             for _ in range(self.retries):
-                self._socket.sendto(payload, str(self.server_path))
+                try:
+                    self._socket.sendto(payload, str(self.server_path))
+                except OSError as error:
+                    last_error = error
+                    continue
                 try:
                     while True:
                         raw_ack = self._socket.recv(MAX_DATAGRAM_BYTES)
@@ -245,6 +250,11 @@ class UnixDatagramRuntimeEventSink:
                 if int(ack.get("event_count", -1)) != len(events):
                     raise RuntimeError("runtime event ACK count mismatch")
                 return
+        if last_error is not None:
+            raise ConnectionError(
+                f"runtime event socket is unavailable after {self.retries} attempts: "
+                f"{last_error}"
+            ) from last_error
         raise TimeoutError(
             f"runtime event ACK timed out after {self.retries} attempts"
         )

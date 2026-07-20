@@ -1,0 +1,13 @@
+{
+  "source_run": "p1_real_hicache_short",
+  "context_id": "deepagents-context:fdc67d3fd0c9a938",
+  "first_command_id": "reactive-287",
+  "last_command_id": "reactive-572",
+  "zero_byte_h2d_reject_count": 268,
+  "span_ms": 7176.689893960953,
+  "blocker_codes": [
+    "ancestor_closure",
+    "device_capacity"
+  ],
+  "reason": "all_node_actions_rejected: SGLangBackendError: H2D selection violates HiCache ancestor closure | SGLangBackendError: HiCache device allocation failed"
+}

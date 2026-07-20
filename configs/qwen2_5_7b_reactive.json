@@ -10,5 +10,14 @@
   "predictor_enabled": false,
   "predictor_model_path": null,
   "shadow_enabled": false,
-  "runtime_audit_path": null
+  "runtime_audit_path": null,
+  "transfer_telemetry_path": null,
+  "resource_telemetry_interval_ms": 50.0,
+  "service_curve_window": 256,
+  "service_curve_min_samples": 8,
+  "transfer_retry_guard_enabled": true,
+  "transfer_retry_max_same_snapshot_attempts": 1,
+  "transfer_retry_unknown_base_ms": 10.0,
+  "transfer_retry_unknown_max_ms": 1000.0,
+  "transfer_retry_unknown_circuit_breaker_failures": 8
 }

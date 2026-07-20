@@ -12,6 +12,12 @@ from beliefkv.core.config import BeliefKVConfig
 from beliefkv.core.events import RuntimeEvent
 from beliefkv.experiments.matrix import ExperimentMatrix, ExperimentMatrixRunner
 from beliefkv.metrics.artifacts import ExperimentArtifactWriter
+from beliefkv.metrics.transfer_timeline import (
+    load_transfer_timeline,
+    render_transfer_timeline,
+)
+from beliefkv.metrics.transfer_validation import validate_transfer_audit
+from beliefkv.policy.transfer_cost import PCIeCostModel
 from beliefkv.predictor.training import extract_training_corpus, train_predictor
 from beliefkv.runtime.sglang_adapter import (
     BASE_SGLANG_GIT_COMMIT,
@@ -164,6 +170,64 @@ def cmd_train_predictor(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_render_transfer_timeline(args: argparse.Namespace) -> None:
+    timeline = load_transfer_timeline(
+        Path(args.audit),
+        run_id=args.run_id,
+        metrics_path=Path(args.metrics_jsonl) if args.metrics_jsonl else None,
+        kv_bytes_per_token=args.kv_bytes_per_token,
+        hbm_capacity_bytes=args.hbm_capacity_bytes,
+    )
+    html_path, data_path = render_transfer_timeline(
+        timeline,
+        Path(args.output),
+        title=args.title,
+    )
+    print(
+        json.dumps(
+            {
+                "html": str(html_path),
+                "data": str(data_path),
+                "run_id": timeline.run_id,
+                "summary": timeline.summary,
+            },
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+    )
+
+
+def cmd_validate_transfer_telemetry(args: argparse.Namespace) -> None:
+    config: dict[str, object] = {}
+    if args.config:
+        value = json.loads(Path(args.config).read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("BeliefKV config must contain a JSON object")
+        config = value
+    report = validate_transfer_audit(
+        Path(args.audit),
+        fallback=PCIeCostModel(
+            bandwidth_gbps=float(config.get("pcie_bandwidth_gbps", 24.0)),
+            overhead_ms=float(config.get("transfer_overhead_ms", 0.08)),
+        ),
+        service_curve_window=int(config.get("service_curve_window", 256)),
+        service_curve_min_samples=int(
+            config.get("service_curve_min_samples", 8)
+        ),
+        holdout_fraction=args.holdout_fraction,
+        max_underestimation_rate=args.max_underestimation_rate,
+    )
+    content = json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    if args.output:
+        output = Path(args.output).resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output.with_suffix(output.suffix + ".tmp")
+        temporary.write_text(content, encoding="utf-8")
+        temporary.replace(output)
+    print(content, end="")
+
+
 def _default_run_id(workload: str) -> str:
     safe_workload = re.sub(r"[^A-Za-z0-9_.-]+", "-", workload).strip("-")
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -224,6 +288,32 @@ def main(argv: list[str] | None = None) -> None:
     train.add_argument("--min-family-samples", type=int, default=8)
     train.add_argument("--min-backend-samples", type=int, default=5)
     train.set_defaults(func=cmd_train_predictor)
+
+    timeline = sub.add_parser(
+        "render-transfer-timeline",
+        help="render HBM/Host occupancy and KV transfer telemetry as a timeline",
+    )
+    timeline.add_argument("audit", help="runtime audit or transfer telemetry JSONL")
+    timeline.add_argument("output", help="output self-contained HTML report")
+    timeline.add_argument("--run-id")
+    timeline.add_argument("--metrics-jsonl", help="optional legacy SGLang metrics JSONL")
+    timeline.add_argument("--kv-bytes-per-token", type=int)
+    timeline.add_argument("--hbm-capacity-bytes", type=int)
+    timeline.add_argument("--title", default="BeliefKV KV Transfer Timeline")
+    timeline.set_defaults(func=cmd_render_transfer_timeline)
+
+    validation = sub.add_parser(
+        "validate-transfer-telemetry",
+        help="validate transfer ACK ordering, residency samples, and service curves",
+    )
+    validation.add_argument("audit", help="runtime audit JSONL")
+    validation.add_argument("--config", help="BeliefKV server config JSON")
+    validation.add_argument("--output", help="optional JSON report path")
+    validation.add_argument("--holdout-fraction", type=float, default=0.2)
+    validation.add_argument(
+        "--max-underestimation-rate", type=float, default=0.1
+    )
+    validation.set_defaults(func=cmd_validate_transfer_telemetry)
 
     args = parser.parse_args(argv)
     args.func(args)

@@ -162,7 +162,7 @@ class ControllerTest(unittest.TestCase):
             PhysicalResidency.CPU_ONLY,
         )
 
-    def test_stalled_transfer_allows_native_reclaim_without_fake_ack(self):
+    def test_stalled_transfer_cannot_authorize_native_reclaim(self):
         h = ControllerHarness(
             reserve_hbm_bytes=300,
             admission_liveness_timeout_ms=1,
@@ -191,13 +191,12 @@ class ControllerTest(unittest.TestCase):
         self.assertFalse(first.admission.admitted)
         command_id = first.transfer.command.command_id
         h.controller.mark_command_started(command_id, [handle])
+        h.controller.report_native_admission_capacity("request", 500)
 
-        recovered = h.controller.tick(10)
-        self.assertEqual(recovered.stalled_command_ids, (command_id,))
-        self.assertTrue(recovered.admission.admitted)
-        self.assertEqual(
-            recovered.admission.reason, "admission_liveness_native_reclaim"
-        )
+        blocked = h.controller.tick(10)
+        self.assertEqual(blocked.stalled_command_ids, (command_id,))
+        self.assertFalse(blocked.admission.admitted)
+        self.assertEqual(blocked.admission.reason, "insufficient_actual_hbm")
         self.assertEqual(h.controller.inflight_command_ids, (command_id,))
         self.assertEqual(
             h.controller.page_index.pages[handle].residency,
@@ -275,6 +274,90 @@ class ControllerTest(unittest.TestCase):
         h = ControllerHarness()
         with self.assertRaises(ValueError):
             h.controller.report_engine_activity(-1)
+        with self.assertRaises(ValueError):
+            h.controller.report_engine_activity(1, running_request_count=2)
+
+    def test_admitted_waiter_drives_frontier_spill_until_engine_can_run_it(self):
+        h = ControllerHarness(
+            reserve_hbm_bytes=100,
+            admission_liveness_timeout_ms=1,
+            admission_force_progress_timeout_ms=5,
+        )
+        for workflow_id in ("target-wf", "victim-wf"):
+            h.controller.process_runtime_event(
+                RuntimeEvent(
+                    event_id=f"start-{workflow_id}",
+                    ts_ms=1,
+                    kind=RuntimeEventKind.WORKFLOW_START,
+                    workflow_id=workflow_id,
+                )
+            )
+            h.controller.process_runtime_event(
+                RuntimeEvent(
+                    event_id=f"inv-{workflow_id}",
+                    ts_ms=2,
+                    kind=RuntimeEventKind.INVOCATION_CREATE,
+                    workflow_id=workflow_id,
+                    invocation_id=f"inv-{workflow_id}",
+                    context_id=f"ctx-{workflow_id}",
+                    context_epoch=0,
+                )
+            )
+        for page_id, context_id in (
+            (1, "ctx-target-wf"),
+            (2, "ctx-victim-wf"),
+        ):
+            handle = PageHandle(page_id, 0)
+            h.controller.page_index.register_page(handle, size_bytes=400)
+            h.controller.page_index.bind_pages(context_id, 0, [handle])
+        h.controller.report_hbm_usage(950)
+        h.controller.report_engine_activity(0, running_request_count=0)
+        h.controller.submit_request(
+            AdmissionRequest(
+                request_id="target-request",
+                workflow_id="target-wf",
+                invocation_id="inv-target-wf",
+                context_id="ctx-target-wf",
+                context_epoch=0,
+                submitted_ts_ms=3,
+                uncached_prompt_tokens=2,
+                expected_output_tokens=1,
+                kv_bytes_per_token=100,
+            )
+        )
+        h.controller.report_native_admission_capacity("target-request", 301)
+
+        admitted = h.controller.tick(10)
+        self.assertTrue(admitted.admission.admitted)
+        self.assertEqual(
+            admitted.admission.reason, "admission_liveness_native_reclaim"
+        )
+        self.assertIsNone(admitted.transfer)
+        h.controller.report_engine_activity(1, running_request_count=0)
+        reclaim = h.controller.tick(11)
+
+        self.assertEqual(reclaim.transfer.command.kind, CommandKind.OFFLOAD_CONTEXT)
+        self.assertEqual(reclaim.transfer.command.context_id, "ctx-victim-wf")
+        self.assertEqual(
+            reclaim.transfer.command.metadata["reason"],
+            "admission_liveness_frontier_spill",
+        )
+
+    def test_unexecutable_drop_unowned_is_not_retried_until_state_changes(self):
+        h = ControllerHarness(reserve_hbm_bytes=300)
+        h.create_parked()
+        h.add_page(800)
+        locked = PageHandle(2, 0)
+        h.controller.page_index.register_page(locked, size_bytes=200)
+        h.controller.page_index.set_engine_lock(locked, 1)
+
+        rejected = h.controller.tick(10)
+        self.assertEqual(rejected.local_acks[0].reason, "no_unowned_pages")
+        self.assertEqual(len(h.controller.command_history), 1)
+
+        fallback = h.controller.tick(11)
+        self.assertEqual(fallback.transfer.command.kind, CommandKind.OFFLOAD_CONTEXT)
+        self.assertEqual(len(h.controller.command_history), 2)
 
     def test_wakeup_outcome_updates_online_interval_calibration(self):
         h = ControllerHarness(predictor_enabled=True)

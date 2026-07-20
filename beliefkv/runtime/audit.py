@@ -16,7 +16,7 @@ class RuntimeAuditLog:
     can safely append to the same experiment artifact.
     """
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(
         self,

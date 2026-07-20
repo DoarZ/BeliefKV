@@ -11,6 +11,7 @@ from beliefkv.runtime.protocol import (
     PageHandle,
     PhysicalPageAction,
     PhysicalResidency,
+    TransferBlockerCode,
     TransferDirection,
 )
 from beliefkv.runtime.radix_arbiter import RadixArbiter
@@ -59,6 +60,8 @@ class PageIndexTest(unittest.TestCase):
         self.assertEqual(index.pages[handle].residency, PhysicalResidency.MIRRORING)
         index.complete_transfer(handle, TransferDirection.D2H, keep_gpu=True)
         self.assertEqual(index.pages[handle].residency, PhysicalResidency.DUAL_CLEAN)
+        index.commit_cpu(handle)
+        self.assertEqual(index.pages[handle].residency, PhysicalResidency.CPU_ONLY)
         index.commit_cpu(handle)
         self.assertEqual(index.pages[handle].residency, PhysicalResidency.CPU_ONLY)
 
@@ -171,6 +174,10 @@ class RadixArbiterTest(unittest.TestCase):
         )
         self.assertFalse(resolved.page_actions)
         self.assertEqual(resolved.reason, "no_migratable_marginal_pages")
+        self.assertIn(
+            TransferBlockerCode.ENGINE_BUSY,
+            {item.code for item in resolved.blockers},
+        )
 
     def test_private_suffix_is_selected_but_active_shared_prefix_is_not(self):
         self.create_invocation(1, "parent", "ctx-parent")
@@ -292,6 +299,10 @@ class RadixArbiterTest(unittest.TestCase):
             self.command(CommandKind.PREFETCH_CONTEXT, "ctx-parent", 200)
         )
         self.assertEqual(rejected.reason, "no_cpu_pages")
+        self.assertEqual(
+            {item.code for item in rejected.blockers},
+            {TransferBlockerCode.ANCESTOR_CLOSURE},
+        )
 
         self.index.bind_pages("ctx-parent", 0, [prefix])
         resolved = arbiter.resolve(

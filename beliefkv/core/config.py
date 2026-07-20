@@ -27,9 +27,18 @@ class BeliefKVConfig:
     shadow_enabled: bool = True
     prefetch_enabled: bool = True
     runtime_audit_path: str | None = None
+    transfer_telemetry_path: str | None = None
     runtime_event_socket_path: str | None = None
     runtime_event_log_path: str | None = None
     runtime_event_max_lateness_ms: float = 5000.0
+    resource_telemetry_interval_ms: float = 50.0
+    service_curve_window: int = 256
+    service_curve_min_samples: int = 8
+    transfer_retry_guard_enabled: bool = True
+    transfer_retry_max_same_snapshot_attempts: int = 1
+    transfer_retry_unknown_base_ms: float = 10.0
+    transfer_retry_unknown_max_ms: float = 1000.0
+    transfer_retry_unknown_circuit_breaker_failures: int = 8
 
     def __post_init__(self) -> None:
         if self.hbm_capacity_bytes <= 0 or self.host_capacity_bytes <= 0:
@@ -81,6 +90,38 @@ class BeliefKVConfig:
             or self.runtime_event_max_lateness_ms < 0
         ):
             raise ValueError("runtime_event_max_lateness_ms must be finite and non-negative")
+        if (
+            not math.isfinite(self.resource_telemetry_interval_ms)
+            or self.resource_telemetry_interval_ms <= 0
+        ):
+            raise ValueError("resource_telemetry_interval_ms must be positive")
+        if self.service_curve_window <= 0:
+            raise ValueError("service_curve_window must be positive")
+        if not 1 <= self.service_curve_min_samples <= self.service_curve_window:
+            raise ValueError(
+                "service_curve_min_samples must be within the service curve window"
+            )
+        if self.transfer_retry_max_same_snapshot_attempts <= 0:
+            raise ValueError(
+                "transfer_retry_max_same_snapshot_attempts must be positive"
+            )
+        if (
+            not math.isfinite(self.transfer_retry_unknown_base_ms)
+            or self.transfer_retry_unknown_base_ms <= 0
+        ):
+            raise ValueError("transfer_retry_unknown_base_ms must be positive")
+        if (
+            not math.isfinite(self.transfer_retry_unknown_max_ms)
+            or self.transfer_retry_unknown_max_ms
+            < self.transfer_retry_unknown_base_ms
+        ):
+            raise ValueError(
+                "transfer_retry_unknown_max_ms must be no smaller than the base"
+            )
+        if self.transfer_retry_unknown_circuit_breaker_failures <= 0:
+            raise ValueError(
+                "transfer_retry_unknown_circuit_breaker_failures must be positive"
+            )
         if self.predictor_model_path is not None and not isinstance(
             self.predictor_model_path, str
         ):
@@ -89,6 +130,10 @@ class BeliefKVConfig:
             self.runtime_audit_path, str
         ):
             raise ValueError("runtime_audit_path must be a string or null")
+        if self.transfer_telemetry_path is not None and not isinstance(
+            self.transfer_telemetry_path, str
+        ):
+            raise ValueError("transfer_telemetry_path must be a string or null")
         if self.runtime_event_socket_path is not None and not isinstance(
             self.runtime_event_socket_path, str
         ):

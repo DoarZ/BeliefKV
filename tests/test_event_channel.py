@@ -99,6 +99,24 @@ class RuntimeEventChannelTest(unittest.TestCase):
             events,
         )
 
+    def test_missing_control_socket_is_reported_as_connection_failure(self):
+        events = (event("end", RuntimeEventKind.WORKFLOW_END, ts_ms=2.0),)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "missing-server.sock"
+            try:
+                sink = UnixDatagramRuntimeEventSink(
+                    path,
+                    ack_timeout_s=0.01,
+                    retries=2,
+                    client_directory=temporary,
+                )
+            except PermissionError as error:
+                self.skipTest(f"Unix sockets are blocked by the test sandbox: {error}")
+            with sink:
+                with self.assertRaises(ConnectionError) as captured:
+                    sink.emit_batch(events)
+        self.assertIsInstance(captured.exception.__cause__, FileNotFoundError)
+
     @staticmethod
     def _drain_one(server: RuntimeEventDatagramServer) -> None:
         deadline = time.monotonic() + 2.0
