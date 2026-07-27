@@ -19,6 +19,7 @@ _GUARDED_KINDS = {
     CommandKind.OFFLOAD_CONTEXT,
     CommandKind.SHADOW_CONTEXT,
     CommandKind.PREFETCH_CONTEXT,
+    CommandKind.DROP_TERMINAL_PRIVATE,
 }
 
 
@@ -313,6 +314,16 @@ class TransferAttemptGuard:
         if command.context_id is None or command.context_epoch is None:
             raise ValueError("a guarded transfer command requires context identity")
         bundle = command.physical_bundle
+        if command.target_handles:
+            return TransferAttemptKey(
+                context_id=command.context_id,
+                context_epoch=command.context_epoch,
+                command_kind=command.kind,
+                bundle_id="terminal-private",
+                closure_fingerprint=self._target_handles_fingerprint(
+                    command.target_handles
+                ),
+            )
         if bundle is None:
             return self.key_for(
                 command.context_id, command.context_epoch, command.kind
@@ -324,6 +335,31 @@ class TransferAttemptGuard:
             bundle_id=bundle.bundle_id,
             closure_fingerprint=bundle.generation_fingerprint,
         )
+
+    def _target_handles_fingerprint(
+        self, handles: tuple[PageHandle, ...]
+    ) -> str:
+        state: list[tuple[object, ...]] = []
+        for handle in sorted(handles):
+            page = self.page_index.pages.get(handle)
+            if page is None:
+                state.append((handle.page_id, handle.allocation_generation, "missing"))
+                continue
+            state.append(
+                (
+                    handle.page_id,
+                    handle.allocation_generation,
+                    page.residency.value,
+                    tuple(sorted(page.owner_contexts.items())),
+                    page.engine_lock_ref,
+                    page.active_reader_count,
+                    page.transfer_direction.value
+                    if page.transfer_direction is not None
+                    else None,
+                    tuple(sorted(page.children)),
+                )
+            )
+        return blake2b(repr(tuple(state)).encode("utf-8"), digest_size=16).hexdigest()
 
     def drain_events(self) -> tuple[TransferGuardEvent, ...]:
         events = tuple(self._events)

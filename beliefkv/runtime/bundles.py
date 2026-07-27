@@ -103,6 +103,7 @@ class PhysicalBundleBuilder:
         now_ms: float,
         allow_ready_owners: bool = False,
         protected_context_id: str | None = None,
+        bypass_owner_context_ids: frozenset[str] = frozenset(),
         host_available_bytes: int | None = None,
         device_available_bytes: int | None = None,
     ) -> tuple[PhysicalBundlePreview, ...]:
@@ -125,7 +126,17 @@ class PhysicalBundleBuilder:
                 now_ms=now_ms,
                 allow_ready_owners=allow_ready_owners,
                 protected_context_id=protected_context_id,
+                bypass_owner_context_ids=bypass_owner_context_ids,
                 host_available_bytes=host_available_bytes,
+            )
+        elif command_kind == CommandKind.DROP_CONTEXT:
+            previews = self._drop_previews(
+                context_id,
+                context_epoch,
+                now_ms=now_ms,
+                allow_ready_owners=allow_ready_owners,
+                protected_context_id=protected_context_id,
+                bypass_owner_context_ids=bypass_owner_context_ids,
             )
         elif command_kind == CommandKind.PREFETCH_CONTEXT:
             previews = self._prefetch_previews(
@@ -158,6 +169,7 @@ class PhysicalBundleBuilder:
         now_ms: float,
         allow_ready_owners: bool = False,
         protected_context_id: str | None = None,
+        bypass_owner_context_ids: frozenset[str] = frozenset(),
         host_available_bytes: int | None = None,
         device_available_bytes: int | None = None,
     ) -> PhysicalBundlePreview | None:
@@ -171,6 +183,7 @@ class PhysicalBundleBuilder:
                     now_ms=now_ms,
                     allow_ready_owners=allow_ready_owners,
                     protected_context_id=protected_context_id,
+                    bypass_owner_context_ids=bypass_owner_context_ids,
                     host_available_bytes=host_available_bytes,
                     device_available_bytes=device_available_bytes,
                 )
@@ -188,6 +201,7 @@ class PhysicalBundleBuilder:
         now_ms: float,
         allow_ready_owners: bool,
         protected_context_id: str | None,
+        bypass_owner_context_ids: frozenset[str],
         host_available_bytes: int | None,
     ) -> list[PhysicalBundlePreview]:
         roots = [
@@ -237,6 +251,7 @@ class PhysicalBundleBuilder:
                     now_ms=now_ms,
                     allow_ready_owners=allow_ready_owners,
                     protected_context_id=protected_context_id,
+                    bypass_owner_context_ids=bypass_owner_context_ids,
                 )
                 blockers.extend(page_blockers)
                 if page_blockers:
@@ -289,6 +304,68 @@ class PhysicalBundleBuilder:
             previews.append(
                 self._preview(
                     command_kind,
+                    context_id,
+                    context_epoch,
+                    closure,
+                    tuple(actions),
+                    blockers_tuple,
+                    blocked_handles,
+                    now_ms=now_ms,
+                )
+            )
+        return previews
+
+    def _drop_previews(
+        self,
+        context_id: str,
+        context_epoch: int,
+        *,
+        now_ms: float,
+        allow_ready_owners: bool,
+        protected_context_id: str | None,
+        bypass_owner_context_ids: frozenset[str],
+    ) -> list[PhysicalBundlePreview]:
+        roots = [
+            page
+            for page in self.page_index.context_pages(context_id)
+            if page.gpu_resident
+        ]
+        previews: list[PhysicalBundlePreview] = []
+        seen_closures: set[tuple[PageHandle, ...]] = set()
+        for root in sorted(roots, key=lambda page: (-page.radix_depth, page.handle)):
+            closure, closure_blockers = self._gpu_descendant_closure(root)
+            handles = tuple(sorted(closure))
+            if not handles or handles in seen_closures:
+                continue
+            seen_closures.add(handles)
+            blockers = list(closure_blockers)
+            actions: list[ResolvedPageAction] = []
+            blocked_handles: set[PageHandle] = set()
+            for page in sorted(
+                closure.values(), key=lambda item: (-item.radix_depth, item.handle)
+            ):
+                actions.append(
+                    ResolvedPageAction(
+                        page.handle,
+                        PhysicalPageAction.DROP,
+                        page.size_bytes,
+                    )
+                )
+                page_blockers = self._page_blockers(page)
+                page_blockers += self._owner_blockers(
+                    page,
+                    now_ms=now_ms,
+                    allow_ready_owners=allow_ready_owners,
+                    protected_context_id=protected_context_id,
+                    bypass_owner_context_ids=bypass_owner_context_ids,
+                )
+                blockers.extend(page_blockers)
+                if page_blockers:
+                    blocked_handles.add(page.handle)
+            blockers_tuple = self._deduplicate_blockers(blockers)
+            previews.append(
+                self._preview(
+                    CommandKind.DROP_CONTEXT,
                     context_id,
                     context_epoch,
                     closure,
@@ -444,7 +521,9 @@ class PhysicalBundleBuilder:
         closure_bytes = sum(item.size_bytes for item in actions)
         reclaimable = (
             closure_bytes
-            if command_kind == CommandKind.OFFLOAD_CONTEXT and not blockers
+            if command_kind
+            in {CommandKind.OFFLOAD_CONTEXT, CommandKind.DROP_CONTEXT}
+            and not blockers
             else 0
         )
         residencies = sorted({page.residency.value for page in closure.values()})
@@ -478,6 +557,7 @@ class PhysicalBundleBuilder:
                     if command_kind
                     in {
                         CommandKind.OFFLOAD_CONTEXT,
+                        CommandKind.DROP_CONTEXT,
                         CommandKind.SHADOW_CONTEXT,
                     }
                     else {
@@ -575,9 +655,12 @@ class PhysicalBundleBuilder:
         now_ms: float,
         allow_ready_owners: bool,
         protected_context_id: str | None,
+        bypass_owner_context_ids: frozenset[str],
     ) -> list[TransferBlocker]:
         blockers: list[TransferBlocker] = []
         for context_id in sorted(page.owner_contexts):
+            if context_id in bypass_owner_context_ids:
+                continue
             lease = self.leases.context(context_id, now_ms=now_ms)
             blocked = (
                 context_id == protected_context_id

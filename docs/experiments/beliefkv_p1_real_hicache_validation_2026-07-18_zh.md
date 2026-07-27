@@ -27,8 +27,8 @@ workload            冻结 SWE-bench Verified SymPy manifest，planned Deep Agen
 首次 instrumented run 位于：
 
 ```text
-experiments/raw/deepagents_swebench/20260718T150352Z/server-p1-telemetry
-experiments/raw/deepagents_swebench/20260718T150352Z/planned-8-p1-telemetry
+experiments/archive/20260727/superseded_raw/deepagents_swebench/20260718T150352Z/server-p1-telemetry
+experiments/archive/20260727/superseded_raw/deepagents_swebench/20260718T150352Z/planned-8-p1-telemetry
 ```
 
 运行约 178 个 request、59 个迁移后，Radix split 在 HiCache DMA in-flight 期间改变了 node
@@ -51,8 +51,8 @@ in-flight command 时 `sync_tree()` 延迟完整拓扑重建，ACK 后再按 SGL
 路径：
 
 ```text
-raw server    experiments/raw/deepagents_swebench/20260718T151540Z/server-p1-telemetry
-raw workload  experiments/raw/deepagents_swebench/20260718T151540Z/planned-8-p1-telemetry
+raw server    experiments/archive/20260727/superseded_raw/deepagents_swebench/20260718T151540Z/server-p1-telemetry
+raw workload  experiments/archive/20260727/superseded_raw/deepagents_swebench/20260718T151540Z/planned-8-p1-telemetry
 validation    experiments/processed/p1_20260718T151540Z/transfer_validation.json
 timeline      experiments/processed/p1_20260718T151540Z/kv_transfer_timeline.html
 ```
@@ -129,9 +129,9 @@ actual / estimate ratio P90            0.679
 路径：
 
 ```text
-raw server    experiments/raw/deepagents_swebench/20260718T160549Z/server-p1-overhead
-raw workload  experiments/raw/deepagents_swebench/20260718T160549Z/planned-4-p1-overhead
-raw workload  experiments/raw/deepagents_swebench/20260718T160549Z/planned-4b-p1-overhead
+raw server    experiments/archive/20260727/superseded_raw/deepagents_swebench/20260718T160549Z/server-p1-overhead
+raw workload  experiments/archive/20260727/superseded_raw/deepagents_swebench/20260718T160549Z/planned-4-p1-overhead
+raw workload  experiments/archive/20260727/superseded_raw/deepagents_swebench/20260718T160549Z/planned-4b-p1-overhead
 validation    experiments/processed/p1_20260718T160549Z/transfer_validation.json
 timeline      experiments/processed/p1_20260718T160549Z/kv_transfer_timeline.html
 ```

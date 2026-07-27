@@ -18,6 +18,7 @@ class RuntimeEventKind(str, Enum):
     RETURN = "return"
     MESSAGE = "message"
     HANDOFF = "handoff"
+    REACTIVATE = "reactivate"
     JOIN_CREATE = "join_create"
     JOIN_WAIT = "join_wait"
     JOIN_SATISFIED = "join_satisfied"
@@ -26,6 +27,7 @@ class RuntimeEventKind(str, Enum):
     TOOL_END = "tool_end"
     LLM_SUBMIT = "llm_submit"
     LLM_RESULT = "llm_result"
+    STRUCTURED_ACTION = "structured_action"
 
 
 class RelationType(str, Enum):

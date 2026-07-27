@@ -97,6 +97,158 @@ class ControllerTest(unittest.TestCase):
         )
         self.assertEqual(h.controller.page_index.gpu_bytes, 400)
 
+    def test_terminal_child_drops_only_its_private_host_extent(self):
+        h = ControllerHarness(shadow_enabled=False, prefetch_enabled=False)
+        h.emit(RuntimeEventKind.WORKFLOW_START)
+        h.emit(
+            RuntimeEventKind.INVOCATION_CREATE,
+            invocation_id="parent",
+            context_id="ctx-parent",
+            context_epoch=0,
+        )
+        h.emit(
+            RuntimeEventKind.INVOCATION_CREATE,
+            invocation_id="child",
+            context_id="ctx-child",
+            context_epoch=0,
+            parent_invocation_id="parent",
+        )
+        prefix = PageHandle(1, 0)
+        private = PageHandle(2, 0)
+        h.controller.page_index.register_page(
+            prefix, size_bytes=100, residency=PhysicalResidency.DUAL_CLEAN
+        )
+        h.controller.page_index.register_page(
+            private,
+            size_bytes=200,
+            residency=PhysicalResidency.CPU_ONLY,
+            parent=prefix,
+        )
+        h.controller.page_index.bind_pages("ctx-parent", 0, (prefix,))
+        h.controller.page_index.bind_pages("ctx-child", 0, (prefix, private))
+
+        h.emit(RuntimeEventKind.RETURN, invocation_id="child")
+        tick = h.controller.tick(10)
+
+        self.assertEqual(
+            tick.transfer.command.kind, CommandKind.DROP_TERMINAL_PRIVATE
+        )
+        self.assertEqual(
+            tuple(item.handle for item in tick.transfer.page_actions), (private,)
+        )
+        self.assertEqual(
+            h.controller.page_index.pages[prefix].owner_contexts,
+            {"ctx-parent": 0},
+        )
+        command_id = tick.transfer.command.command_id
+        h.controller.mark_command_started(command_id, (private,))
+        h.controller.acknowledge_command(
+            CommandAck(
+                command_id=command_id,
+                status=CommandStatus.COMPLETED,
+                completed_ts_ms=11,
+                actual_bytes=200,
+                page_handles=(private,),
+            )
+        )
+
+        self.assertEqual(
+            h.controller.page_index.pages[private].residency,
+            PhysicalResidency.DEAD,
+        )
+        self.assertEqual(
+            h.controller.page_index.pages[prefix].residency,
+            PhysicalResidency.DUAL_CLEAN,
+        )
+
+    def test_terminal_dual_clean_private_extent_releases_host_copy_only(self):
+        h = ControllerHarness(shadow_enabled=False, prefetch_enabled=False)
+        h.emit(RuntimeEventKind.WORKFLOW_START)
+        h.emit(
+            RuntimeEventKind.INVOCATION_CREATE,
+            invocation_id="child",
+            context_id="ctx-child",
+            context_epoch=0,
+        )
+        handle = PageHandle(1, 0)
+        h.controller.page_index.register_page(
+            handle, size_bytes=200, residency=PhysicalResidency.DUAL_CLEAN
+        )
+        h.controller.page_index.bind_pages("ctx-child", 0, (handle,))
+
+        h.emit(RuntimeEventKind.RETURN, invocation_id="child")
+        tick = h.controller.tick(10)
+        command_id = tick.transfer.command.command_id
+        h.controller.mark_command_started(command_id, (handle,))
+        h.controller.acknowledge_command(
+            CommandAck(
+                command_id=command_id,
+                status=CommandStatus.COMPLETED,
+                completed_ts_ms=11,
+                actual_bytes=200,
+                page_handles=(handle,),
+            )
+        )
+
+        self.assertEqual(
+            h.controller.page_index.pages[handle].residency,
+            PhysicalResidency.GPU_ONLY,
+        )
+
+    def test_terminal_cleanup_waits_for_lock_state_change_without_retry_storm(self):
+        h = ControllerHarness(shadow_enabled=False, prefetch_enabled=False)
+        h.emit(RuntimeEventKind.WORKFLOW_START)
+        h.emit(
+            RuntimeEventKind.INVOCATION_CREATE,
+            invocation_id="child",
+            context_id="ctx-child",
+            context_epoch=0,
+        )
+        handle = PageHandle(1, 0)
+        h.controller.page_index.register_page(
+            handle, size_bytes=200, residency=PhysicalResidency.CPU_ONLY
+        )
+        h.controller.page_index.bind_pages("ctx-child", 0, (handle,))
+        h.controller.page_index.set_engine_lock(handle, 1)
+        h.emit(RuntimeEventKind.RETURN, invocation_id="child")
+
+        rejected = h.controller.tick(10)
+        self.assertIsNone(rejected.transfer)
+        self.assertEqual(len(rejected.local_acks), 1)
+        suppressed = h.controller.tick(11)
+        self.assertIsNone(suppressed.transfer)
+        self.assertEqual(suppressed.local_acks, ())
+
+        h.controller.page_index.set_engine_lock(handle, 0)
+        resumed = h.controller.tick(12)
+        self.assertEqual(
+            resumed.transfer.command.kind, CommandKind.DROP_TERMINAL_PRIVATE
+        )
+
+    def test_terminal_cleanup_captures_late_cache_finish_rebind(self):
+        h = ControllerHarness(shadow_enabled=False, prefetch_enabled=False)
+        h.emit(RuntimeEventKind.WORKFLOW_START)
+        h.emit(
+            RuntimeEventKind.INVOCATION_CREATE,
+            invocation_id="child",
+            context_id="ctx-child",
+            context_epoch=0,
+        )
+        h.emit(RuntimeEventKind.RETURN, invocation_id="child")
+
+        handle = PageHandle(1, 0)
+        h.controller.page_index.register_page(
+            handle, size_bytes=200, residency=PhysicalResidency.CPU_ONLY
+        )
+        h.controller.page_index.bind_pages("ctx-child", 0, (handle,))
+
+        tick = h.controller.tick(10)
+
+        self.assertEqual(
+            tick.transfer.command.kind, CommandKind.DROP_TERMINAL_PRIVATE
+        )
+        self.assertEqual(tick.transfer.command.target_handles, (handle,))
+
     def test_wakeup_cancels_inflight_shadow_without_resume_stall(self):
         h = ControllerHarness()
         h.create_parked()

@@ -4,8 +4,9 @@ import hashlib
 import json
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Protocol, Sequence
 from uuid import UUID
 
 from langchain_core.callbacks import BaseCallbackHandler
@@ -23,6 +24,7 @@ from beliefkv.core.events import (
 )
 from beliefkv.predictor.taxonomy import ToolTaxonomy
 from beliefkv.runtime.agent_runtime_adapter import RuntimeEventSink
+from beliefkv.runtime.action_frontier import StructuredActionKind
 from beliefkv.runtime.sglang_adapter import BeliefKVRequestMetadata
 
 
@@ -81,6 +83,10 @@ class RuntimeControlDeliveryFailure:
     error: str
 
 
+class RequestDeadline(Protocol):
+    def request_timeout_s(self, cap_s: float) -> float: ...
+
+
 class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
     """Translate Deep Agents callbacks into authoritative BeliefKV events.
 
@@ -100,6 +106,11 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
         *,
         control_sink: RuntimeEventSink | None = None,
         clock_ms: Callable[[], float] | None = None,
+        event_namespace: str = "deepagents",
+        completion_tool_names: frozenset[str] = frozenset(
+            {"ChildCompletion", "WorkflowCompletion", "DelegationPlan"}
+        ),
+        allowed_subagent_types: frozenset[str] | None = None,
     ) -> None:
         super().__init__()
         if root_metadata.relation_type != RelationType.ROOT.value:
@@ -108,6 +119,11 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
         self.control_sink = control_sink
         self.root_metadata = root_metadata
         self.clock_ms = clock_ms or (lambda: time.monotonic() * 1000.0)
+        if not event_namespace or ":" in event_namespace:
+            raise ValueError("event_namespace must be non-empty and contain no colon")
+        self.event_namespace = event_namespace
+        self.completion_tool_names = completion_tool_names
+        self.allowed_subagent_types = allowed_subagent_types
         self._lock = threading.RLock()
         self._sequence = 0
         self._last_ts_ms = 0.0
@@ -125,7 +141,9 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
         self._task_run_to_call: dict[str, str] = {}
         self._join_members: dict[str, set[str]] = {}
         self._join_completed: dict[str, set[str]] = {}
+        self._join_cancelled: dict[str, set[str]] = {}
         self._ordinary_tools: dict[str, tuple[str, str, float, str]] = {}
+        self._ignored_tool_runs: set[str] = set()
         self._taxonomy = ToolTaxonomy()
         self._control_delivery_failure_count = 0
         self._first_control_delivery_failure: RuntimeControlDeliveryFailure | None = None
@@ -266,6 +284,16 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
                     f"model run has no BeliefKV identity: {key}"
                 ) from error
 
+    def latest_context_epoch(self, invocation_id: str | None = None) -> int:
+        """Return the latest model epoch observed for one invocation."""
+
+        target = invocation_id or self.root_metadata.invocation_id
+        with self._lock:
+            identity = self._identities.get(target)
+            if identity is None:
+                raise ValueError(f"unknown invocation: {target}")
+            return self._model_epochs.get(target, identity.metadata.context_epoch)
+
     def on_chain_start(
         self,
         serialized: dict[str, Any],
@@ -352,6 +380,39 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
             for call in getattr(message, "tool_calls", ())
             if isinstance(call, dict)
         ]
+        action_kinds: list[StructuredActionKind] = []
+        action_names: list[str] = []
+        for call in tool_calls:
+            name = str(call.get("name") or "unknown")
+            action_names.append(name)
+            if name == "task":
+                action_kinds.append(StructuredActionKind.SPAWN)
+            elif name == "handoff" or name.startswith("transfer_to_"):
+                action_kinds.append(StructuredActionKind.HANDOFF)
+            elif name in self.completion_tool_names:
+                action_kinds.append(StructuredActionKind.FINAL_ANSWER)
+            else:
+                action_kinds.append(StructuredActionKind.FUNCTION_CALL)
+        if not tool_calls and messages:
+            action_kinds.append(StructuredActionKind.FINAL_ANSWER)
+        output_tokens = sum(
+            int((getattr(message, "usage_metadata", None) or {}).get("output_tokens", 0))
+            for message in messages
+        )
+        task_calls = [call for call in tool_calls if str(call.get("name")) == "task"]
+        executable_task_calls = [
+            call
+            for call in task_calls
+            if self.allowed_subagent_types is None
+            or str(
+                (
+                    call.get("args")
+                    if isinstance(call.get("args"), dict)
+                    else {}
+                ).get("subagent_type")
+            )
+            in self.allowed_subagent_types
+        ]
         result = self._event(
             RuntimeEventKind.LLM_RESULT,
             invocation_id=invocation_id,
@@ -361,13 +422,24 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
             attributes={
                 "source": "deepagents_callback",
                 "output_chars": output_chars,
+                "output_tokens": output_tokens or None,
                 "tool_call_count": len(tool_calls),
+                "rejected_task_call_count": len(task_calls)
+                - len(executable_task_calls),
+                "parser_status": "valid" if action_kinds else "unknown",
+                "structured_action_kinds": [item.value for item in action_kinds],
+                "structured_action_names": action_names,
+                "action_boundary_token_index": None,
+                "action_boundary_source": "runtime_structured_output",
+                "parser_reason": (
+                    "Deep Agents exposed a complete AIMessage; incremental token boundary "
+                    "is unavailable"
+                ),
             },
         )
         self._publish((result,), control=False)
-        task_calls = [call for call in tool_calls if str(call.get("name")) == "task"]
-        if task_calls:
-            self._declare_task_group(invocation_id, key, task_calls)
+        if executable_task_calls:
+            self._declare_task_group(invocation_id, key, executable_task_calls)
 
     def on_llm_error(
         self,
@@ -416,7 +488,19 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
         parent_invocation_id = self._resolve_invocation(key)
         tool_name = str((serialized or {}).get("name") or "unknown")
         payload = inputs or {}
+        if tool_name in self.completion_tool_names:
+            with self._lock:
+                self._ignored_tool_runs.add(key)
+            return
         if tool_name == "task":
+            requested_type = str(payload.get("subagent_type") or "general-purpose")
+            if (
+                self.allowed_subagent_types is not None
+                and requested_type not in self.allowed_subagent_types
+            ):
+                with self._lock:
+                    self._ignored_tool_runs.add(key)
+                return
             pending = self._bind_task_run(
                 key,
                 parent_invocation_id,
@@ -466,6 +550,9 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
         del kwargs
         key = self._remember_run(run_id, parent_run_id)
         with self._lock:
+            if key in self._ignored_tool_runs:
+                self._ignored_tool_runs.remove(key)
+                return
             task_call_id = self._task_run_to_call.get(key)
         if task_call_id is not None:
             self._complete_task(task_call_id, cancelled=False, error=None)
@@ -483,6 +570,9 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
         del kwargs
         key = self._remember_run(run_id, parent_run_id)
         with self._lock:
+            if key in self._ignored_tool_runs:
+                self._ignored_tool_runs.remove(key)
+                return
             task_call_id = self._task_run_to_call.get(key)
         if task_call_id is not None:
             self._complete_task(task_call_id, cancelled=True, error=error)
@@ -559,7 +649,7 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
                         return_target_id=parent_invocation_id,
                         join_id=join_id,
                         attributes={
-                            "persistent": False,
+                            "persistent": True,
                             "source": "deepagents_task",
                             "description_chars": description_chars,
                             "description_sha256": description_sha256,
@@ -624,6 +714,7 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
                 )
             self._join_members[join_id] = set(child_ids)
             self._join_completed[join_id] = set()
+            self._join_cancelled[join_id] = set()
         self._publish(tuple(events), control=True)
         return tuple(pending_items)
 
@@ -682,7 +773,11 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
             pending.terminal = True
             completed = self._join_completed[pending.join_id]
             completed.add(pending.child_invocation_id)
+            cancelled_members = self._join_cancelled[pending.join_id]
+            if cancelled:
+                cancelled_members.add(pending.child_invocation_id)
             join_complete = completed >= self._join_members[pending.join_id]
+            join_satisfied = join_complete and not cancelled_members
         ts_ms = self._timestamp()
         kind = (
             RuntimeEventKind.INVOCATION_CANCEL
@@ -702,7 +797,7 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
                 },
             )
         ]
-        if join_complete:
+        if join_satisfied:
             events.append(
                 self._event(
                     RuntimeEventKind.JOIN_SATISFIED,
@@ -800,7 +895,7 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
         with self._lock:
             self._sequence += 1
             event_id = (
-                f"{self.root_metadata.root_workflow_id}:deepagents:"
+                f"{self.root_metadata.root_workflow_id}:{self.event_namespace}:"
                 f"{self._sequence:09d}"
             )
         return RuntimeEvent(
@@ -876,15 +971,26 @@ class BeliefKVChatOpenAI(ChatOpenAI):
     """ChatOpenAI client that tags every request with its runtime identity."""
 
     _beliefkv_adapter: DeepAgentsRuntimeAdapter = PrivateAttr()
+    _activation_deadline: RequestDeadline | None = PrivateAttr(default=None)
+    _request_timeout_cap_s: float | None = PrivateAttr(default=None)
+    _abort_url: str | None = PrivateAttr(default=None)
 
     def __init__(
         self,
         *,
         beliefkv_adapter: DeepAgentsRuntimeAdapter,
+        activation_deadline: RequestDeadline | None = None,
+        request_timeout_s: float | None = None,
+        abort_url: str | None = None,
         **kwargs: Any,
     ) -> None:
+        if request_timeout_s is not None and request_timeout_s <= 0:
+            raise ValueError("request_timeout_s must be positive")
         super().__init__(**kwargs)
         self._beliefkv_adapter = beliefkv_adapter
+        self._activation_deadline = activation_deadline
+        self._request_timeout_cap_s = request_timeout_s
+        self._abort_url = abort_url
 
     def _generate(
         self,
@@ -893,8 +999,14 @@ class BeliefKVChatOpenAI(ChatOpenAI):
         run_manager: Any | None = None,
         **kwargs: Any,
     ) -> Any:
-        kwargs = self._with_beliefkv_metadata(run_manager, kwargs)
-        return super()._generate(messages, stop, run_manager, **kwargs)
+        rid: str | None = None
+        try:
+            kwargs, rid = self._with_beliefkv_runtime(run_manager, kwargs)
+            return super()._generate(messages, stop, run_manager, **kwargs)
+        except BaseException:
+            if rid is not None:
+                self._abort_request(rid)
+            raise
 
     async def _agenerate(
         self,
@@ -903,20 +1015,54 @@ class BeliefKVChatOpenAI(ChatOpenAI):
         run_manager: Any | None = None,
         **kwargs: Any,
     ) -> Any:
-        kwargs = self._with_beliefkv_metadata(run_manager, kwargs)
-        return await super()._agenerate(messages, stop, run_manager, **kwargs)
+        rid: str | None = None
+        try:
+            kwargs, rid = self._with_beliefkv_runtime(run_manager, kwargs)
+            return await super()._agenerate(messages, stop, run_manager, **kwargs)
+        except BaseException:
+            if rid is not None:
+                self._abort_request(rid)
+            raise
 
-    def _with_beliefkv_metadata(
+    def _with_beliefkv_runtime(
         self,
         run_manager: Any | None,
         kwargs: dict[str, Any],
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], str]:
         if run_manager is None:
             raise RuntimeError("BeliefKV ChatOpenAI requires a callback run manager")
         metadata = self._beliefkv_adapter.metadata_for_model_run(run_manager.run_id)
+        rid = f"beliefkv:{run_manager.run_id}"
         extra_body = dict(kwargs.get("extra_body") or {})
         existing = extra_body.get("beliefkv_metadata")
         if existing is not None and existing != metadata.to_wire():
             raise RuntimeError("conflicting beliefkv_metadata in ChatOpenAI request")
+        existing_rid = extra_body.get("rid")
+        if existing_rid is not None and existing_rid != rid:
+            raise RuntimeError("conflicting rid in ChatOpenAI request")
         extra_body["beliefkv_metadata"] = metadata.to_wire()
-        return {**kwargs, "extra_body": extra_body}
+        extra_body["rid"] = rid
+        request_kwargs = {**kwargs, "extra_body": extra_body}
+        if self._request_timeout_cap_s is not None:
+            timeout_s = self._request_timeout_cap_s
+            if self._activation_deadline is not None:
+                timeout_s = self._activation_deadline.request_timeout_s(timeout_s)
+            request_kwargs["timeout"] = timeout_s
+        return request_kwargs, rid
+
+    def _abort_request(self, rid: str) -> None:
+        if self._abort_url is None:
+            return
+        request = urllib.request.Request(
+            self._abort_url,
+            data=json.dumps({"rid": rid}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=1.0):
+                pass
+        except Exception:
+            # Preserve the original model failure. SGLang abort is idempotent and
+            # best-effort when the request failed before reaching the server.
+            return

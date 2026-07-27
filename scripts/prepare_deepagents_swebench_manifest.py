@@ -58,6 +58,14 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dataset-revision", required=True)
     parser.add_argument("--instance", action="append", default=[])
+    parser.add_argument(
+        "--selection-policy",
+        default=(
+            "all seven SymPy instances labeled 1-4 hours or >4 hours, plus "
+            "the five longest problem statements labeled 15 min - 1 hour whose "
+            "base commits exist in the pinned local source repository"
+        ),
+    )
     args = parser.parse_args()
 
     arrow_path = args.arrow.expanduser().resolve()
@@ -99,11 +107,7 @@ def main() -> int:
         "source_repo": str(source_repo),
         "source_repo_head": git_output(source_repo, "rev-parse", "HEAD"),
         "gold_fields_exposed": False,
-        "selection_policy": (
-            "all seven SymPy instances labeled 1-4 hours or >4 hours, plus the "
-            "five longest problem statements labeled 15 min - 1 hour whose base "
-            "commits exist in the pinned local source repository"
-        ),
+        "selection_policy": args.selection_policy,
         "workloads": workloads,
     }
     output.parent.mkdir(parents=True, exist_ok=True)

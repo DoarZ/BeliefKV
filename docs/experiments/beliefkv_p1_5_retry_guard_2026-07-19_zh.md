@@ -68,9 +68,9 @@ GPU 实验。
 实验路径：
 
 ```text
-raw server   experiments/raw/deepagents_swebench/20260718T174946Z/server-p1_5-retry-guard
-raw workload experiments/raw/deepagents_swebench/20260718T174946Z/planned-4-p1_5-retry-guard
-raw workload experiments/raw/deepagents_swebench/20260718T174946Z/planned-4b-p1_5-retry-guard
+raw server   experiments/archive/20260727/superseded_raw/deepagents_swebench/20260718T174946Z/server-p1_5-retry-guard
+raw workload experiments/archive/20260727/superseded_raw/deepagents_swebench/20260718T174946Z/planned-4-p1_5-retry-guard
+raw workload experiments/archive/20260727/superseded_raw/deepagents_swebench/20260718T174946Z/planned-4b-p1_5-retry-guard
 validation   experiments/processed/p1_5_20260718T174946Z/transfer_validation.json
 timeline     experiments/processed/p1_5_20260718T174946Z/kv_transfer_timeline.html
 ```

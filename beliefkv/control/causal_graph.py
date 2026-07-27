@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Iterable
 
@@ -116,6 +116,7 @@ class GraphDelta:
     parked_invocations: frozenset[str] = frozenset()
     completed_invocations: frozenset[str] = frozenset()
     changed_contexts: frozenset[str] = frozenset()
+    graph_version: int = 0
 
 
 class RuntimeCausalContextGraph:
@@ -129,7 +130,12 @@ class RuntimeCausalContextGraph:
         self.communication_edges: dict[tuple[str, str], CommunicationEdge] = {}
         self._processed_event_ids: set[str] = set()
         self._last_ts_by_workflow: dict[str, float] = {}
+        self._graph_version = 0
         self.strict_timestamps = strict_timestamps
+
+    @property
+    def graph_version(self) -> int:
+        return self._graph_version
 
     def timestamp_watermark(self, workflow_id: str) -> float | None:
         """Return the latest committed event time for one root workflow."""
@@ -138,7 +144,10 @@ class RuntimeCausalContextGraph:
 
     def apply(self, event: RuntimeEvent) -> GraphDelta:
         if event.event_id in self._processed_event_ids:
-            return GraphDelta(event_id=event.event_id)
+            return GraphDelta(
+                event_id=event.event_id,
+                graph_version=self._graph_version,
+            )
 
         last_ts = self._last_ts_by_workflow.get(event.workflow_id)
         if self.strict_timestamps and last_ts is not None and event.ts_ms < last_ts:
@@ -152,7 +161,8 @@ class RuntimeCausalContextGraph:
         self._last_ts_by_workflow[event.workflow_id] = max(
             event.ts_ms, last_ts if last_ts is not None else event.ts_ms
         )
-        return delta
+        self._graph_version += 1
+        return replace(delta, graph_version=self._graph_version)
 
     def apply_batch(
         self, events: Iterable[RuntimeEvent], *, atomic: bool = True
@@ -286,6 +296,13 @@ class RuntimeCausalContextGraph:
             changed_contexts=frozenset({invocation.context_id}),
         )
 
+    def _on_structured_action(self, event: RuntimeEvent) -> GraphDelta:
+        invocation = self._event_invocation(event)
+        self._validate_context_epoch(
+            self.contexts[invocation.context_id], event.context_epoch
+        )
+        return GraphDelta(event.event_id)
+
     def _on_call(self, event: RuntimeEvent) -> GraphDelta:
         return self._link_child(event, ExecutionMode.FOREGROUND)
 
@@ -357,6 +374,25 @@ class RuntimeCausalContextGraph:
 
     def _on_handoff(self, event: RuntimeEvent) -> GraphDelta:
         return self._deliver_message(event, handoff=True)
+
+    def _on_reactivate(self, event: RuntimeEvent) -> GraphDelta:
+        invocation = self._event_invocation(event)
+        self._ensure_not_terminal(invocation)
+        previous = invocation.state
+        if previous == InvocationState.RUNNING_LLM:
+            raise CausalGraphError("cannot reactivate an invocation already running")
+        invocation.state = InvocationState.READY
+        invocation.updated_ts_ms = event.ts_ms
+        awakened = (
+            frozenset({invocation.invocation_id})
+            if previous != InvocationState.READY
+            else frozenset()
+        )
+        return GraphDelta(
+            event.event_id,
+            awakened_invocations=awakened,
+            changed_contexts=frozenset({invocation.context_id}),
+        )
 
     def _deliver_message(self, event: RuntimeEvent, *, handoff: bool) -> GraphDelta:
         source = self._event_invocation(event)
@@ -677,6 +713,7 @@ class RuntimeCausalContextGraph:
         """Return a deterministic JSON-compatible state snapshot."""
 
         return {
+            "graph_version": self._graph_version,
             "workflows": {
                 key: {
                     "start_ts_ms": value.start_ts_ms,
@@ -686,36 +723,82 @@ class RuntimeCausalContextGraph:
                 for key, value in sorted(self.workflows.items())
             },
             "invocations": {
-                key: {
-                    "workflow_id": value.workflow_id,
-                    "context_id": value.context_id,
-                    "state": value.state.value,
-                    "parent_invocation_id": value.parent_invocation_id,
-                    "children": sorted(value.child_invocation_ids),
-                    "blocking_children": sorted(value.blocking_child_ids),
-                    "pending_messages": value.pending_messages,
-                    "join_id": value.join_id,
-                }
+                key: self._invocation_snapshot(value)
                 for key, value in sorted(self.invocations.items())
             },
             "contexts": {
                 key: {
                     "workflow_id": value.workflow_id,
                     "epoch": value.epoch,
+                    "created_ts_ms": value.created_ts_ms,
+                    "updated_ts_ms": value.updated_ts_ms,
                     "parent_context_id": value.parent_context_id,
+                    "context_mode": value.context_mode.value,
                     "invocation_ids": sorted(value.invocation_ids),
                     "persistent": value.persistent,
                 }
                 for key, value in sorted(self.contexts.items())
             },
             "joins": {
-                key: {
-                    "members": sorted(value.member_invocation_ids),
-                    "completed": sorted(value.completed_member_ids),
-                    "waiters": sorted(value.waiter_invocation_ids),
-                    "mode": value.mode.value,
-                    "satisfied": value.satisfied,
-                }
+                key: self._join_snapshot(value)
                 for key, value in sorted(self.joins.items())
             },
+            "communication_edges": [
+                {
+                    "source_invocation_id": value.source_invocation_id,
+                    "target_invocation_id": value.target_invocation_id,
+                    "count": value.count,
+                    "last_ts_ms": value.last_ts_ms,
+                }
+                for _, value in sorted(self.communication_edges.items())
+            ],
+        }
+
+    def invocation_snapshot(self, invocation_id: str) -> dict[str, object]:
+        """Serialize one invocation without materializing the complete RCCG."""
+
+        value = self.invocations.get(invocation_id)
+        return self._invocation_snapshot(value) if value is not None else {}
+
+    def join_snapshot(self, join_id: str) -> dict[str, object]:
+        """Serialize one join without materializing the complete RCCG."""
+
+        value = self.joins.get(join_id)
+        return self._join_snapshot(value) if value is not None else {}
+
+    @staticmethod
+    def _invocation_snapshot(value: InvocationRecord) -> dict[str, object]:
+        return {
+            "workflow_id": value.workflow_id,
+            "context_id": value.context_id,
+            "agent_definition_id": value.agent_definition_id,
+            "agent_instance_id": value.agent_instance_id,
+            "state": value.state.value,
+            "created_ts_ms": value.created_ts_ms,
+            "updated_ts_ms": value.updated_ts_ms,
+            "parent_invocation_id": value.parent_invocation_id,
+            "parent_context_id": value.parent_context_id,
+            "relation_type": value.relation_type.value,
+            "context_mode": value.context_mode.value,
+            "execution_mode": value.execution_mode.value,
+            "return_target_id": value.return_target_id,
+            "children": sorted(value.child_invocation_ids),
+            "blocking_children": sorted(value.blocking_child_ids),
+            "pending_messages": value.pending_messages,
+            "join_id": value.join_id,
+            "persistent": value.persistent,
+            "confidence": value.confidence.value,
+            "active_tool_family": value.active_tool_family,
+            "active_tool_start_ms": value.active_tool_start_ms,
+            "llm_round": value.llm_round,
+        }
+
+    @staticmethod
+    def _join_snapshot(value: JoinRecord) -> dict[str, object]:
+        return {
+            "members": sorted(value.member_invocation_ids),
+            "completed": sorted(value.completed_member_ids),
+            "waiters": sorted(value.waiter_invocation_ids),
+            "mode": value.mode.value,
+            "satisfied": value.satisfied,
         }

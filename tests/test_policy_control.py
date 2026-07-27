@@ -609,6 +609,58 @@ class TransferPolicyTest(unittest.TestCase):
         self.assertIsNotNone(eligible)
         self.assertEqual(eligible.kind, CommandKind.PREFETCH_CONTEXT)
 
+    def test_prefetch_restores_preferred_context_as_largest_bundle(self):
+        parent = PageHandle(1, 0)
+        child = PageHandle(2, 0)
+        self.h.index.register_page(
+            parent,
+            size_bytes=100,
+            residency=PhysicalResidency.CPU_ONLY,
+        )
+        self.h.index.register_page(
+            child,
+            size_bytes=400,
+            residency=PhysicalResidency.CPU_ONLY,
+            parent=parent,
+        )
+        self.h.index.bind_pages("ctx-child", 0, (parent, child))
+        self.h.invocation("wf", "other", "ctx-other")
+        other = PageHandle(3, 0)
+        self.h.index.register_page(
+            other,
+            size_bytes=50,
+            residency=PhysicalResidency.CPU_ONLY,
+        )
+        self.h.index.bind_pages("ctx-other", 0, (other,))
+        planner = ReactiveTransferPlanner(
+            self.h.graph,
+            self.h.index,
+            self.classifier,
+            self.frontier,
+            self.shadow,
+            TransferPlannerConfig(
+                reserve_hbm_bytes=0,
+                prefetch_enabled=True,
+                prefetch_chunk_bytes=1000,
+            ),
+        )
+
+        command = planner.plan_next(
+            now_ms=10,
+            hbm_capacity_bytes=2000,
+            actual_hbm_used_bytes=0,
+            signals=self.signals,
+            preferred_restore_context_ids=("ctx-child",),
+        )
+
+        self.assertIsNotNone(command)
+        self.assertEqual(command.context_id, "ctx-child")
+        self.assertEqual(command.target_bytes, 500)
+        self.assertEqual(
+            {item.handle for item in command.physical_bundle.page_actions},
+            {parent, child},
+        )
+
     def test_idle_window_prepares_non_destructive_shadow(self):
         handle = PageHandle(1, 0)
         self.h.index.register_page(handle, size_bytes=100)

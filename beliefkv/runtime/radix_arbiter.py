@@ -89,6 +89,8 @@ class RadixArbiter:
             return self._resolve_offload(command, shadow=True)
         if command.kind == CommandKind.PREFETCH_CONTEXT:
             return self._resolve_prefetch(command)
+        if command.kind == CommandKind.DROP_TERMINAL_PRIVATE:
+            return self._resolve_terminal_private_drop(command)
         if command.kind in {CommandKind.PIN_CONTEXT, CommandKind.UNPIN_CONTEXT}:
             action = (
                 PhysicalPageAction.PIN
@@ -117,6 +119,10 @@ class RadixArbiter:
             now_ms=command.created_ts_ms,
             allow_ready_owners=bool(command.metadata.get("allow_ready_owners", False)),
             protected_context_id=command.metadata.get("protected_context_id"),
+            bypass_owner_context_ids=frozenset(
+                str(item)
+                for item in command.metadata.get("bypass_owner_context_ids", ())
+            ),
         )
         if preview is None:
             return ResolvedCommand(
@@ -356,6 +362,75 @@ class RadixArbiter:
             tuple(selected),
             resolved_bytes,
             "resolved" if selected else "no_unowned_pages",
+        )
+
+    def _resolve_terminal_private_drop(
+        self, command: ControlCommand
+    ) -> ResolvedCommand:
+        """Release only Host copies proven private when a context terminated."""
+
+        limit = command.target_bytes or self.config.urgent_chunk_bytes
+        pages: list[PhysicalPageRecord] = []
+        blockers: list[TransferBlocker] = []
+        for handle in command.target_handles:
+            page = self.page_index.pages.get(handle)
+            if page is None or page.residency == PhysicalResidency.DEAD:
+                continue
+            if page.owner_contexts:
+                blockers.append(
+                    TransferBlocker(
+                        TransferBlockerCode.EXTENT_MUTATED,
+                        handle,
+                        page.size_bytes,
+                        "terminal-private extent acquired another owner",
+                    )
+                )
+                continue
+            if page.residency not in {
+                PhysicalResidency.DUAL_CLEAN,
+                PhysicalResidency.CPU_ONLY,
+            }:
+                continue
+            page_blockers = self._page_transfer_blockers(page)
+            if page_blockers:
+                blockers.extend(page_blockers)
+                continue
+            if page.residency == PhysicalResidency.CPU_ONLY and any(
+                child in self.page_index.pages
+                and self.page_index.pages[child].residency != PhysicalResidency.DEAD
+                for child in page.children
+            ):
+                blockers.append(
+                    TransferBlocker(
+                        TransferBlockerCode.DESCENDANT_CLOSURE,
+                        handle,
+                        page.size_bytes,
+                        "CPU-only terminal extent is not yet a Radix leaf",
+                    )
+                )
+                continue
+            pages.append(page)
+
+        pages.sort(key=lambda page: (-page.radix_depth, page.last_access_ms, page.handle))
+        selected: list[ResolvedPageAction] = []
+        resolved_bytes = 0
+        for page in pages:
+            if resolved_bytes >= limit:
+                break
+            selected.append(
+                ResolvedPageAction(
+                    page.handle,
+                    PhysicalPageAction.DROP_HOST,
+                    page.size_bytes,
+                )
+            )
+            resolved_bytes += page.size_bytes
+        return ResolvedCommand(
+            command,
+            tuple(selected),
+            resolved_bytes,
+            "resolved" if selected else "no_terminal_private_host_pages",
+            self._deduplicate_blockers(blockers) if not selected else (),
         )
 
     @staticmethod

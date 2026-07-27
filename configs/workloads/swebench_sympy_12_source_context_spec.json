@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "selection": "gold_change_paths_only; content_read_from_each_instance_base_commit",
+  "workloads": [
+    {
+      "instance_id": "sympy__sympy-12489",
+      "reference_commit": "a0f997ad56eafa99925153d673074a3116c3a230",
+      "paths": [
+        "sympy/combinatorics/permutations.py",
+        "sympy/combinatorics/tests/test_permutations.py"
+      ]
+    },
+    {
+      "instance_id": "sympy__sympy-13852",
+      "reference_commit": "2ec7166dc180589530ae7107e34bf31acd35e2fc",
+      "paths": [
+        "sympy/functions/special/tests/test_zeta_functions.py"
+      ]
+    },
+    {
+      "instance_id": "sympy__sympy-13878",
+      "reference_commit": "710e4f5a49f54c28444b5acf3abbf4329ecbd67d",
+      "paths": [
+        "sympy/stats/crv_types.py",
+        "sympy/stats/tests/test_continuous_rv.py"
+      ]
+    },
+    {
+      "instance_id": "sympy__sympy-14248",
+      "reference_commit": "82bf1d76747b3d309fba5079a16a4e3183fc21fd",
+      "paths": [
+        "sympy/printing/latex.py",
+        "sympy/printing/pretty/pretty.py",
+        "sympy/printing/str.py",
+        "sympy/printing/tests/test_latex.py"
+      ]
+    },
+    {
+      "instance_id": "sympy__sympy-16597",
+      "reference_commit": "fd007c2b589590fff49624bbd864b62c3450c44c",
+      "paths": [
+        "sympy/assumptions/ask.py",
+        "sympy/core/assumptions.py",
+        "sympy/core/power.py",
+        "sympy/core/tests/test_assumptions.py"
+      ]
+    },
+    {
+      "instance_id": "sympy__sympy-17630",
+      "reference_commit": "5b589f797d5e8a8ed7c9878f71af29256da79651",
+      "paths": [
+        "sympy/matrices/expressions/matexpr.py",
+        "sympy/matrices/expressions/tests/test_blockmatrix.py",
+        "sympy/matrices/expressions/tests/test_matadd.py"
+      ]
+    },
+    {
+      "instance_id": "sympy__sympy-18199",
+      "reference_commit": "4bdfba0d9fc5e3e69ced9d6e56f2efb28e9f9668",
+      "paths": [
+        "sympy/ntheory/residue_ntheory.py",
+        "sympy/ntheory/tests/test_residue.py"
+      ]
+    },
+    {
+      "instance_id": "sympy__sympy-13877",
+      "reference_commit": "6404271241aed0327e60c847e119b040cdd33281",
+      "paths": [
+        "sympy/matrices/matrices.py",
+        "sympy/matrices/tests/test_matrices.py"
+      ]
+    },
+    {
+      "instance_id": "sympy__sympy-17318",
+      "reference_commit": "f99ed644c4baa15dce312a8ff520cecd9ae9ac6d",
+      "paths": [
+        "sympy/simplify/radsimp.py",
+        "sympy/simplify/sqrtdenest.py",
+        "sympy/simplify/tests/test_sqrtdenest.py"
+      ]
+    },
+    {
+      "instance_id": "sympy__sympy-16792",
+      "reference_commit": "3cb3e34f16f764da7b58af2c983382a5578cd9df",
+      "paths": [
+        "sympy/utilities/codegen.py",
+        "sympy/utilities/tests/test_codegen.py"
+      ]
+    },
+    {
+      "instance_id": "sympy__sympy-19040",
+      "reference_commit": "63ab534ebc9bb8fa47ca80aea5a1b0eca743fb9e",
+      "paths": [
+        "sympy/polys/factortools.py",
+        "sympy/polys/tests/test_polytools.py"
+      ]
+    },
+    {
+      "instance_id": "sympy__sympy-15599",
+      "reference_commit": "53b5006a1a56c71fadc954e3ca530879b31db415",
+      "paths": [
+        "sympy/core/mod.py",
+        "sympy/core/tests/test_arit.py"
+      ]
+    }
+  ]
+}

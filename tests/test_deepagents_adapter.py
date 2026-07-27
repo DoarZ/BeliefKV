@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import itertools
+import json
 import threading
+from types import SimpleNamespace
 from typing import Any, Sequence
 from uuid import uuid4
 
@@ -12,12 +14,17 @@ pytest.importorskip("deepagents")
 from deepagents import create_deep_agent
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.outputs import ChatGeneration, ChatResult, LLMResult
 from langchain_core.runnables import Runnable
+from langchain_openai import ChatOpenAI
 
 from beliefkv.control.causal_graph import InvocationState, RuntimeCausalContextGraph
 from beliefkv.core.events import RuntimeEventKind
-from beliefkv.runtime.deepagents_adapter import DeepAgentsRuntimeAdapter
+from beliefkv.experiments.agent_protocol import ActivationDeadline
+from beliefkv.runtime.deepagents_adapter import (
+    BeliefKVChatOpenAI,
+    DeepAgentsRuntimeAdapter,
+)
 from beliefkv.runtime.sglang_adapter import BeliefKVRequestMetadata
 
 
@@ -143,6 +150,7 @@ def test_deepagents_task_callbacks_form_replayable_parent_child_join() -> None:
         and event.invocation_id == child_create.invocation_id
     )
     assert child_llm.context_id == child_create.context_id
+    assert child_create.attributes["persistent"] is True
     assert child_create.attributes["description_chars"] > 0
     assert "description" not in child_create.attributes
 
@@ -239,6 +247,93 @@ def test_code_orchestrator_can_bind_dynamic_child_runs() -> None:
     assert kinds.count(RuntimeEventKind.RETURN) == 3
 
 
+def test_cancelled_runtime_task_does_not_satisfy_join() -> None:
+    sink = CollectingSink()
+    root = BeliefKVRequestMetadata("wf", "root", "ctx", 0, "supervisor", "root")
+    adapter = DeepAgentsRuntimeAdapter(sink, root)
+    adapter.start()
+    tasks = adapter.declare_runtime_tasks(
+        [("explorer", "Inspect"), ("tester", "Test")],
+        group_id="cancelled-group",
+    )
+
+    adapter.complete_runtime_task(tasks[0])
+    adapter.complete_runtime_task(tasks[1], error=TimeoutError("deadline"))
+
+    kinds = [event.kind for event in sink.events]
+    assert kinds.count(RuntimeEventKind.RETURN) == 1
+    assert kinds.count(RuntimeEventKind.INVOCATION_CANCEL) == 1
+    assert RuntimeEventKind.JOIN_SATISFIED not in kinds
+
+
+def test_chat_client_uses_remaining_deadline_and_aborts_failed_request(
+    monkeypatch,
+) -> None:
+    sink = CollectingSink()
+    root = BeliefKVRequestMetadata("wf", "root", "ctx", 0, "supervisor", "root")
+    adapter = DeepAgentsRuntimeAdapter(sink, root)
+    adapter.start()
+    model_run_id = uuid4()
+    adapter.on_chat_model_start(
+        {},
+        [[HumanMessage(content="inspect")]],
+        run_id=model_run_id,
+    )
+    now = [10.0]
+    deadline = ActivationDeadline(clock=lambda: now[0])
+    deadline.start(20.0)
+    now[0] = 14.0
+    client = BeliefKVChatOpenAI(
+        beliefkv_adapter=adapter,
+        activation_deadline=deadline,
+        request_timeout_s=900.0,
+        abort_url="http://127.0.0.1:30000/abort_request",
+        model="test-model",
+        base_url="http://127.0.0.1:30000/v1",
+        api_key="EMPTY",
+        max_retries=0,
+    )
+    run_manager = SimpleNamespace(run_id=model_run_id)
+    payload, rid = client._with_beliefkv_runtime(run_manager, {})
+    assert payload["timeout"] == 16.0
+    assert payload["extra_body"]["rid"] == rid
+    assert payload["extra_body"]["beliefkv_metadata"]["invocation_id"] == "root"
+
+    aborted: list[tuple[str, dict[str, str], float]] = []
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            del args
+
+    def fake_urlopen(request, *, timeout):
+        aborted.append(
+            (request.full_url, json.loads(request.data.decode("utf-8")), timeout)
+        )
+        return _Response()
+
+    def fail_generate(self, messages, stop=None, run_manager=None, **kwargs):
+        del self, messages, stop, run_manager, kwargs
+        raise TimeoutError("request timed out")
+
+    monkeypatch.setattr(
+        "beliefkv.runtime.deepagents_adapter.urllib.request.urlopen", fake_urlopen
+    )
+    monkeypatch.setattr(ChatOpenAI, "_generate", fail_generate)
+    with pytest.raises(TimeoutError, match="request timed out"):
+        client._generate([], run_manager=run_manager)
+
+    assert aborted == [
+        (
+            "http://127.0.0.1:30000/abort_request",
+            {"rid": rid},
+            1.0,
+        )
+    ]
+
+
 def test_ordinary_tool_boundaries_keep_the_model_tool_call_id() -> None:
     sink = CollectingSink()
     root = BeliefKVRequestMetadata("wf", "root", "ctx", 0, "supervisor", "root")
@@ -262,6 +357,113 @@ def test_ordinary_tool_boundaries_keep_the_model_tool_call_id() -> None:
         "call-from-model",
         "call-from-model",
     ]
+
+
+def test_structured_completion_is_not_counted_as_an_external_tool() -> None:
+    sink = CollectingSink()
+    root = BeliefKVRequestMetadata("wf", "root", "ctx", 0, "supervisor", "root")
+    adapter = DeepAgentsRuntimeAdapter(
+        sink,
+        root,
+        event_namespace="agenticroot",
+        completion_tool_names=frozenset({"WorkflowCompletion"}),
+    )
+    run_id = uuid4()
+
+    adapter.on_tool_start(
+        {"name": "WorkflowCompletion"},
+        "",
+        run_id=run_id,
+        inputs={"status": "blocked"},
+        tool_call_id="completion-call",
+    )
+    adapter.on_tool_end("accepted", run_id=run_id)
+
+    assert not any(
+        event.kind in {RuntimeEventKind.TOOL_START, RuntimeEventKind.TOOL_END}
+        for event in sink.events
+    )
+
+
+def test_unsupported_subagent_type_does_not_create_a_physical_child() -> None:
+    sink = CollectingSink()
+    root = BeliefKVRequestMetadata("wf", "root", "ctx", 0, "supervisor", "root")
+    adapter = DeepAgentsRuntimeAdapter(
+        sink,
+        root,
+        allowed_subagent_types=frozenset({"repository-explorer"}),
+    )
+    model_run_id = uuid4()
+    tool_run_id = uuid4()
+    adapter.on_llm_end(
+        LLMResult(
+            generations=[
+                [
+                    ChatGeneration(
+                        message=AIMessage(
+                            content="",
+                            tool_calls=[
+                                {
+                                    "name": "task",
+                                    "args": {
+                                        "description": "Inspect the repository",
+                                        "subagent_type": "general-purpose",
+                                    },
+                                    "id": "invalid-task",
+                                }
+                            ],
+                        )
+                    )
+                ]
+            ]
+        ),
+        run_id=model_run_id,
+    )
+    adapter.on_tool_start(
+        {"name": "task"},
+        "",
+        run_id=tool_run_id,
+        inputs={
+            "description": "Inspect the repository",
+            "subagent_type": "general-purpose",
+        },
+        tool_call_id="invalid-task",
+    )
+    adapter.on_tool_end("unsupported type", run_id=tool_run_id)
+
+    assert not any(
+        event.kind
+        in {
+            RuntimeEventKind.INVOCATION_CREATE,
+            RuntimeEventKind.SPAWN,
+            RuntimeEventKind.JOIN_CREATE,
+        }
+        for event in sink.events
+    )
+    result = next(event for event in sink.events if event.kind == RuntimeEventKind.LLM_RESULT)
+    assert result.attributes["rejected_task_call_count"] == 1
+
+
+def test_adapter_event_namespace_prevents_cross_peer_id_collisions() -> None:
+    first_sink = CollectingSink()
+    second_sink = CollectingSink()
+    first = DeepAgentsRuntimeAdapter(
+        first_sink,
+        BeliefKVRequestMetadata("wf", "root-a", "ctx-a", 0),
+        event_namespace="peera",
+    )
+    second = DeepAgentsRuntimeAdapter(
+        second_sink,
+        BeliefKVRequestMetadata("wf", "root-b", "ctx-b", 0),
+        event_namespace="peerb",
+    )
+
+    first.start()
+    second.start()
+
+    first_ids = {event.event_id for event in first_sink.events}
+    second_ids = {event.event_id for event in second_sink.events}
+    assert first_ids.isdisjoint(second_ids)
 
 
 def test_declared_join_ids_are_scoped_to_the_workflow() -> None:

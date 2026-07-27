@@ -74,7 +74,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stuck-alternating-repetitions", type=int, default=3)
     parser.add_argument("--stuck-consecutive-error-limit", type=int, default=3)
     parser.add_argument("--stuck-no-progress-limit", type=int, default=5)
-    parser.add_argument("--stuck-diagnostic-probe-limit", type=int, default=8)
     parser.add_argument("--stuck-max-model-calls", type=int, default=32)
     parser.add_argument("--stuck-max-tool-calls", type=int, default=64)
     parser.add_argument("--stuck-recovery-model-calls", type=int, default=3)
@@ -139,7 +138,6 @@ def main() -> int:
             alternating_cycle_repetitions=args.stuck_alternating_repetitions,
             consecutive_error_limit=args.stuck_consecutive_error_limit,
             consecutive_no_progress_limit=args.stuck_no_progress_limit,
-            consecutive_diagnostic_probe_limit=args.stuck_diagnostic_probe_limit,
             max_model_calls_without_completion=args.stuck_max_model_calls,
             max_tool_calls_without_completion=args.stuck_max_tool_calls,
             recovery_model_call_limit=args.stuck_recovery_model_calls,

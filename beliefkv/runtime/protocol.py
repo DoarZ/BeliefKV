@@ -36,9 +36,11 @@ class CommandKind(str, Enum):
     ADMIT_REQUEST = "admit_request"
     DEFER_REQUEST = "defer_request"
     OFFLOAD_CONTEXT = "offload_context"
+    DROP_CONTEXT = "drop_context"
     SHADOW_CONTEXT = "shadow_context"
     PREFETCH_CONTEXT = "prefetch_context"
     DROP_UNOWNED = "drop_unowned"
+    DROP_TERMINAL_PRIVATE = "drop_terminal_private"
     PIN_CONTEXT = "pin_context"
     UNPIN_CONTEXT = "unpin_context"
     SET_WORKFLOW_BUDGET = "set_workflow_budget"
@@ -80,6 +82,7 @@ class PhysicalPageAction(str, Enum):
     COMMIT_CPU = "commit_cpu"
     START_H2D = "start_h2d"
     DROP = "drop"
+    DROP_HOST = "drop_host"
     PIN = "pin"
     UNPIN = "unpin"
 
@@ -138,6 +141,7 @@ class ControlCommand:
     queue_class: CommandQueueClass = CommandQueueClass.URGENT
     metadata: Mapping[str, Any] = field(default_factory=dict)
     physical_bundle: PhysicalBundleIntent | None = None
+    target_handles: tuple[PageHandle, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.command_id:
@@ -148,6 +152,8 @@ class ControlCommand:
             raise ValueError("target_bytes must be non-negative")
         if self.context_epoch is not None and self.context_epoch < 0:
             raise ValueError("context_epoch must be non-negative")
+        if len(set(self.target_handles)) != len(self.target_handles):
+            raise ValueError("target_handles must be unique")
 
 @dataclass(frozen=True)
 class TransferBlocker:

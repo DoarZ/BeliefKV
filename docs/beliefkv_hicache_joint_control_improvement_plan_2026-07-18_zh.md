@@ -1,13 +1,19 @@
 # BeliefKV 当前版本改进方案：基于 HiCache 数据面的 Agent/KV 联合控制
 
-初始日期：2026-07-18  
-最新修订：2026-07-20  
-状态：实施中；P0/P1 已通过，P2 可靠性修复通过 CPU gate，真实 GPU gate 待复验  
+初始日期：2026-07-18
+最新修订：2026-07-27
+状态：实施中；P2 显式 bundle 可靠性 gate 与 P2.5 已通过；P4 修复后 24-workflow GPU 复验
+已形成 96% KV 压力并验证 admission/迁移活性，但 JointPlan planning budget 和 workload 终止性
+未过 gate；P5A--P5C CPU/接口路径已实现且默认关闭，真实 GPU gate 待执行
 依赖分析：
 
+- [BeliefKV 相关工作与竞品对比总表](related_work_comparison_2026-07-21_zh.md)
 - [HiCache / HiSparse / Theta KVPool 对 BeliefKV 的启发与差异分析](hicache_theta_kvpool_implications_2026-07-18_zh.md)
 - [BeliefKV 面对动态 Agent Workflow 需要注意的地方](beliefkv_dynamic_agent_workflow_considerations_2026-07-20_zh.md)
 - [P2 Physical Causal Lease 与原子 Bundle 执行](experiments/beliefkv_p2_physical_bundle_2026-07-19_zh.md)
+- [P3 Rolling Physical Replay 与 Trace-order Oracle 检查点](experiments/beliefkv_p3_rolling_oracle_2026-07-21_zh.md)
+- [P3 动态并发 GPU Characterization](experiments/beliefkv_p3_dynamic_gpu_validation_2026-07-21_zh.md)
+- [P4 24-workflow Chunked-Prefill Correctness Gate](experiments/beliefkv_p4_chunked_prefill_gate_2026-07-23_zh.md)
 - [ScaleSim](https://arxiv.org/abs/2601.21473)、
   [AugServe](https://arxiv.org/abs/2512.04013)、
   [ThunderAgent](https://arxiv.org/abs/2602.13692) 和
@@ -39,11 +45,26 @@ JointPlan
 独立的优先级。即使关闭预测，事件驱动 baseline 也必须通过同一个 JointPlan 接口，确保
 性能差异来自策略而不是执行路径不同。
 
-完整部署 ScaleSim、AugServe、ThunderAgent 等外部系统不阻塞 P2-P6 的功能实现，但它们的
-策略空间、输入假设和输出动作必须从 P2.5 开始进入统一 reference-policy 接口。BeliefKV
-功能稳定前使用同数据面的 shadow/replay 和 hindsight oracle 验证算法边界；功能稳定后再做
-原生系统端到端对比。不能以“动态 workflow 更真实”为理由，把所有竞争验证推迟到系统完成
-之后。
+P2-P6 不搭建 ScaleSim、AugServe、ThunderAgent、CONCUR 等方法的统一对比框架，也不为其
+实现 adapter、预测器或前端 metadata producer。当前已经存在的不可变
+`PolicyInput/PolicyOutput`、中立 trace 和 reactive replay 只服务于 BeliefKV 自身的正确性、
+O0-O3 oracle 和回归验证，不再承担“兼容所有竞品”的职责。早期竞品策略草图和专用 hindsight
+注入已从维护代码删除，不恢复也不继续扩展。
+
+BeliefKV 的功能、正确性和配置在 P5/P6 稳定后，P8 再重新评估场景重叠、metadata 假设、公开
+代码和硬件兼容性，并据此选择可以忠实运行的比较方法。当前计划不预设一定采用
+same-data-plane adaptation、metadata oracle 或原生部署中的哪一种，也不要求核心系统为了未来
+竞品修改在线接口。
+
+该调整不意味着最终论文可以回避相关工作。它只避免在动态 subagent workload、JointPlan
+接口和物理数据面仍变化时，用不忠实的策略改写污染核心架构。现在只采集解释 BeliefKV 决策
+和复现实验所必需的运行时事件、物理 extent、资源和服务 trace；不得为了潜在竞品额外合成
+invocation distance、tool duration、program phase 或其他应用先验。
+
+BeliefKV 不再表述为 metadata-free。系统要求 invocation/context identity，以及已经发生的
+spawn、wait、return、message、handoff 和 tool 等最小在线因果事件；它不要求的是先验完整 DAG、
+未来 agent、invocation distance、未来工具时长或 program phase。论文定位统一为：
+**无需先验 DAG、依靠最小在线因果事件动态发现 workflow**。
 
 本文只定义可以落到当前仓库的模块、接口、算法、测试和退出条件。以下能力不作为
 BeliefKV 的创新：
@@ -73,8 +94,9 @@ ICML 2026 相关工作已经覆盖“预测下一次调用/工具时间，再决
 prefetch 或 eviction”的宽泛表述。因此该表述不能单独成为 Major contribution。P5.5 将额外
 检验一个更窄的候选 insight：根据在线 action frontier 优先完成能够产生合法 tool/spawn/
 handoff 的 decode quantum，并依据校准置信度控制 KV 动作从 KEEP、SHADOW 到 COMMIT 的
-可逆程度。只有其 oracle 明显优于带 hindsight 信息的 ScaleSim/AugServe reference policy，
-P6 才将其升级为核心算法；否则继续使用更保守的 Dynamic Frontier JointPlan。
+可逆程度。P5.5 先相对当前 reactive policy、scheduler-only、KV-only 和 observed-state
+JointPlan 验证该目标是否有独立机制收益。与 ScaleSim/AugServe 等工作的最终实验边界在系统
+冻结后重新判断，不再阻塞 P6 的实现与正确性验证。
 
 Reveal-and-Commit 只是该联合框架中的条件性动作：当一个当前可运行的 agent 能在强制内存
 决策前消除高代价场景分歧时才启用。它不再被预设为所有 blocking subagent workload 的
@@ -255,7 +277,7 @@ observed RCCG facts G_t
 JointPlan 只能调度 `G_t` 中已经 READY 的 invocation；`H_t` 只能影响已存在 agent 的排序和
 KEEP/PREPARE/PREFETCH 等可撤销动作，不能创建虚构 request 或授权不可行的物理迁移。
 
-### 2.8 竞争边界与分层对比原则
+### 2.8 竞争边界与后置比较原则
 
 现阶段不能再把以下单点作为 BeliefKV 的创新：
 
@@ -264,25 +286,26 @@ KEEP/PREPARE/PREFETCH 等可撤销动作，不能创建虚构 request 或授权�
 - 将 agent phase、waiting queue 和 KV pause/restore 联合管理，ThunderAgent 已实现；
 - 根据 KV pressure/hit rate 调整 active agent 数，CONCUR 已使用 AIMD feedback control。
 
-BeliefKV 后续比较分为三层：
+这些工作仍决定 BeliefKV 可以声明什么，但不应在系统尚未稳定时决定其内部接口，也不能假设
+它们可以直接迁移到动态 multi-agent/subagent workload。当前实施边界是：
 
 ```text
-L1: hindsight/oracle policy replay
-    给竞品真实 invocation distance、output/tool duration 或 phase metadata
-    用于判断 BeliefKV 的目标和动作空间是否存在上界收益
+P3-P6 主线
+    observed-state reactive baseline
+    SGLang/HiCache 原生数据面基线
+    BeliefKV 自身 PolicyInput/physical trace、O0-O3 联合性 oracle
+    不实现竞品 adapter，不为其合成前端 metadata
 
-L2: same-data-plane reference policy
-    所有策略通过同一个 PolicyInput/PolicyOutput 在 BeliefKV/SGLang 上执行
-    用于隔离调度/KV算法收益，避免引擎版本和数据面差异
-
-L3: native end-to-end system
-    在 BeliefKV P5/P6 稳定后部署开源原系统
-    用于验证 reference policy 的忠实度和最终端到端竞争力
+系统冻结后的 P8
+    先检查论文代码、输入假设、工作流语义和硬件是否真正可比
+    再为可比方法选择原生复现、共同 workload 或最小忠实适配
+    不要求所有方法进入同一个 BeliefKV policy framework
 ```
 
-L1/L2 必须先于 predictive policy 实现；L3 可以延后，但在形成论文系统结果前必须完成。对
-不支持动态 peer/subagent 语义的竞品，同时报告 common-denominator workload 和 BeliefKV
-完整动态 workload，不把“不支持”直接记为性能失败。
+P8 不再是 P4-P6 的 correctness 或实现前置条件。最终投稿前仍需完成可比且可运行的强基线，
+但比较集合由届时的系统能力和 workload intersection 决定。对依赖 invocation distance、静态
+DAG、program phase 等前端先验的方法，只有真实应用能够提供相同信息时才进入在线性能对比；
+否则只在 related-work/assumption 表中说明边界，不为制造数值结果而构造不忠实实现。
 
 ## 3. 目标架构
 
@@ -843,8 +866,9 @@ EXECUTE/ACK/OBSERVE G_(t+1)
 
 ### 6.6 条件性 Action-frontier 扩展
 
-该扩展不是 P4/P5 的 correctness 必需项，只有 P5.5 证明 action-unlock oracle 相比 B1/B2
-存在独立收益后才进入 P6。其关键不是增加一个 priority score，而是把短 decode quantum 与
+该扩展不是 P4/P5 的 correctness 必需项，只有 P5.5 证明 action-unlock oracle 相比当前
+reactive policy 和独立 scheduling/KV oracle 存在收益后才进入 P6。其关键
+不是增加一个 priority score，而是把短 decode quantum 与
 随后发生的 KV 生命周期转换建模为同一个候选动作：
 
 ```text
@@ -930,33 +954,39 @@ joint_plan: JointPlan | None
 execution_intent: ExecutionIntent | None
 ```
 
-SGLang waiting queue 不再自行重新计算 workflow/frontier 顺序，而是优先应用
-`ExecutionIntent.ordered_request_ids`。未出现在 intent 中的请求保持上游相对顺序，未携带
+SGLang 始终拥有 waiting queue，不再由 BeliefKV 抽取和稍后放回 request。
+`ExecutionIntent.ordered_request_ids` 在当前 batch-construction epoch 被编译成短期 ticket 的
+eligibility 和优先级；未获得 ticket 的 tagged request 本轮跳过但继续留在原生队列，未携带
 BeliefKV metadata 的请求不受影响。
 
-从 P4 开始强制以下单写者规则：
+P4 只生成和验证 shadow plan，现有 reactive controller 仍是实际动作的唯一写者；**从 P5
+开始**强制以下 JointPlan 单写者规则：
 
 ```text
 JointPlanner 是 tagged agent request 顺序、admission 和策略性 KV 动作的唯一决策者。
 AdmissionController 只校验/兑现 AdmissionIntent，不再重新选择 workflow。
 ReactiveTransferPlanner 只把 ResidencyIntent 编译成 command，不再重新选择 victim。
-SGLang reorder_waiting_queue 只应用 ExecutionIntent，不再重新计算 frontier/fairness。
+SGLang admission gate 只消费由 ExecutionIntent 编译的当前 epoch ticket，不再重新计算策略。
 RadixArbiter 仍可因物理状态拒绝计划，但不能替换为另一个策略动作。
 ```
 
 未携带 BeliefKV metadata 的普通请求继续采用 SGLang 原生策略，不能被 JointPlan 饿死；其
 容量和服务消耗作为 external charge 反馈给下一次规划。
 
-### 7.1 两级公平约束
+### 7.1 吞吐优先的软公平约束
 
-联合策略继续使用两级结构：
+联合策略保留两级排序信息，但 workflow 公平不作为 batch admission 的硬配额：
 
-1. **workflow 层**：按 attained GPU service 和 physical HBM charge 维护 virtual runtime；
+1. **workflow 层**：按 attained GPU service 和 physical HBM charge 维护 virtual runtime，用于
+   防饿死、等待上界和同等物理收益下的 tie-break；
 2. **workflow 内部**：按 causal frontier、next-consumer progress、reveal value、循环终止机会和
    exact startup cost 选择 invocation。
 
-REVEAL 不能无限突破公平。建议增加 `fairness_lag_budget_ms`：只有 virtual runtime 不超过
-最欠服务 workflow 加该预算的 workflow，才允许因 reveal 被提前。
+不设置“每个 workflow 每轮最多一个 request”、固定 `1/N` HBM 份额或固定 round-robin。只要
+多个 request 均已 READY、物理上可同时 admission，且加入它们能够提高 prefill batch fill、
+action throughput 或 GPU 利用率，同一 workflow 可以在一个 scheduler epoch 获得多个 ticket。
+公平只通过最大等待时间、starvation guard 和软 virtual-runtime penalty 约束；除 liveness 上界
+外，不得让低收益的 workflow 均衡要求覆盖明显更高吞吐的可行 batch。
 
 ### 7.2 与 SGLang batch 的关系
 
@@ -964,14 +994,16 @@ REVEAL 不能无限突破公平。建议增加 `fairness_lag_budget_ms`：只有
 kernel。具体执行顺序：
 
 1. scheduler safe point 应用上一轮 ACK；
-2. 同步 Radix tree、allocator、lock 和 request 状态；
-3. controller 生成一个带 generation 的 `JointPlan`；
-4. runtime 使用 execution intent 重排 tagged waiting requests；
-5. admission 只放行与 plan 一致且物理可行的 request；
+2. 增量同步 Radix tree、allocator、lock 和 request 状态；
+3. controller 生成带 scoped generation 的 `JointPlan`；P4 reactive fallback 直接使用 observed
+   state，P5 使用主动 JointPlan；
+4. runtime 将 execution/admission intent 编译为当前 epoch 的 ticket，不移动 waiting request；
+5. SGLang prefill loop 跳过无 ticket 的 tagged request 并继续扫描，由 `PrefillAdder` 最终决定
+   哪些物理可行 request 进入 batch；
 6. admission 只有在依赖的 restore ACK 或 recompute plan 满足后才兑现；
 7. residency intent 经 RadixArbiter 再解析为 page action；
-8. plan 在 batch selection 前变 stale 时丢弃，并在同一 snapshot 上生成
-   `OBSERVED_JOINT` fallback。
+8. plan 的局部 component 在 batch selection 前变 stale 时只丢弃对应 ticket/action，并生成
+   有界 `OBSERVED_JOINT` fallback，不使无关 request 或 bundle 失效。
 
 ### 7.3 JointPlan 生成算法
 
@@ -979,27 +1011,29 @@ kernel。具体执行顺序：
 
 1. **建立 factual runnable frontier**：只收集 RCCG 中 `READY`、pending-message 或明确
    reactivation 的 invocation；`WAIT_TOOL/WAIT_CHILD/WAIT_JOIN` 只贡献 residency obligation；
-2. **选择 fair workflow window**：按 root-workflow virtual runtime、已获 GPU service 和
-   physical HBM charge 选出 bounded-lag workflow，fan-out 不增加份额；
+2. **建立有界候选窗口**：按 request readiness、causal progress、启动成本和当前资源可行性
+   收集候选；root-workflow virtual runtime、已获 GPU service 和 HBM charge 只提供软 penalty
+   与 starvation guard，不限制单个 workflow 的候选数；
 3. **构造 ExecutionPackage**：对每个 READY invocation 计算：
 
    ```text
    exact startup/restore bundles
    next-yield 前 token/KV demand
    可解除的 waiter、join、message consumer 或 loop termination
-   admission reservation 和 restore/recompute alternatives
+   startup budget 和 restore/recompute alternatives
    ```
 
 4. **联合枚举**：对每个候选 execution order，用 What-if Packer 同时选择 admission 和
    residency actions；不能先固定 agent，再从剩余空间找 KV victim；
 5. **场景聚合**：P4/P5 只计算 observed scenario；P6 对 top-K scenario 做 consensus、robust
    或 reveal 判定；
-6. **字典序选择**：先满足 correctness/liveness/fairness，再最大化 causal progress，最后最小化
-   unhidden stall、迁移/重算字节和 HBM-time；
+6. **字典序选择**：先满足 correctness、依赖和 liveness 硬约束，再最大化可行 batch 的 causal
+   progress、action throughput 和资源利用率，最后最小化 unhidden stall、迁移/重算字节、
+   HBM-time 与软公平 penalty；
 7. **生成依赖**：任何需要 H2D 的 request 都产生 `TransferDependency(require_ack=True)`；允许
    recompute 时把它作为明确 alternative，而不是隐式欠债；
-8. **版本化提交**：JointPlan 带 graph、allocator、topology 和 bundle generation；任一版本变化
-   使未执行部分 stale，并触发重新规划。
+8. **版本化提交**：JointPlan 带 graph、topology 和 touched request/bundle 的 scoped generation；
+   全局 allocator generation 只用于审计，局部依赖变化仅使相关 ticket/action stale。
 
 workflow 内 causal progress 的确定性优先级只使用已观测事实：
 
@@ -1014,10 +1048,10 @@ workflow 内 causal progress 的确定性优先级只使用已观测事实：
 该顺序不是最终 score。What-if Packer 可以因为启动成本、HBM 可行性或 root-workflow fairness
 选择后续候选，但所有偏离都必须在 JointPlan reason 中可审计。
 
-### 7.4 Reference-policy 兼容接口
+### 7.4 BeliefKV 内部策略快照与回放接口
 
-P2.5 开始提供只读、可 replay 的统一策略接口。它不是另建一套执行路径，而是让竞品策略和
-BeliefKV 使用同一个 snapshot，并输出同一种 JointPlan primitive：
+P2.5 已提供只读、可 replay 的统一策略快照。它只服务于当前 reactive policy、BeliefKV
+JointPlan、O0-O3 和离线物理分析，不是竞品扩展点，也不是另一套在线执行路径：
 
 ```python
 @dataclass(frozen=True)
@@ -1038,22 +1072,17 @@ class PolicyOutput:
     metadata_assumptions: tuple[str, ...]
 ```
 
-首批 reference policy：
+当前内部策略：
 
-| Policy | 输入 | 主要动作 | 前期用途 |
+| Policy | 输入 | 主要动作 | 当前状态 |
 | --- | --- | --- | --- |
-| `ReactivePolicy` | 当前物理状态 | LRU/reactive restore | B0 correctness baseline |
-| `DistancePolicy` | invocation distance | distance eviction/prefetch | ScaleSim-style B1 |
-| `SpaceTimePolicy` | output/tool duration | Preserve/Swap/Discard + value-density order | AugServe-style B2 |
-| `PhasePolicy` | Reasoning/Acting/program phase | Pause/Restore + shortest-first | ThunderAgent-style B3 |
-| `CongestionPolicy` | KV usage/hit/eviction feedback | AIMD admit/pause | CONCUR-style B4 |
+| `ReactivePolicy` | 当前物理状态 | LRU/reactive restore | 默认 correctness baseline |
 | `BeliefJointPolicy` | `G_t/H_t/R_t` | 完整 JointPlan | BeliefKV |
 
-P2.5/P3 中 reference policy 默认只记录 shadow output。hindsight metadata 只允许用于 oracle
-replay，必须在 `metadata_assumptions` 中声明，不能与在线 BeliefKV 结果混称为可部署策略。
-每个 policy 明确区分 `online` 与 `oracle` mode：前者只能使用论文要求且当前 runtime 实际可得
-的 metadata，后者可在 run 完成后注入真实未来信息。
-原生系统与 reference policy 在 common workload 上的动作和趋势偏差由 P8 单独校验。
+P2.5-P6 只记录 reactive counterfactual 和 BeliefKV 所需快照。不得继续向该接口添加竞品专用
+metadata、状态机或动作，也不增加动态 policy registry/plugin discovery。P8 若决定复现某个
+外部方法，应在核心系统冻结后使用独立 runner 或最小适配层；是否复用该快照届时决定，不能
+反向扩张 JointPlanner 的在线路径。
 
 ## 8. HiCache 数据面改进
 
@@ -1204,14 +1233,12 @@ prefetch 是可选优化。被 guard 抑制时不得阻塞 admission、decode �
 | `beliefkv/predictor/composer.py` | 保留边际预测 API；为 scenario builder 提供组成事件，不直接输出迁移动作 |
 | `beliefkv/runtime/bundles.py` | 生成 closure-aware physical bundle snapshot |
 | `beliefkv/policy/resource_snapshot.py` | 聚合 HBM、Host、PCIe、service curve 和 reservation |
+| `beliefkv/policy/reference/snapshot_builder.py` | 在 scheduler safe point 构造统一、可版本化的 `PolicyInput` 和不重叠物理 extent |
 | `beliefkv/policy/scenario_physicalizer.py` | 将场景映射为未来物理需求 |
 | `beliefkv/policy/whatif_packer.py` | 生成每个 scenario 的无副作用可行 plan |
 | `beliefkv/policy/joint_scheduler.py` | observed/robust/reveal 模式，联合 Execution/Admission/Residency 和依赖 |
-| `beliefkv/policy/reference/base.py` | 定义统一 PolicyInput/PolicyOutput、metadata assumptions 和 shadow/replay API |
-| `beliefkv/policy/reference/distance.py` | ScaleSim-style invocation-distance reference policy |
-| `beliefkv/policy/reference/space_time.py` | AugServe-style space-time/value-density reference policy |
-| `beliefkv/policy/reference/phase.py` | ThunderAgent-style phase-aware pause/restore reference policy |
-| `beliefkv/policy/reference/congestion.py` | CONCUR-style AIMD admission reference policy |
+| `beliefkv/policy/reference/base.py` | 历史命名；定义 BeliefKV 内部 PolicyInput/PolicyOutput 和 shadow/replay API，不再扩展竞品 adapter |
+| `beliefkv/policy/reference/reactive.py` | observed-state reactive correctness/replay baseline |
 | `beliefkv/policy/admission.py` | 从独立选 workflow 改为校验并兑现 AdmissionIntent |
 | `beliefkv/policy/transfer_planner.py` | 从独立选 victim 改为编译 ResidencyIntent；旧逻辑仅保留为实验 baseline |
 | `beliefkv/policy/transfer_guard.py` | 新增失败 attempt ledger、typed blocker 和 event-gated retry eligibility |
@@ -1224,7 +1251,8 @@ prefetch 是可选优化。被 guard 抑制时不得阻塞 admission、decode �
 | `beliefkv/runtime/audit.py` | schema 升级并记录 scenario/lease/joint-plan 事件 |
 | `beliefkv/predictor/unlock_hazard.py` | P5.5 gate 通过后预测 active invocation 到合法 action 的 token hazard |
 | `beliefkv/predictor/reentry_hazard.py` | 预测 waiting context 的 return/reactivation 与 prompt-delta 分布 |
-| `beliefkv/experiments/policy_replay.py` | 在冻结 trace 上运行 B0-B4、O0-O3 和 action-unlock oracle |
+| `beliefkv/experiments/policy_replay.py` | 只运行内部 reactive policy 和 O0-O3；不承担外部方法复现 |
+| `beliefkv/metrics/policy_snapshot.py` | 统计快照覆盖、safe-point 开销、writer 完整性和压缩存储成本 |
 | `beliefkv/core/config.py` | 增加 feature flags、场景预算、公平 lag 和风险阈值 |
 
 建议配置项及第一版默认值：
@@ -1262,6 +1290,8 @@ transfer_retry_unknown_circuit_breaker_failures=8
 `frontier_belief_enabled` 激活，用于隔离 agent/KV 联合调度本身与预测收益。
 `action_frontier_observer_enabled` 只采集结构化 action 状态，不改变 decode 顺序；
 `action_frontier_policy_enabled` 必须等 P5.5 gate 通过后才能打开。
+`reference_policy_shadow_enabled` 是现有实现的历史配置名，只控制内部 reactive
+counterfactual；不得据此注册外部策略。
 
 ## 10. 审计与实验数据格式
 
@@ -1335,6 +1365,10 @@ decision_metrics.csv
 action_metrics.csv
 ```
 
+`reference_policy_decision` 和 `reference_policy_decisions.jsonl` 同样是历史 schema 名称，P2-P6
+只写内部 reactive counterfactual。为避免破坏现有实验解析器暂不改名，但不再把它们解释为
+通用竞品对比框架。
+
 ## 11. 分阶段实施计划
 
 ### P0：冻结当前 correctness baseline
@@ -1354,8 +1388,13 @@ action_metrics.csv
 
 ### P1：补全 capability 和真实 telemetry
 
-实施状态（2026-07-18）：已完成。真实验证与统计限制见
-[P1 HiCache 真实迁移、服务曲线与控制开销验证](experiments/beliefkv_p1_real_hicache_validation_2026-07-18_zh.md)。
+实施状态（2026-07-21 修订）：BeliefKV 显式 command 的 telemetry、ACK 和 timeline 已完成，
+但全系统 HiCache operation coverage 重新打开。P3 mixed run 证明 SGLang request admission 可通过
+`init_load_back()` 发起无 BeliefKV command ID 的 native H2D；当前 telemetry 不包含这类 demand
+load。因此 P1 只能标记为 explicit-command telemetry 完成，不能继续声称所有 HiCache DMA
+均可观测。真实验证与统计限制见
+[P1 HiCache 真实迁移、服务曲线与控制开销验证](experiments/beliefkv_p1_real_hicache_validation_2026-07-18_zh.md)
+和 [P3 动态并发 GPU Characterization](experiments/beliefkv_p3_dynamic_gpu_validation_2026-07-21_zh.md)。
 
 实现文件：
 
@@ -1438,13 +1477,25 @@ eviction；H2D 复用 HiCache 原生 ancestor load。确定性与故障注入测
 `FileNotFoundError` 使 P2 gate 失败。详见
 [P2 physical bundle 实现与验证](experiments/beliefkv_p2_physical_bundle_2026-07-19_zh.md)。
 
-可靠性修复状态（2026-07-20）：已确认 281 次小 H2D reject 的直接原因是固定 HiCache 的
+可靠性修复状态（2026-07-21）：已确认 281 次小 H2D reject 的直接原因是固定 HiCache 的
 10-token `load_back_threshold`，而非真实 allocator capacity；满载 fatal 同时存在 1,505-token
 live Radix/free-list overlap。当前实现已加入 forced/no-eviction H2D、authoritative allocator
 delta 校验、H2D ACK 前 admission barrier 与 prefix rematch、allocator/Radix resync、逐 callback
-故障隔离，以及 control-socket failure 与 workflow failure 解耦。全量 CPU 测试通过；真实 GPU
-复跑因两张卡被其他实验占用而未启动。因此 P2 仍未通过真实可靠性 gate，也不能开始 P4 的
-主动 JointPlan 控制。
+故障隔离，以及 control-socket failure 与 workflow failure 解耦。修复版随后在同一模型、
+`163840`-token KV pool、8 个 planned SWE-bench workflow、并发 8 下完成真实 GPU 复跑：
+8/8 workflow 和 848/848 request 都获得系统终态，1502/1502 transfer 有 ACK，scheduler
+exception、watchdog、unknown blocker、identical failed retry、HBM mirror 超过 allocator 和 Host
+账本偏差均为 0；52,851,376,128 bytes offload 的 reclaim realization 为 100%。旧 run 的
+`device_capacity` reject 降为 0，剩余 79 次 `engine_busy` 和 8 次 `extent_mutated` 均在 DMA 前
+fail closed，且没有重复失败 fingerprint。P2 真实可靠性 gate 因此通过；但只有 3/8 workflow
+通过任务 correctness gate，service-curve holdout 低估率为 13.48%，controller timing summary
+缺失，且尚未运行同代码/manifest 的 P1.5 配对基线。因此 P2 配对性能 gate 仍未通过，P4
+只能继续 shadow，不能主动应用 JointPlan。详见 P2 实验文档第 9 节。
+
+2026-07-21 的 P3 mixed run 对该结论增加了边界：上述可靠性 gate 只覆盖 BeliefKV 显式
+command。SGLang request admission 自己发起的 native `init_load_back()` 没有 command ID，也
+没有进入现有 transfer telemetry。P2 的 bundle/ACK correctness 仍成立，但“全系统 callback
+coverage”重新标为未闭合；补齐并去重 native operation telemetry 后才能恢复该表述。
 
 实现文件：
 
@@ -1478,48 +1529,99 @@ delta 校验、H2D ACK 前 admission barrier 与 prefix rematch、allocator/Radi
 - H2D full closure admission、partial rollback 和 allocator/Radix resync 不产生账本不变量失败；
 - 使用同 manifest 的 P1.5/P2 配对实验闭合后，才允许 P4 主动应用 JointPlan。
 
-### P2.5：统一 Reference-policy Contract
+### P2.5：BeliefKV 内部决策快照与追踪 Contract
 
-该阶段不部署 ScaleSim、AugServe、ThunderAgent 或 CONCUR 原系统，也不阻塞 P2 真实 GPU
-可靠性修复。目标是提前固定公平比较所需的输入、动作、metadata assumption 和日志格式，避免
-BeliefKV 完成后再为每个竞品重写实验路径。
+该阶段不部署或适配外部系统，也不阻塞 P2 真实 GPU 可靠性修复。目标仅是固定 BeliefKV
+自身 JointPlan、reactive counterfactual 和 O0-O3 离线分析需要的不可变输入、动作与日志格式。
+
+实施状态（2026-07-22）：已新增不可变 `PolicyInput/PolicyOutput` schema、统一 execution/
+admission/residency/dependency primitive、request/program/context ID 映射和 runtime capability
+report。现有 `ReferencePolicyAdapter` 是历史类名，只运行内部 reactive policy；调用前按声明
+裁剪 metadata，online 模式无法接触 hindsight 字段，oracle metadata 只允许 O0-O3 replay；
+所有输出保持 shadow-only。unsupported metadata/action 不做隐式转换，而是进入结构化结果。
+reactive adapter 的确定性、统一物理
+计费、schema round-trip、审计重建和篡改检测均通过。P3B 已在该契约上增加 physical
+`extent_ids`、actionability/blocker 和 parent-child extent identity，禁止重叠 closure 双重
+计费，并使 reactive policy 对不可执行 restore fail closed。`policy_state_updates` 仅作为历史决策记录的
+序列化兼容字段保留；状态注入和跨 snapshot 状态回放逻辑已删除。
 
 实现文件：
 
 - 新增 `policy/reference/base.py`；
+- 新增 `policy/reference/snapshot_builder.py` 和 `policy/resource_snapshot.py`；
 - 新增 `tests/test_reference_policy_contract.py`；
-- B0-B4 具体策略和 `experiments/policy_replay.py` 留到 P3B。
+- reactive policy 与 `experiments/policy_replay.py` 保持主线可用；外部策略草图与专用
+  hindsight enricher 已删除。
 
 任务：
 
-1. 所有策略读取相同的 `PolicyInput`，输出可审计的 `PolicyOutput`；
-2. 每个输出声明使用了 observed、predicted 还是 hindsight metadata；
-3. contract 明确 online/oracle metadata mode 和 hindsight 隔离；
-4. reference policy 默认 shadow-only，不触发真实 admission、D2H 或 H2D；
-5. 为未来 native baseline 保留 request/program/context ID 映射和 capability report。
+1. 所有 BeliefKV 内部策略读取相同的 `PolicyInput`，输出可审计的 `PolicyOutput`；
+2. 每个输出声明使用了 observed、predicted 还是内部 oracle metadata；
+3. contract 明确 online/internal-oracle metadata mode 和 hindsight 隔离；
+4. reactive counterfactual 默认 shadow-only，不触发真实 admission、D2H 或 H2D；
+5. 保留 BeliefKV 审计需要的 request/program/context ID 映射和 capability report；不得因潜在
+   竞品需要而扩展在线调度分支或合成应用先验；
+6. 冻结为静态 internal adapter，不增加通用 registry、动态加载和 per-competitor state。
 
 退出条件：
 
-- synthetic reference adapter 对相同输入生成确定性、schema-valid 的 PolicyOutput；
+- reactive adapter 对相同输入生成确定性、schema-valid 的 PolicyOutput；
 - hindsight 字段无法泄漏到在线 BeliefKV predictor；
 - 同一物理 snapshot 下所有策略使用相同 HBM/PCIe accounting；
 - unsupported action/metadata 被明确记录，不静默转换成 BeliefKV 特有动作；
 - contract output 可被 audit validator 重建。
+- replay 只运行 reactive policy 和 O0-O3；当前代码不存在竞品 adapter 或竞品专用 metadata
+  producer。
 
-### P3：动态 Workload、Reference-policy Oracle 与 Agent 调度基线
+### P3：动态 Workload、Joint Oracle 与 Agent 调度基线
 
 P3 的第一目标是建立动态 agent 调度实验面、action-unlock 观测面和 joint oracle，不先训练
-frontier predictor，也不要求先部署竞品原系统。该阶段可以与 P2 可靠性修复并行开发，但 P2
-gate 未通过时只能做 replay/shadow，不主动控制真实 HiCache。
+frontier predictor，也不运行竞品 reference/native 系统。该阶段可以与 P2 可靠性修复并行开发，
+但 P2 gate 未通过时只能做 replay/shadow，不主动控制真实 HiCache。
+
+实施状态（2026-07-22）：P3A 的 CPU/runtime instrumentation、scheduler-safe-point 统一
+`PolicyInput` snapshot、gzip trace 和 P3B 的离线决策层已实现。
+queue/service resimulator、token-exact tiered Radix、rolling allocator、arm-aware evaluator 和
+完整/有界 topological-order search 已接入。单-workflow 1,000-token HBM 负例的 joint synergy
+gap 仍为 0。
+
+2026-07-22 workload 审计确认：先前 12-workflow mixed run 的 48 个 child 是 one-shot，且
+repository tool call 为 0，因此只能保留为 topology/pressure characterization。新版
+agentic backend 已实现持久 peer RESUME、模型运行时 task fan-out、FRESH child 多轮工具循环、
+最终轮禁用 task 和独立 workload validity gate；另增加 initial coder 的 `2..4`
+required-range characterization mode。单次 240 秒、4-workflow 探针实际产生 16 个 child，
+瞬时达到 16 个 running request，但按时间积分后 `running <= 2` 占 68.13%，`running >= 8`
+仅占 24.36%，稳定 GPU-ready 并发 gate 仍未通过。详见
+[P3 真实工具型 Agentic Workload](experiments/beliefkv_p3_agentic_workload_2026-07-22_zh.md)。
+
+正式 163,840-token、12-workflow 全 mixed GPU characterization 已完成：12/12 semantic
+completion，模型创建 48 个 FRESH child，并产生 40 次 HANDOFF、17 次 REACTIVATE；峰值 HBM
+96.93%。BeliefKV 显式路径完成 14 次 D2H 和 8 次 H2D，无 partial/reject/retry storm。该 run
+同时发现两项硬阻塞：一笔 join 后错误恢复占显式 H2D 的 37.52%；三个 parent 通过 SGLang
+native demand-load 恢复，但没有 BeliefKV telemetry。1,138 个 runtime GPU batch 还证明旧
+batch-1/2/4 短 context service model 无法外推，overlap completion interval 也不能直接作为
+独立 batch service time。因此 P3 workload gate 有进展，但 physical/service oracle gate 与
+全量 transfer accounting 仍未通过。详见
+[P3 统一快照与 Reference Replay Smoke](experiments/beliefkv_p3_shadow_smoke_2026-07-21_zh.md)
+、[P3 Queue/Service Resimulator 标定](experiments/beliefkv_p3_queue_service_calibration_2026-07-21_zh.md)
+、[P3 Rolling Physical Replay 检查点](experiments/beliefkv_p3_rolling_oracle_2026-07-21_zh.md)
+和 [P3 动态并发 GPU Characterization](experiments/beliefkv_p3_dynamic_gpu_validation_2026-07-21_zh.md)。
 
 实现文件：
 
 - 新增 `control/data_consumers.py`；
 - 新增 `policy/scenario_physicalizer.py`、`policy/whatif_packer.py`；
-- 新增 `policy/reference/distance.py`、`space_time.py`、`phase.py` 和 `congestion.py`；
+- 新增 `policy/joint_oracle.py`；
+- 新增 `policy/reference/snapshot_builder.py`、`policy/resource_snapshot.py`；
 - 新增 `experiments/policy_replay.py`；
+- 新增 `experiments/counterfactual_trace.py`、`experiments/service_calibration.py`；
+- 新增 `simulator/queue_service.py`、`simulator/token_radix.py`、
+  `simulator/rolling_physical.py` 和 `simulator/rolling_queue_service.py`；
+- 新增 `metrics/policy_snapshot.py`；
 - 新增 `runtime/action_frontier.py`；
-- 新增 `experiments/langgraph_peer_workflow.py` 或等价真实 multi-agent adapter；
+- 新增 `experiments/langgraph_peer_workflow.py` 和 `scripts/run_rolling_joint_oracle.py`；
+- 新增 `experiments/agentic_peer_backend.py`，并扩展
+  `scripts/run_langgraph_peer_workloads.py` 为真实 tool/sandbox runner；
 - 扩展 RuntimeEvent adapter，可靠捕获 `HANDOFF/MESSAGE/REACTIVATE/CANCEL`；
 - 扩展 simulator/replay 和 audit validator；
 - 新增 `tests/test_data_consumers.py`、`tests/test_whatif_packer.py`、
@@ -1527,6 +1629,19 @@ gate 未通过时只能做 replay/shadow，不主动控制真实 HiCache。
   `tests/test_reference_policies.py`。
 
 #### P3A：动态 workload 与 instrumentation
+
+实现状态：已加入 observed producer-consumer index、单调 graph version、`REACTIVATE` 事件、
+基于真实 PageHandle 的 context prefix affinity、增量 structured-action observer，以及动态
+Coder/Reviewer/Tester peer loop 内嵌 FRESH subagent 的 LangGraph workload。CPU fake backend
+能够重复完成 spawn/join/handoff/reactivation 并生成 topology/consumer/action characterization；
+Deep Agents 只能报告 runtime 已解析的 action，当前不能伪造原生 incremental boundary token。
+早期全 mixed run 正常完成 100 个 LLM call、48 个 one-shot child，并覆盖 join 后 peer
+handoff 和 cyclic reactivation；审计后它只保留为 topology/pressure smoke。新版真实工具
+backend 的单 workflow gate 已覆盖动态 task、child 内 11--17 次 LLM、真实工具等待、join、
+handoff 和 peer RESUME，但仍缺同 manifest 并发 A/B、fanout coverage、nested/nonblocking
+subagent 和 incremental boundary-token coverage。required-range probe 只证明 fan-out
+机制和峰值负载，不证明稳定 ready 并发；P3A 下一 gate 是固定 fan-out 下的 phase-aware child
+release 配对，而不是继续增加 root 数量。
 
 任务：
 
@@ -1541,95 +1656,257 @@ gate 未通过时只能做 replay/shadow，不主动控制真实 HiCache。
 7. 将 trace 标记为 schedule-invariant、timing-sensitive 或 semantic-race-sensitive；后两类必须用
    真实 A/B 闭合，不能只依赖冻结 replay。
 
-#### P3B：reference policy、joint oracle 与竞争上界
+#### P3B：Reactive baseline、joint oracle 与物理有效性
+
+实现状态：reactive baseline、ScenarioPhysicalizer、What-if Packer、O0-O3 JointPlan oracle、
+rolling Radix/allocator/queue-service evaluator 已实现。`policy_replay.py` 原子写出 reactive
+决策、输入指纹和 unsupported 项，并禁止从冻结 physical trace 直接报告反事实 JCT。外部
+方法的 same-data-plane 草图和 hindsight enricher 已删除；P3-P6 不再重建或维护这些近似实现。
+
+Scenario physicalizer/What-if Packer 已对 blocking、nonblocking、FRESH、handoff、multi-consumer
+和 cyclic reactivation 执行 closure/capacity/fairness/hysteresis 检查，缺少 extent identity 或
+closure 重叠时 fail closed。rolling evaluator 能按候选顺序重算 token-prefix、锁、allocator、
+tier residency 和 transfer。单 workflow 机制跑的 synergy gap 为 0；多 workflow fairness、真实
+dynamic A/B、page/node extent 对齐和 PCIe holdout 尚未闭合。
 
 任务：
 
-1. 对冻结 trace 运行五个 reference baseline：
+1. 使用 current reactive scheduling + current bundle policy 建立统一的无预测 correctness
+   与性能基线；
+2. 在真实 trace 中筛选同时具有多个 READY agent、HBM/PCIe pressure 和可选 physical action 的
+   决策快照，执行局部 Jointness Audit；
 
    ```text
-   B0 current reactive scheduling + current bundle policy
-   B1 ScaleSim-style + hindsight invocation distance
-   B2 AugServe-style + true output length/tool duration
-   B3 ThunderAgent-style + perfect Reasoning/Acting phase metadata
-   B4 CONCUR-style + identical cache feedback
+   S: 只改变当前 agent execution order
+   K: 只改变当前 KV/admission action
+   J: 在同一短窗口联合改变 execution、admission 和 KV action
+
+   local synergy gap = min(cost(S), cost(K)) - cost(J)
    ```
 
-2. B1/B2 使用的真实未来信息必须标记为 oracle metadata；B3 的 program/phase metadata 标记为
-   application-provided。oracle variant 用于给竞品更强上界，不声称在线可部署；
-3. B0-B4 初版只实现论文核心策略，不复制各系统的数据面和 kernel；replay 固定 semantic
-   events、token demand 和 tool duration，并区分 schedule-invariant 与 schedule-sensitive trace；
-4. 对冻结 trace 构造四个 jointness offline oracle：
-
-   ```text
-   O0 current separate scheduler + current bundle policy
-   O1 oracle agent scheduling + current KV policy
-   O2 current agent scheduling + oracle KV policy
-   O3 oracle JointPlan(agent scheduling + admission + KV)
-   ```
-
-5. 对 lower-is-better cost 定义
-   `joint synergy gap = min(cost(O1), cost(O2)) - cost(O3)`，证明联合决策不是两个独立优化
-   的简单叠加；
-6. 构造 action-unlock oracle：使用真实 action boundary 和后续因果事件，比较“优先产生合法
-   action”与 B1/B2 的 invocation-distance/value-density 目标；
-7. What-if packer 对 blocking、nonblocking、handoff、multi-consumer 和 cyclic reactivation
+3. 局部窗口只推进到下一个 TOOL_START、WAIT、HANDOFF、RETURN 或 JOIN 等已观测因果边界；固定
+   该窗口内的 token demand、tool duration 和 action outcome，候选动作会改变语义分支时标记
+   `counterfactual_unidentifiable`，不强行报告反事实收益；
+4. What-if packer 对 blocking、nonblocking、handoff、multi-consumer 和 cyclic reactivation
    都生成物理可行 plan；
-8. oracle 冻结同一语义依赖、LLM token demand、tool duration 和 runtime transition outcome，
-   但根据候选调度重新计算 service time、HBM residency 和 physical action；禁止固定原策略的
-   wall-clock/physical trace 后声称模拟了新调度；
-9. 对 semantic-race-sensitive workflow，oracle 结果只报告为 optimistic bound；
-10. 真实端到端 A/B 使用固定任务、模型参数和随机性并重复运行；仍无法冻结动态路径时同时
-   报告 transition hash 和统计置信区间。
+5. 已实现的完整 O0-O3 rolling oracle 保留为系统冻结后的可选深入分析，不再作为 P5A--P5C
+   端到端系统搭建和 correctness gate 的前置条件；
+6. 系统完成后的真实端到端比较使用固定任务、模型参数和随机性并重复运行；无法冻结动态路径时
+   同时报告 transition hash、调用量/拓扑分布和统计置信区间；
+7. 保留复现 BeliefKV 决策所需的中立 runtime/physical 字段，但 P3 不生成 invocation
+   distance、perfect phase 或 true-future duration 等竞品专用 metadata；
+8. 保持竞品专用 adapter/metadata producer 不进入 P3 代码，replay 只运行 reactive policy 和
+   O0-O3。
 
-退出条件：
+研究证据条件（不作为 P5A--P5C 系统实现前置条件）：
 
 - 至少一个 blocking subagent、一个 cyclic peer multi-agent 和一个 mixed workflow 可重复运行；
 - FRESH child 不继承 parent pages，causal/data/prefix 三种边可分别重建；
-- structured action coverage、boundary-token 分布、tool-start gap 和 action-critical inversion 被报告；
-- B0-B4 与 O0-O3 可以在同一 trace、同一物理 accounting 上 replay；
+- structured action coverage、boundary-token 分布和 tool-start gap 被报告；
+- 真实 pressure snapshot 能生成可审计的 `S/K/J` 局部决策与不可识别标签；
 - What-if packer 无副作用且满足 closure/capacity/fairness/liveness；
-- 预注册 workflow JCT 为 primary metric；O3 相比该指标上的 `best(B0..B4)` 上界收益至少
-  10%，且 action throughput/causal-blocked time/unhidden stall 至少一项提供一致的机制证据；
-  如果只优于 B0，不能证明新的竞争边界；
-- `min(cost(O1), cost(O2)) - cost(O3)` 的置信区间高于 0，否则 JointPlan 降级为工程统一接口；
-- action-unlock oracle 相比 B1/B2 的增量收益单独报告，但在 P5.5 前不据此启用在线策略；
+- execution-order reversal、KV-action reversal 和 local synergy gap 能按 blocking/peer/mixed
+  关系归因；该结果是论文 JointPlan 主张门槛，不阻塞 P5A--P5C 的系统实现；
+- 证据采集不依赖竞品 adapter 或任何原生竞品结果；
 - 当前 workload topology entropy、cycle、handoff 和 consumer fan-out 被正式报告。
 
 ### P4：Observed-State JointPlan Shadow Mode
 
+前置状态（2026-07-21）：统一快照和 shadow trace 已具备，但 P3 workload/oracle gate 与 P2
+配对性能 gate 均未通过；当时尚未实现或启用 `joint_scheduler.py`。修复前真实 GPU 同步快照
+P99=38.08 ms，明确不达标；异步 writer 后 CPU 快路径在 256 extents 无变化时 P99=0.283 ms，
+114 extents 的 warm lease 切换 P99=0.891 ms，但单 extent engine-lock 改变仍为 1.929 ms。
+这些 CPU 数字只用于定位开销，不替代真实 scheduler safe-point 复验，也不能提前宣称 P4
+overhead gate 通过。
+
+实施状态（2026-07-23）：已新增纯函数 `ObservedJointPlanner` 和版本化 `JointPlan`，能够从
+同一个 observed snapshot 联合生成 execution、admission、residency 与 restore-ACK dependency；
+已覆盖 join straggler、root-workflow 公平、restore/victim 联动、transition-open settling
+barrier、nonblocking parent 和 stale physical version。策略快照同时冻结 attained service、
+virtual runtime 与 root-workflow HBM charge，并修复 reserved request startup 重复计费。
+
+runtime 技术路线已经固定为：
+
+1. scheduler safe point 在应用 event、ACK 并同步 RCCG/Radix/allocator 后，只发布 immutable
+   RCCG event、PageIndex replacement record、queue/resource 最新值和 component version；完整
+   `PolicyInput` 不再在 scheduler thread 构造；
+2. 容量为 1 的 latest-wins worker 持有独立 RCCG、consumer 和 PageIndex mirror，按顺序无损合并
+   pending delta，在 worker 内构造 `PolicyInput` 并运行 `ObservedJointPlanner`；较新的 submission
+   可以替换 pending sequence，但不能丢弃被替换 sequence 携带的 event/page delta；
+3. 下一 safe point 使用 `PlanReadSet` 和 source/current component stamp 做 optimistic validation；
+   `snapshot_id` 只用于 lineage，graph/topology/allocator 全局版本比较只作为
+   `strict_global_stale` 对照指标；
+4. source snapshot 内的 validation 同时检查 request/frontier identity、context epoch、局部
+   invocation/join、transition generation、touched bundle generation/actionability、当前 workflow
+   fairness priority、plan expiry 和 HBM/Host feasibility certificate；source snapshot 之后在
+   scheduler safe point 按 execution、每条 admission、每条 residency 和每条 transfer dependency
+   分域重验。全局 graph/topology/allocator stamp 只保留为对照诊断，单个 request 或 extent 改变
+   不再使无关动作 stale；decode 推进导致的 startup bytes 减少、无关 transfer epoch 前进或不改变
+   实际优先级的 fairness revision 前进不会制造假 stale；
+5. fresh plan 只记录 `joint_plan_would_apply`，stale、过期或 worker failure 只记录原因，不同步
+   重跑完整 planner，也不改变 waiting queue、admission、D2H/H2D 或 physical residency；
+6. runtime 分别记录 safe-point delta capture、worker snapshot build、trace enqueue、queue wait、plan
+   compute、publish-to-safe-point、validation、plan age、pending coalescing/drop、strict/scoped stale 和
+   would-apply coverage；
+7. `joint_policy_enabled=true` 在 P4 fail closed，防止尚未实现的 P5 执行路径被误认为已启用。
+
+snapshot 提交采用事件触发加 watchdog，而不是每个 decode quantum 无条件全量重建：queue、graph、
+transition 和 transfer 变化立即触发；连续物理增长与 attained-service 推进按
+`reference_policy_snapshot_min_interval_ms` 周期刷新。变化探测使用 page-index revision，不在探测
+阶段重复枚举 Radix extent；真实 snapshot build 开销仍必须由 P4 GPU gate 测量。
+
+此前 P4 runtime shadow 在线路径不能继续沿用：tagged request 在进入 SGLang waiting queue 前被
+长期隐藏、每个 controller tick 只放回一个 request、`WAIT_H2D` admission 持有 reservation，以及
+scheduler safe point 同步构造大 snapshot，会共同造成 KV lock/admission convoy。2026-07-23 已完成
+该数据路径的 CPU 机制修复，但尚未通过真实 GPU overhead/stale/coverage gate：
+
+> **Visible-but-Gated Incremental Admission**：SGLang 始终拥有完整 waiting queue；BeliefKV
+> 使用增量状态在当前 batch-construction epoch 编译短期 admission ticket，并在 SGLang 原生
+> `PrefillAdder` 前做 gate。ticket 只表示执行资格，不提前占用 HBM；SGLang allocator 和
+> `PrefillAdder` 保留最终容量与 batch 决定权。
+
+该改进直接替换 `_deferred_requests -> decide_next() -> 单请求放回` 路径，不实现临时
+`decide_batch()`，也不维护第二套长期请求队列。它属于 reactive admission 数据路径修复，
+不等于提前启用 P5 的策略性 ResidencyIntent；P5 只需把 ticket 的决策来源从 observed/reactive
+状态切换为主动 JointPlan，不再更换队列和提交协议。
+
 实现文件：
 
 - 新增 `policy/joint_scheduler.py`；
-- 修改 `control/controller.py`、`runtime/audit.py`；
-- 新增 `tests/test_joint_scheduler.py`；
-- 扩展 `tests/test_controller.py`。
+- 新增 `runtime/joint_shadow.py`；
+- 修改 `control/controller.py`、`policy/admission.py`、`runtime/audit.py`；
+- 修改 `runtime/sglang_v052rc1.py` 和 `patches/sglang-0.5.2rc1-beliefkv.patch`；
+- 扩展 page/context dirty journal 和增量 resource view；
+- 新增 `tests/test_joint_scheduler.py`、`tests/test_joint_shadow_worker.py`；
+- 扩展 `tests/test_controller.py`、`tests/test_sglang_adapter.py`。
 
 任务：
 
-1. 只使用已观测 `G_t/R_t` 生成完整 `JointPlan`，prediction 关闭；
-2. JointPlan 同时给出 workflow/agent order、admission、restore dependency 和 KV bundle action；
-3. blocking parent、tool wait、background spawn、handoff 和 message 分别进入正确运行队列；
-4. 记录与现有 admission/transfer/waiting 独立排序的差异；
-5. 分别计算 scheduler-only、KV-only 和 joint counterfactual regret；
-6. 将 planner 从固定 5ms 全量扫描改为 runtime/allocator/ACK 事件触发，保留 watchdog tick；
-7. 限制 workflow/frontier 候选和规划预算，超时生成 observed-state conservative JointPlan；
-8. 在 shadow mode 校验 plan dependency：需要 restore 的 request 不得先于 ACK admission；
-9. 同一 snapshot 记录可在线执行的 reference decision，并保存 B1/B2 oracle replay 所需输入；
-   hindsight decision 只能在 run 完成后生成，所有 reference policy 都不能改变真实队列或 KV；
-10. `ActionFrontierObserver` 只记录 parser/boundary 状态，不改变 decode order。
+1. 让所有 request 立即进入 SGLang 原生 waiting queue；BeliefKV 只维护按 request ID 索引的
+   `VISIBLE_PENDING / WAIT_RESTORE / POLICY_BLOCKED` side state，删除长期 hidden queue 所有权；
+2. 在 page、owner、lock、residency、allocator、RCCG 和 queue 的既有 mutation point 更新 dirty
+   journal、增量计数器和 scoped generation；scheduler safe point 不再扫描并排序全部 page owner；
+3. 每个 batch-construction epoch 用当前 waiting request、causal frontier、restore dependency、
+   prefill token budget 和 authoritative HBM view 一次生成多个短期 ticket；不设置 per-workflow
+   ticket 上限，同一 workflow 的多个可行 request 可以同时进入候选 batch；
+4. 在 SGLang 原生 prefill loop 中，对无 ticket、`WAIT_RESTORE` 或 blocker 未解除的 request 执行
+   policy `continue`，继续扫描后续 request；实际加入 `can_run_list` 时才提交服务记账，未使用
+   ticket 在 epoch 结束后自动失效；
+5. ticket 校验 request/context/prompt/prefix 和相关 bundle 的局部 generation，不以全局
+   allocator generation 相等为条件；`PrefillAdder` 重新匹配 prefix 并完成最终 allocation，
+   BeliefKV 的 startup bytes 只用于有界 packing；
+6. `WAIT_RESTORE` 不持有 admission reservation。H2D ACK 后重新匹配 authoritative prefix，
+   下一 epoch 重新生成 ticket；partial/rejected ACK 只失效相关 request/bundle action，不能阻塞
+   无 H2D 依赖的 request；
+7. snapshot 发布和 JointPlan validation 改为 dependency-scoped、component-wise 提交：request
+   消失只丢对应 admission item，bundle 改变只丢对应 residency/transfer item，fairness 变化只
+   重编译当前 ticket 顺序，不使整个 plan stale；
+8. planner 超时、无 fresh shadow plan 或 snapshot 暂不可用时，使用同步且有界的 observed-state
+   reactive ticket fallback；显式 restore/terminal/transition-open blocker 仍 fail closed；
+9. 保留 prediction 关闭、JointPlan residency shadow-only 和 atomic transition barrier；记录
+   ticket issued/selected/expired/native-rejected、policy skip、batch fill、running concurrency、
+   admission wait、snapshot overhead/stale 和 H2D blocking 指标。
+
+当前完成度：任务 1--9 的 CPU 机制已完成。任务 7 使用 `PlanReadSet` 定点读取当前 request、
+invocation、join、transition 与 touched extent，逐 action 输出 valid/reasons；residency 校验会对
+目标 extent 重算 owner lease、lock/reader/pin/in-flight 状态和 GPU descendant closure，并滚动
+重验 Host/HBM headroom。无法解析的 extent、缺失记录、generation 变化和容量不足均 fail closed；
+局部 fresh component 只在 shadow audit 中标记 `joint_plan_shadow_partial`，不宣称可独立提交且
+尚未执行；P5 必须在提交前再闭合 execution/admission/residency dependency。2026-07-23 首次
+24-workflow GPU gate 中，24 个初始 prompt 均因完整 prompt 大于 4096-token epoch chunk budget
+而被错误标记为 `prefill_token_budget`，93,883 个 epoch 未发出 ticket。修复后 ticket 仅消耗
+本 epoch 的首块 token，HBM feasibility 仍按完整请求计算。独立复验记录 1,418 次 LLM submit、
+1,351 次工具调用、61 次 spawn，KV usage 峰值 96%，完成 13.34 GB D2H 和 3.49 GB H2D，且
+未复现 retry storm；全量 CPU 回归为 `347 passed, 7 skipped`。但 12,922 个 JointPlan 因
+`max_joint_plan_budget_ms=1` 触发 `planning_budget_exceeded`；planner 自身 P50/P95 为
+13.9/33.0 ms，worker 端到端 compute（含 snapshot build）为 157.7/290.8 ms。运行约 95.6
+分钟后仅有 3 个 workflow 以 API timeout 自然终止。P4 因规划开销和单 activation 终止性仍
+未通过，详见本阶段实验文档。
 
 退出条件：
 
-- P99 planning overhead 小于 1ms，或小于 scheduler step 的 5%；
+- scheduler safe point 的增量 snapshot、ticket compile 和 validation 总 P99 小于 1ms，或小于
+  scheduler step 的 5%；
 - 计划在执行前 stale 的比例低于 10%；
 - physical plan rejection 不高于当前 reactive planner；
-- shadow-mode joint regret 稳定优于当前独立排序；
+- SGLang waiting queue 成为唯一请求所有者，不再存在长期 `_deferred_requests`；
+- admission ticket 不产生跨 epoch HBM reservation，`WAIT_H2D` 阻塞无关 request 的次数为 0；
+- 同一 workflow 的多个可行 request 能进入同一 prefill batch，不因公平规则被强制串行化；
+- 使用现有 P4 stress workload 直接复验 correctness、吞吐、batch fill、running concurrency、JCT
+  和 admission tail；当前阶段不增加四路 admission 消融矩阵；
 - nonblocking/background parent 从不因 `SPAWN` 被错误标为 parked/offload；
-- 同一 root workflow 的 fan-out 不增加 workflow service budget；
-- online/oracle reference-policy decision 与其 metadata assumption 可由 audit 完整重建；
+- workflow service 按实际进入 batch 的 GPU 服务记账，fan-out 不获得虚构服务，也不被固定份额限制；
+- reactive counterfactual 与其 observed-state 输入可由 audit 完整重建；
 - action observer 对未支持的自由文本输出明确返回 UNKNOWN，不伪造 action boundary；
-- 在 prediction 关闭时即可重建所有 JointPlan 决策和 fallback。
+- 在 prediction 关闭时即可重建所有 JointPlan 决策和 fallback；
+- 将 snapshot build、planner search 和 safe-point validation 分开预算；24-workflow 下不能以
+  放宽 TTL 或把 1 ms 直接改成数百毫秒替代开销优化；
+- 单次 agent activation 必须有语义完成及墙钟/调用预算，且正常 RETURN/JOIN workload 能在
+  gate 内形成 workflow 终态；
+- runtime audit 和 policy snapshot 改为有界采样/delta；当前 95.6 分钟产生 1.8 GiB audit 和
+  603 MiB 压缩快照，不能用于性能结论；
+- native demand-load/write-back telemetry 已接入统一 transfer timeline；Host 生命周期已实现
+  `DUAL_CLEAN -> GPU_ONLY`、terminal-private cleanup 以及容量饱和时的淘汰/drop-recompute
+  路径。上述机制均需在下一次真实 GPU run 中验证覆盖与字节一致性；
+- 支持 atomic transition 的 adapter 不出现 join-to-handoff transient READY prefetch；不支持
+  atomic transition 的 adapter 必须通过可审计 settling barrier 回退。
+
+层次边界（2026-07-23）：固定 SGLang 0.5.2rc1 不提供理解 agent message/tool 语义的自动上下文
+总结或压缩。模型 sliding-window attention、请求截断和 KV eviction 都不能替代语义压缩。因此
+BeliefKV 不实现 tool-output summarization 或 context checkpoint；这两项属于 LangGraph/Deep Agents
+业务层。serving 层只保留 context-growth admission、run-to-yield/terminal scheduling 和物理 KV
+迁移，避免把质量改变混入 KV 管理贡献。
+
+当前 context-growth admission 已在 visible-ticket 路径实现：每个 waiting request 按未命中 prompt
+token 与尚未生成的最大 output token 计算增量 KV，ticket 编译再用 authoritative HBM headroom
+检查；后续 agent turn 以新的 prompt/prefix match 重新估算。该机制只控制物理容量，不修改消息
+内容。run-to-yield/terminal scheduling 需要改变 running decode batch，属于 P5 在线联合调度，不在
+P4 shadow 修复中提前启用。
+
+P4 开销修复将确定性的 snapshot/index preparation、可中断 package search 和 plan/read-set
+materialization 分开计时。`max_joint_plan_budget_ms` 约束 anytime package search；完整 planner wall
+time 仍单独报告，不能用提高 TTL 或隐藏 preparation 代替优化。4096-extent CPU 定向基准中，单
+lock snapshot P50 为约 2.6 ms，单 residency snapshot 为约 6.3 ms；JointPlan preparation P50
+约 3.0 ms，而 physicalize+pack search P50 约 0.48 ms。该结果只用于定位开销，仍需真实 GPU
+safe-point/stale gate。
+
+2026-07-23 的第一轮 shadow 热路径修复已经完成，但尚未执行 GPU gate：PageIndex 和 RCCG
+journal 改为从最新 revision 向后读取，不再每次扫描 65K/262K 历史窗口；worker mirror 用覆盖
+revision 区间的单条 mutation 记录替代逐 revision 空记录，并以 changed extent 的局部一致性校验
+替代每个 delta 后的全 PageIndex 扫描；纯 lock/residency/transfer 变化使用轻量 physical-state
+patch，不再复制未变化的完整 Radix topology、owner 和 context handle list；worker 在后台将
+pending delta 合并为最终 page/context replacement state，
+但保留全部 RCCG event 和 transfer telemetry。4096 extents、64 contexts、每轮 384 个 lock extent
+变化的 200 轮 CPU 定向基准中，delta capture P50/P95/P99 为 1.69/2.21/4.00 ms，mirror apply
+P50/P95/P99 为 2.61/2.69/3.33 ms，复制 context 数为 0；capture 仍出现 62.2 ms 的单次离群值，
+因此还未通过 P99 gate。该基准与旧 24-workflow 在线统计不完全同构，不能直接把差值宣称为
+线上加速。
+
+P4 worker 不再依赖完整 `PolicyInput` snapshot log 才能启动。实验配置生成器提供两级隔离：
+`--disable-snapshot-persistence` 保留 JointPlan shadow、关闭后台完整快照 JSON 序列化；
+`--disable-policy-shadow` 同时关闭 snapshot capture 和 JointPlan worker。后续必须用同一固定
+manifest 做 shadow-off、shadow-on/no-persist 和 shadow-on/persist 三组开销归因；在完成该配对前，
+不能把 GPU 利用率变化归因于 agent scheduling 或 JointPlan 策略收益。
+
+2026-07-23 已完成进入 observed-state admission scheduling 前的第二项观测前置工作：新增
+`beliefkv/runtime/lock_service.py`，以已完成的 GPU batch 而非 queue/running membership 作为
+request 获得 service 的证据。每个资源采样点将 tagged running request 的
+`last_node -> Radix root` 精确路径与 `engine_lock_ref` extent 关联，并报告 100/500 ms
+`locked_but_not_served_gpu_bytes`。共享 prefix 只计算一次；只有所有 lock ref 都已归因且全部
+blocker 超窗时才计为 stale，部分归因和路径错误保守归入 unknown，初始窗口内归入 warming。
+因此该指标是“持锁但未获完成 service”的物理字节下界，不等价于可立即迁移量。
+
+实现复用 PageIndex 同 revision 的 physical breakdown 缓存，避免资源采样后再次全树扫描；额外
+复杂度为当前 engine-locked extent 建表及运行 request 祖先路径总长度。现有 transfer timeline
+已加入 100/500 ms 曲线、归因覆盖率和 stale/engine-lock 比例。该变更完全只读，不修改 ticket、
+waiting queue、running batch 或 residency。必须先在真实 GPU trace 上同时验证归因覆盖率、
+locked-but-not-served HBM-time 与低 GPU 利用率的时间重叠，才可据此决定是否进入 observed-state
+admission scheduling；仅凭 Engine-locked 总量不能证明 lock/admission convoy。
+
+为避免此前 95.6 分钟产生 GiB 级审计，在线 worker 输入不采样，但完整 replay `PolicyInput`
+默认每 10 秒持久化一次，writer queue 上限为 8；设置 persist interval 为 0 可执行专用全量
+capture。重复 JointPlan 状态使用 compact audit，状态类别变化、错误和每秒周期样本保留 full
+detail，最终 summary 记录 compact/full、sampled-out 和 writer-drop 计数。
 
 ### P5：启用 Observed-State Joint Agent/KV Scheduling
 
@@ -1641,21 +1918,92 @@ gate 未通过时只能做 replay/shadow，不主动控制真实 HiCache。
 
 启用顺序：
 
-1. 先应用完整 JointPlan，但 ResidencyIntent 仅允许 KEEP/DROP_DEAD 和已有 reactive bundle；
-2. AdmissionController 改为只兑现 AdmissionIntent，不再自行选 workflow；
-3. waiting queue 改为只应用 ExecutionIntent，不再自行重算 fairness/frontier；
-4. transfer planner 改为只编译 ResidencyIntent，不再自行选 victim/prefetch context；
-5. 启用 blocking parent/tool-wait exclusive-suffix offload 和 READY restore dependency；
-6. 启用 cyclic peer residency hysteresis 和 multi-consumer admission；
-7. prediction、scenario reservation 和 reveal 保持关闭；
-8. 在 blocking、peer 和 mixed 并发 workload 中逐项 A/B；
-9. B0-B4 online mode 保持 shadow logging，B1/B2 oracle mode 留到 run 后 replay，验证两类输入
-   都与相应时刻物理状态一致。
+1. 启用完整 JointPlan，但 ResidencyIntent 仅允许 KEEP/DROP_DEAD 和已有 reactive bundle；
+2. 将 JointPlan 的 ExecutionIntent、AdmissionIntent 和 restore dependency 编译成 P4 已建立的
+   batch-epoch ticket；AdmissionController 不再自行选择 workflow，也不建立长期 reservation；
+3. SGLang 继续拥有 visible waiting queue，ExecutionIntent 只影响当前 epoch 的 ticket eligibility
+   和顺序；一个 workflow 可以同时获得多个 ticket，fairness 只作为防饿死软约束；
+4. 增加 transfer-to-transfer dependency DAG，只有 completed ACK 才能解锁后继 H2D、admission
+   和 execution；partial/rejected 触发 prefix rematch、计划失效和保守 replan；
+5. transfer planner 改为只编译 ResidencyIntent，不再自行选 victim/prefetch context；
+6. 启用 blocking parent/tool-wait exclusive-suffix offload 和 READY restore dependency；
+7. 启用 cyclic peer residency hysteresis 和 multi-consumer admission；
+8. prediction、scenario reservation 和 reveal 保持关闭；
+9. 在现有 blocking、peer 和 mixed 并发 stress workload 中直接验证完整在线路径；暂不扩展
+   admission 策略消融矩阵；
+10. 仅保留 reactive counterfactual logging；P5 不包含竞品 replay 或在线 adaptation。
+
+实施状态（2026-07-25）：已完成 admission-only 的 P5A 在线切片，尚未完成完整 P5。新增
+`ObservedAdmissionScheduler`，在当前 SGLang batch epoch 直接读取 visible request、observed causal
+frontier、root-workflow fairness、PageIndex engine-lock/active-reader 字节和 running-private KV。
+它不等待异步 shadow JointPlan，也不执行 physicalizer/packer：
+
+```text
+active KV footprint
+  = unique Radix engine-locked/active-reader bytes
+  + running/chunked private KV bytes
+
+active KV budget
+  = (KV pool - reserve) * configurable high-watermark ratio
+```
+
+ticket compiler 同时受 native HBM/token/request slot 和 active KV growth headroom 约束。running 数
+低于可配置 floor 时只补足 floor，这是唯一高水位 bypass；starvation 只改变 observed candidate
+顺序，不允许绕过 HBM。候选顺序使用 causal rank、unblock depth、workflow virtual runtime、
+frontier round、等待时间和 incremental KV，不使用预测。无 metadata request 保持 SGLang 原生行为；
+restore/terminal/transition blocker 继续 fail closed。observer/policy 异常时回退 reactive ticket，
+并输出 `observed_admission_fallback`。
+
+该切片通过 `observed_admission_scheduling_enabled` 显式启用，默认关闭；初始高水位 `0.8` 和 floor
+`1` 仅用于后续 sweep。审计逐 epoch 输出 active budget/footprint/headroom、Radix lock、running
+private、native/policy HBM budget、mode、issued/selected/expired/native-rejected 和 fallback。全量 CPU
+回归为 `377 passed, 7 skipped`。P5A 尚未运行真实 GPU 配对，不得宣称性能收益。
+
+严格边界：P5A 只能限制新 request 加入 active set，不能缩小已有 running batch，也不接管
+residency writer。因此它不等于完整 JointPlan，任务 1、4--7 仍未闭合。若真实 trace 中 admission
+gate 已降低 lock growth，但 active owner 仍长期占据 8--14 GiB 且未获 service，下一步才实现
+running-batch retraction；若 gate 本身显著降低 GPU-ready concurrency，则先调整/否决 active-set
+算法，而不是用 retraction 掩盖问题。
+
+实施增量（2026-07-26）：P5B 加入默认关闭的 observed selective running-batch retraction；P5C
+进一步闭合 `RETRACT -> physical closure rematch -> OFFLOAD/DROP -> ACK -> replacement admission`
+跨 epoch 事务。P5B 使用完整 lock blocker set 选择运行中 victim，在固定 SGLang safe point 仅释放
+request-private KV 和 Radix lock。P5C 不再把 `available + evictable` 当成已释放 HBM：只有 allocator
+`available` 的真实增量达到 target，且绝对 free bytes 覆盖首个 replacement，才解除 admission barrier。
+
+不足时，P5C 根据 retracted context 集合重新构建 closure-complete physical bundle，只对该事务内的
+context 豁免逻辑 RUNNING owner lease；foreign active owner 和全部物理 blocker 保持 fail closed。Host
+容量允许时显式 D2H/COMMIT_CPU；`DROP_CONTEXT` 可释放 dual-clean GPU copy，GPU-only recompute drop
+默认关闭。每次只允许一个精确 command 在途，partial/rejected/stale/timeout 立即终止事务，不进入
+retry storm。原生 OOM retraction 仍是最终 liveness fallback。全量 CPU 回归为 `389 passed, 7 skipped`；
+真实 GPU gate 尚未完成，因此不能宣称性能、JCT 或 lock-convoy 收益，P5 的通用 ExecutionIntent、
+cyclic peer hysteresis 和多 consumer admission 仍未闭合。
+
+实施增量（2026-07-27）：完成只读 `TentativeUnlockPreview`。物理层以当前 PageOwnershipIndex 和
+临时 lock-ref override 做无副作用 closure 投影；provenance 层只对完整 request blocker set 减少
+假设 lock ref，部分/缺失归因 fail closed。runtime 在 barrier 前记录 observed-stale blocker 的乐观
+上界，在安全点 plan 后记录 selected-set 的 projected newly-migratable bytes，并在 callback 记录
+realized delta、误差、exactness 与 preview 开销。该机制尚不进入 barrier gate、victim selection 或
+JointPlan objective，只用于验证“主动释放哪些 running owner 才会产生真实物理闭包”这一假设。
+全量 CPU 回归为 `403 passed, 7 skipped`；下一次固定 GPU trace 才能判断 attribution coverage、
+closure amplification 和 preview error 是否足以支持后续控制策略。
+
+贡献边界：P5A observed active-set 是 baseline/minor mechanism；P5B/P5C 的候选贡献是
+`causal replacement -> complete physical blocker-set -> RETRACT/OFFLOAD/DROP -> ACK -> ticket`
+原子事务。当前优先完成其真实 GPU 端到端路径，不把复杂 counterfactual 模拟或外部 baseline
+适配放入实现关键路径。`TentativeUnlockPreview` 继续作为采样诊断，不在本阶段升级为正式执行
+前置门槛。
+
+P5 继续优化完整 JointPlan，不预先降级。正式运行同时测量 scheduler critical-path overhead、
+planning fallback、actionable coverage、component freshness 和 plan age；若优化后 critical path
+P99 仍超过 scheduler step 的 5%，或 actionable coverage 低于 80%、planning fallback 高于 20%、
+plan age 超过主要决策窗口，才收敛为 Local Frontier JointPlan，不能仅放宽 TTL/budget。
 
 退出条件：
 
 - correctness/liveness 不低于 P0；
-- workflow Jain fairness 和最大 virtual-runtime lag 不退化；
+- 不出现 workflow starvation；Jain fairness 和 virtual-runtime lag 继续记录，但默认不作为牺牲
+  明显吞吐收益的硬 gate；
 - F3 resource inversion 频率和影响显著下降；
 - scheduler-selected request 与 KV/admission plan mismatch 为 0；
 - `RESTORE_PENDING` request 在 bundle 可用前不会进入运行 batch；
@@ -1671,10 +2019,10 @@ gate 未通过时只能做 replay/shadow，不主动控制真实 HiCache。
 
 1. 定义 `time_to_valid_action`：READY/active invocation 到合法 tool/spawn/handoff/final
    action 的时间；
-2. 定义 action-critical inversion：B1/B2/B3 选择的 agent 与最早解除 causal blocker、启动
-   external work 或扩大 runnable frontier 的 agent 不同；
+2. 定义 action-critical inversion：当前公平/FIFO 顺序或 scheduler-only oracle 选择的 agent，
+   与最早解除 causal blocker、启动 external work 或扩大 runnable frontier 的 agent 不同；
 3. 使用真实 boundary、fan-out、consumer 和 reentry 构造 action-unlock oracle；
-4. 比较三类目标：invocation distance、AugServe value density、action unlock；
+4. 先比较三个内部目标：当前 observed order、独立 scheduling/KV oracle 和 action unlock；
 5. 将每个候选 `RUN(q)` 与其 KV 状态转换联合模拟：
 
    ```text
@@ -1690,8 +2038,8 @@ gate 未通过时只能做 replay/shadow，不主动控制真实 HiCache。
 
 - 至少两类动态 workload 中，action-critical inversion 稳定出现且贡献至少 10% 的 JCT、
   causal-blocked time 或 tool-launch idle gap；
-- action-unlock oracle 相比带 hindsight 信息的 B1/B2 在 workflow JCT 上至少提升 10%，置信
-  区间不跨 0，并降低 causal-blocked time 或 tool-launch idle gap；
+- action-unlock oracle 相比 reactive baseline 和 `best(O1, O2)` 在 workflow JCT 上至少提升
+  10%，置信区间不跨 0，并降低 causal-blocked time 或 tool-launch idle gap；
 - structured action 或可靠 runtime boundary 覆盖主要执行时间，UNKNOWN 不成为主导状态；
 - reversible commitment oracle 相比 point-decision policy 有正净收益，且收益不是只来自
   理想 PCIe 带宽假设。
@@ -1749,7 +2097,7 @@ ReentryHazard
   decision regret；
 - prediction 相比 P5 observed-state JointPlan 有独立、稳定的 JCT 或 unhidden-stall 收益；
 - 启用 action-frontier 时，time-to-valid-action、action throughput 或 causal-blocked time 至少一项
-  相比 strongest B1-B4 reference policy 有稳定收益；
+  相比 P5 observed-state JointPlan 有稳定收益；
 - wasted shadow/prefetch bytes、额外 HBM-time 和 delayed-workflow cost 小于避免成本；
 - reveal precision、coverage 和净收益单独报告；若无收益则关闭 reveal，不影响 frontier policy；
 - OOD fallback 与 P5 的 decision trace 一致，且不劣于 strongest observed baseline。
@@ -1770,38 +2118,37 @@ ReentryHazard
 - 新旧数据面上的策略决策语义一致；
 - 任何版本特有优化单独报告。
 
-### P8：原生竞品系统与两层端到端对比
+### P8：系统冻结后的基线选择与对比
 
-P8 在 BeliefKV P5/P6 功能、正确性和配置冻结后执行。此前不要求为部署外部系统暂停主线，
-但 P2.5-P6 的 reference-policy 日志、ID 映射和 common workload 必须为该阶段准备完毕。
+P8 只在 BeliefKV P5/P6 功能、正确性、workload 和配置冻结后启动。P2-P6 不为该阶段预建
+统一竞品框架，也不承诺把 ScaleSim、AugServe、ThunderAgent、CONCUR 等方法全部改写到
+BeliefKV 数据面。
 
 任务：
 
-1. 在同一 BeliefKV/SGLang 数据面主动运行 B0-B4 的 online-capable variant，形成算法层对比；
-   B1/B2 hindsight variant 继续只作 replay oracle；
-2. 对代码可用且硬件支持的 ScaleSim、ThunderAgent 等部署原生版本；
-3. 对暂时无完整代码或依赖不同 serving engine 的方法，优先复现论文核心 policy，并明确
-   native/unavailable/reimplemented 状态；
-4. 在 common-denominator tool workflow 上比较 reference policy 与 native system 的方向、排序
-   和端到端趋势，验证重实现忠实度；
-5. 在 blocking、cyclic peer 和 mixed workflow 上报告 full-scope 结果；竞品缺少语义接口时
-   报告 unsupported capability，不把启动失败计为加速比；
-6. 统一或显式报告模型、量化、KV pool、SGLang/vLLM 版本、PCIe、batch 和 workload arrival；
-7. 分开报告：
-
-   ```text
-   same-data-plane policy comparison  -> 隔离算法差异
-   native end-to-end comparison       -> 比较完整系统竞争力
-   ```
+1. 先制作 compatibility matrix，逐项检查候选工作的代码可用性、模型/硬件、serving engine、
+   workflow 语义和前端 metadata 假设；
+2. 将实验分为 BeliefKV full dynamic workload 和 common-denominator workload。前者证明目标
+   场景收益，后者只用于与确实支持相同语义的方法比较；
+3. 优先运行论文原生开源实现。只有原生实现不可运行但核心策略可被忠实表达时，才决定是否
+   在独立实验目录编写最小适配；不修改 `beliefkv/policy` 核心路径，也不建立长期维护的通用
+   policy framework；
+4. 对依赖 invocation distance、静态 DAG、program phase 或工具时长先验的方法，仅在真实
+   frontend 能提供相同信息时运行在线版本；否则作为 assumption difference 讨论，不临时构造
+   hindsight 数值冒充在线结果；
+5. 统一或显式报告模型、量化、KV pool、SGLang/vLLM 版本、PCIe、batch、arrival process 和
+   workload 差异；
+6. 如果没有方法能在完整动态 workload 上忠实运行，主表使用 SGLang/HiCache、reactive
+   policy、scheduling-only、KV-only 和 BeliefKV ablation；外部方法只在可比子集单独成表。
 
 退出条件：
 
-- ScaleSim、AugServe、ThunderAgent、CONCUR 至少都有 reference-policy 结果；
-- 所有代码开源且硬件兼容的直接竞品都应尝试 native 部署；至少完成一个，目标完成两个，
-  其余必须记录不可运行的具体原因；
-- reference 与 native 在重叠 workload 上不存在无法解释的趋势反转；
-- 所有竞品的额外 metadata、硬件和部署限制在表格中明确列出；
-- 论文主结果同时包含 strongest same-data-plane baseline 和 strongest runnable native baseline。
+- 每个外部结果都能说明代码来源、输入先验、修改范围和适用 workload；
+- 不把 unsupported workload、缺失 metadata 或启动失败计为 BeliefKV 性能收益；
+- 至少完成一个与 BeliefKV 存在实质场景交集的强外部基线；如果客观上不存在，必须用完整
+  compatibility evidence 说明，而不能只声称“场景更新颖”；
+- 最终结论分别回答 full dynamic workload 的有效性和 common subset 上的竞争力，不混写两类
+  结果。
 
 ## 12. 测试计划
 
@@ -1816,7 +2163,7 @@ P8 在 BeliefKV P5/P6 功能、正确性和配置冻结后执行。此前不要�
 - shared prefix 的 marginal bytes；
 - top-K scenario 概率、OTHER/OOD 和校准；
 - PolicyInput/PolicyOutput schema、metadata assumption 和 hindsight 在线隔离；
-- B0-B4 reference policy 在固定 snapshot 上的确定性与 resource accounting 一致性；
+- reactive 默认路径在固定 snapshot 上的确定性与 resource accounting 一致性；
 - structured action parser、合法 boundary、UNKNOWN 和 malformed output；
 - UnlockHazard/ReentryHazard 的 calibration、OOD 和 fallback；
 - 置信度到 KEEP/SHADOW/COMMIT 的 commitment ladder；
@@ -1854,23 +2201,23 @@ P8 在 BeliefKV P5/P6 功能、正确性和配置冻结后执行。此前不要�
 14. 两个 active agent 中，一个接近 tool action boundary，验证 shadow action-unlock plan 不修改
     P4/P5 真实执行；
 15. action boundary 后 active KV 转为 waiting/dead bundle，RUN(q) 与 residency transition 原子一致；
-16. B1/B2 使用 hindsight metadata 时在线 planner 无法读取对应字段。
+16. 通用 contract 的 hindsight metadata 无法被 online planner 读取。
 
 ### 12.3 真实 GPU 测试
 
-每个正式配置至少运行：
+P3-P6 每个正式配置至少运行：
 
 - pinned upstream SGLang Radix LRU；
 - HiCache write-back；
 - HiCache write-through；
 - HiCache write-through-selective；
 - HiCache + reactive causal policy；
-- B1-B4 online-capable same-data-plane reference policy；hindsight variant 仅 replay；
 - BeliefKV observed-state JointPlan，不使用预测；
 - BeliefKV frontier-belief JointPlan，不使用 reveal；
 - BeliefKV full policy，Reveal-and-Commit 仅在满足 gate 时开启；
-- scheduling-only oracle、KV-only oracle 和 full JointPlan oracle；
-- P8 中可运行的 native ScaleSim/AugServe/ThunderAgent/CONCUR baseline。
+- scheduling-only oracle、KV-only oracle 和 full JointPlan oracle。
+
+P8 在系统冻结后根据 compatibility matrix 选择可运行外部基线；它们不扩张 P3-P6 的必跑矩阵。
 
 统一模型、SGLang commit、量化、KV pool、并发度、随机种子和冻结 workload。动态生成无法完全
 冻结时，必须报告每次 run 的 request/event sequence hash，不允许直接比较不同轨迹的 JCT。
@@ -1944,8 +2291,11 @@ Action：boundary coverage、time-to-valid-action、tool-start gap、frontier de
 - decision regret 相比 reactive 和 oracle；
 - plan stale、fallback 和 planning overhead；
 - execution-admission-residency mismatch count，要求为 0；
-- O0/O1/O2/O3 oracle 和 joint synergy gap；
-- B0-B4 reference policy、best-reference gap 和 metadata advantage；
+- 局部 execution-order reversal、KV-action reversal、`S/K/J` local synergy gap 和
+  `counterfactual_unidentifiable` 比例；
+- 相同 active count 下 locked bytes 分布、multi-blocker extent/bytes、preview/realized reclaim
+  误差和 retraction 后 recompute tokens/time；这些随正式运行采样，不要求单独复杂模拟；
+- 完整 O0/O1/O2/O3 和外部方法指标仅在系统冻结后的可选深入分析/独立对比阶段定义；
 - action-critical priority inversion 的频率、代价和涉及的 active-to-waiting KV bytes；
 - KEEP/SHADOW/COMMIT 的 precision、commit/cancel rate 和 commitment regret；
 - F1-F4 failure 的出现频率与 JCT 贡献。
@@ -1961,12 +2311,12 @@ Action：boundary coverage、time-to-valid-action、tool-start gap、frontier de
 | parent-child prefix affinity 很低 | 因果关系无法带来共享复用 | 优化 independent working-set admission/rotation；shared lease 只做正确性 |
 | multi-agent adapter 丢失 handoff/consumer | 活跃 peer 被误迁移 | 未确认关系使用 READY/RUNNING safety lease，禁止预测性 commit |
 | cyclic handoff 导致 KV 抖动 | H2D/D2H 大于复用收益 | residency hysteresis、minimum tenure、HBM emergency override |
-| JointPlan 只统一接口但无 synergy | 创新退化为工程重构 | 用 O1/O2/O3 oracle gate；无 gap 时不作为 Major contribution |
+| JointPlan 只统一接口但无 synergy | 创新退化为工程重构 | 先用局部 Jointness Audit，最终用端到端结果闭合；无 gap 时不作为 Major contribution |
 | 当前 workload topology entropy 低 | 无法证明动态 MAS | P3 前置 cyclic peer 和 mixed workload，不用固定两-child trace 训练/评价 predictor |
-| ScaleSim/AugServe reference 已解释主要收益 | BeliefKV 目标没有独立价值 | P3B/P5.5 使用 hindsight competitor oracle；无 gap 时停止 predictive 分支 |
+| 外部工作在 common subset 已解释主要收益 | BeliefKV 论文竞争边界收窄 | 系统冻结后运行可比强基线并收缩主张，不反向修改核心接口 |
 | dynamic trace 对调度敏感 | 冻结 replay 产生虚假 oracle 收益 | 标注 schedule sensitivity；semantic race 只作上界并用真实 A/B 闭合 |
 | structured action coverage 低 | UnlockHazard 无法稳定工作 | UNKNOWN 回退 P5；action-frontier 不作为 Major contribution |
-| action criticality 与短作业/value-density 等价 | action-unlock 退化为 AugServe 变体 | P5.5 比较同真实长度/工具时间的 B2 oracle，无独立 gap 即停止 |
+| action criticality 与短作业/value-density 等价 | action-unlock 可能退化为已有目标 | P5.5 先与内部独立 oracle 比较；最终再在可比 workload 上检查已有目标 |
 | CPU shadow 可用 PCIe 窗口很少 | reversible commitment 只有机制价值 | 单独报告 idle service、commit/cancel 和净收益，不作为必要组件 |
 | HiCache overlap 隐藏大部分 restore | KV 预测收益缩小 | 以 unhidden stall 为准，降低该贡献优先级 |
 | shared/closure 使计划频繁失效 | context 估计不可信 | 强制 physical preview 和 generation 二次校验 |
@@ -1976,7 +2326,7 @@ Action：boundary coverage、time-to-valid-action、tool-start gap、frontier de
 
 ## 15. Go/No-Go 与论文主张门槛
 
-### 15.1 Characterization 门槛
+### 15.1 两层 Joint Synergy 门槛
 
 在至少三类真实 MAS workload 中：
 
@@ -1984,18 +2334,19 @@ Action：boundary coverage、time-to-valid-action、tool-start gap、frontier de
 - 至少覆盖 blocking subagent、cyclic peer multi-agent 和 mixed workflow；
 - HBM-pressure 时必须稳定出现多个已观测 runnable agent，且 agent 选择会改变 admission 或
   optimal physical bundle plan；
-- B0-B4 至少完成同 snapshot reference replay，并声明各自 metadata assumption；
-- O3 full JointPlan oracle 相比 `best(B0..B4)` 的 mean/P95 workflow JCT 上界收益至少 10%，
-  并由 action throughput、causal-blocked time 或 unhidden stall 中至少一项解释；只优于
-  O0/B0 不足以继续；
-- O3 相比 `best(O1 scheduling-only, O2 KV-only)` 的 synergy gap 置信区间高于 0；
-- 至少 20% 的受压决策存在 scenario-dependent execution/admission/residency action；
+- **系统搭建期门槛**：从正式运行采样真实 pressure snapshot，完成短窗口 Local Jointness Audit；
+  execution/KV 双向决策反转和正 local synergy gap 必须可重复出现。该审计不要求完整动态 O0-O3
+  模拟，也不阻塞 P5A--P5C correctness 路径完成；
+- **系统完成后门槛**：通过端到端重复运行证明完整 JointPlan 相比最强可运行的独立
+  scheduling/KV 组合仍有净收益，并由 action throughput、causal-blocked time、unhidden stall
+  或 workflow JCT 中至少一项解释；动态路径同时报告 transition hash、调用量和拓扑分布；
 - subagent 与 multi-agent 的 frontier transition 都有足够 coverage，不能只由固定二 child
   workload 支撑 predictor。
 
 P6 action-frontier 分支还必须满足 P5.5 的独立门槛：action-critical inversion 有实际代价，
-action-unlock oracle 优于带 hindsight 的 B1/B2，且 reversible commitment 在实测 PCIe service
-下有正净收益。否则不能把 calibration、action SLO 或 shadow copy包装成核心贡献。
+action-unlock oracle 优于 reactive baseline 和独立 scheduling/KV oracle，且 reversible
+commitment 在实测 PCIe service 下有正净收益。外部方法的最终对比不作为 P6 correctness 的
+前置依赖。
 
 任一关键门槛不满足，应停止扩大 predictive JointPlan。JointPlan 可保留为工程统一接口，
 RCCG lease/ownership bridge 保留为正确性层，但不能作为 Major contribution。
@@ -2008,8 +2359,7 @@ revealer、`P90(T_reveal) < T_force` 且 offline reveal oracle 有净收益时�
 
 完整策略必须同时满足：
 
-- P5 observed-state JointPlan 相比 strongest separate/HiCache/deployable reference baseline 有
-  独立收益；hindsight oracle 只用于报告剩余上界 gap；
+- P5 observed-state JointPlan 相比 strongest separate/HiCache/reactive baseline 有独立收益；
 - P6 predictive JointPlan 相比 P5 仍有独立收益；
 - workflow JCT 或 unhidden stall 至少降低 10%，且置信区间不跨 0；
 - 无效 D2H/H2D/recompute 或 unhidden stall 至少降低 15%；
@@ -2017,7 +2367,8 @@ revealer、`P90(T_reveal) < T_force` 且 offline reveal oracle 有净收益时�
 - execution/admission/residency mismatch、错误 parent park 和未满足依赖的 request dispatch 为 0；
 - 新版 HiCache 数据面上收益仍存在；
 - OOD 时不劣于 P5 observed-state JointPlan；
-- P8 的 strongest runnable native baseline 和 same-data-plane reference baseline 均被纳入主表。
+- 系统冻结后完成 compatibility matrix，并在可比 workload 上纳入至少一个强外部基线，或用
+  充分证据说明不存在忠实可运行的交集。
 
 ### 15.3 可接受的最终贡献结构
 
@@ -2047,15 +2398,13 @@ feat(policy): project RCCG state into causal leases
 feat(runtime): build closure-aware physical KV bundles
 fix(runtime): make H2D closure admission and rollback allocator-consistent
 test(experiments): close the paired P1.5/P2 physical reliability gate
-feat(policy): add common reference-policy input and output contract
-feat(policy): add ScaleSim AugServe ThunderAgent and CONCUR reference policies
-feat(experiments): add hindsight metadata-isolated policy replay
+feat(policy): add immutable internal policy snapshot and replay contract
 feat(control): track observed producer-consumer relationships
 feat(runtime): capture peer handoff message and reactivation events
 feat(runtime): record structured action frontier and valid action boundaries
 feat(experiments): add cyclic peer and mixed dynamic workflows
 feat(policy): add side-effect-free scenario what-if packer
-feat(experiments): add reference scheduling-only KV-only action and joint oracles
+feat(experiments): add reactive scheduling-only KV-only action and joint oracles
 feat(policy): add observed-state JointPlan in shadow mode
 feat(runtime): apply JointPlan execution admission and transfer dependencies
 feat(policy): enable observed-state joint agent and KV scheduling
@@ -2064,14 +2413,18 @@ feat(predictor): add calibrated unlock and reentry hazard scenarios
 feat(policy): add robust predictive JointPlan actions
 feat(policy): add guarded reveal-and-commit when oracle-gated
 test(experiments): add pinned and current-HiCache policy matrix
-test(experiments): add same-data-plane and runnable native competitor matrix
+# After the BeliefKV runtime and configuration freeze
+docs(experiments): characterize external baseline compatibility
+test(experiments): add selected runnable external baselines on common workloads
 docs(results): report dynamic-workflow joint-synergy and go-no-go decision
 ```
 
-每个提交必须通过当前测试，并保持新策略默认关闭。P2 reliability、P2.5 reference contract、
-P3 joint/competitor oracle 和 P4 shadow-mode 是继续 P5/P6 的顺序硬门槛；P5.5 是选择 P6
-action-frontier 或 generic frontier 分支的硬门槛。不能先训练 predictor，再寻找能证明它有效的
-workload。P8 native deployment 可以延后，但不能缺席最终系统结果。
+每个提交必须通过当前测试，并保持新策略默认关闭。P2 reliability、P2.5 internal contract 和
+P4/P5 数据路径 correctness 是完成 P5 系统的顺序硬门槛；Local Jointness Audit 是扩展 P6 和
+形成 Major contribution 前的门槛，但完整动态 O0-O3 模拟与外部 baseline 不是 P5 系统搭建的
+前置条件。P5.5 是选择 P6 action-frontier 或 generic frontier 分支的硬门槛。不能先
+训练 predictor，再寻找能证明它有效的 workload。P8 在核心系统冻结后执行，
+根据 compatibility matrix 选择有效且可运行的强基线，并准确披露不兼容项。
 
 ## 17. 最终落点
 
@@ -2087,10 +2440,12 @@ observed RCCG + data-consumer state G_t
 ```
 
 blocking subagent 是第一个可控实现切片，不是系统的最终定义。P3 必须补充 cyclic peer
-multi-agent 和 mixed workflow，并通过 B0-B4 reference policy 及其 hindsight variant 检查竞争
-边界；P4/P5
-先证明不依赖预测的 agent/KV JointPlan 有效；P5.5 决定 action-unlock 是否值得成为 P6
-主线；P6 再证明预测相对 observed-state JointPlan 和 strongest reference policy 的增量价值。
-Reveal-and-Commit 只有在独立 oracle gate 通过时启用，P8 再完成同数据面与原生系统两层对比。
+multi-agent 和 mixed workflow；P4/P5 先完成不依赖预测的 agent/KV JointPlan，并从真实运行
+同步采样 Local Jointness Audit。系统冻结后再用端到端比较闭合 joint synergy；P5.5 决定
+action-unlock 是否值得成为 P6 主线；
+P6 再证明预测相对 observed-state JointPlan 的增量价值。Reveal-and-Commit 只有在独立 oracle
+gate 通过时启用。外部方法只在系统冻结后根据真实可比性选择，不预建统一竞品框架，也不反向
+增加在线
+核心路径的复杂度。
 这样既不会把动态 workflow 简化成 spawn 后的静态 DAG，也不会用一个 MLP 掩盖 agent 调度、
 物理 KV 和运行时因果之间真正需要联合解决的问题。

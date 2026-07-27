@@ -203,7 +203,7 @@ shared prefix 应采用哪个 owner lease
 结构下 parent-child exact prefix 至多约 5 tokens。
 
 冷启动证据位于
-[`runtime_events.sglang.jsonl`](../experiments/raw/deepagents_swebench/20260719T114541Z/server-p2-bundle-scope/runtime_events.sglang.jsonl#L41)。
+[`runtime_events.sglang.jsonl`](../experiments/archive/20260727/superseded_raw/deepagents_swebench/20260719T114541Z/server-p2-bundle-scope/runtime_events.sglang.jsonl#L41)。
 高压运行本身复用了同一服务器之前建立的 Radix cache，不能仅根据高压运行的 hit 值归因
 parent-child prefix。
 
@@ -248,7 +248,7 @@ parent-child prefix。
 child，不是 parent KV。由此得到：
 
 例如，高压 workload 中一个 fresh child 的第一次请求命中 3,397 tokens，见
-[`runtime_events.sglang.jsonl`](../experiments/raw/deepagents_swebench/20260719T114541Z/planned-8-p2-bundle-scope-pressure/server/runtime_events.sglang.jsonl#L95)。
+[`runtime_events.sglang.jsonl`](../experiments/archive/20260727/superseded_raw/deepagents_swebench/20260719T114541Z/planned-8-p2-bundle-scope-pressure/server/runtime_events.sglang.jsonl#L95)。
 
 ```text
 parent-parent：存在一定 cache affinity

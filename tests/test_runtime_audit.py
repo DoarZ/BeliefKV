@@ -1,9 +1,18 @@
+import base64
 import json
+import gzip
+import queue
+import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from beliefkv.runtime.audit import RuntimeAuditLog
+from beliefkv.runtime.audit import (
+    PolicySnapshotLog,
+    RequestTokenTraceLog,
+    RuntimeAuditLog,
+)
 
 
 class RuntimeAuditLogTest(unittest.TestCase):
@@ -34,6 +43,91 @@ class RuntimeAuditLogTest(unittest.TestCase):
             with RuntimeAuditLog(Path(temporary) / "audit.jsonl") as audit:
                 with self.assertRaises(ValueError):
                     audit.emit("bad", float("nan"))
+
+    def test_policy_snapshot_log_is_exclusive_and_gzip_compressed(self):
+        class _Input:
+            def to_dict(self):
+                return {"snapshot": "state"}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "policy.jsonl.gz"
+            with PolicySnapshotLog(
+                path,
+                trace_id="trace-a",
+                trace_sensitivity="timing_sensitive",
+            ) as snapshots:
+                sequence = snapshots.emit(_Input(), trigger="graph_or_queue")
+                self.assertEqual(sequence, 1)
+            with gzip.open(path, mode="rt", encoding="utf-8") as stream:
+                record = json.loads(stream.readline())
+            self.assertEqual(record["sequence"], 1)
+            self.assertEqual(record["trace_id"], "trace-a")
+            self.assertEqual(record["trigger"], "graph_or_queue")
+            self.assertEqual(record["policy_input"], {"snapshot": "state"})
+            with self.assertRaises(FileExistsError):
+                PolicySnapshotLog(
+                    path,
+                    trace_id="trace-b",
+                    trace_sensitivity="timing_sensitive",
+                )
+
+    def test_policy_snapshot_log_drops_instead_of_blocking_when_full(self):
+        class _Input:
+            def to_dict(self):
+                return {"snapshot": "state"}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with PolicySnapshotLog(
+                Path(temporary) / "bounded.jsonl.gz",
+                trace_id="trace-bounded",
+                trace_sensitivity="timing_sensitive",
+                max_pending=1,
+            ) as snapshots:
+                with mock.patch.object(
+                    snapshots._queue,
+                    "put_nowait",
+                    side_effect=queue.Full,
+                ):
+                    self.assertEqual(
+                        snapshots.emit(_Input(), trigger="bounded"),
+                        0,
+                    )
+                self.assertEqual(snapshots.count, 0)
+                self.assertEqual(snapshots.dropped_count, 1)
+
+    def test_request_token_trace_preserves_equality_without_raw_token_ids(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "request_tokens.jsonl.gz"
+            with RequestTokenTraceLog(path, run_id="run-a") as trace:
+                trace.emit(
+                    "request_prompt",
+                    1.0,
+                    [11, 22, 11],
+                    request_id="request-a",
+                )
+                trace.emit(
+                    "cache_final_commit",
+                    2.0,
+                    [11, 22, 11, 33],
+                    request_id="request-a",
+                )
+                self.assertEqual(trace.count, 2)
+            self.assertEqual(trace.written_count, 2)
+
+            with gzip.open(path, mode="rt", encoding="utf-8") as stream:
+                records = [json.loads(line) for line in stream]
+            decoded = []
+            for record in records:
+                packed = base64.b64decode(record["token_symbols_b64"])
+                decoded.append(
+                    struct.unpack(f"<{record['token_count']}Q", packed)
+                )
+                self.assertEqual(
+                    record["token_encoding"], RequestTokenTraceLog.ENCODING
+                )
+            self.assertEqual(decoded[0], decoded[1][:3])
+            self.assertEqual(decoded[0][0], decoded[0][2])
+            self.assertNotEqual(decoded[0][0], decoded[0][1])
 
 
 if __name__ == "__main__":

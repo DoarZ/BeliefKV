@@ -1,19 +1,37 @@
 from __future__ import annotations
 
+import copy
+from collections import deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Mapping, Sequence
 
 from beliefkv.control.causal_graph import GraphDelta, RuntimeCausalContextGraph
+from beliefkv.control.data_consumers import ObservedDataConsumerIndex
 from beliefkv.core.config import BeliefKVConfig
 from beliefkv.core.events import RuntimeEvent, RuntimeEventKind
 from beliefkv.policy.admission import (
     AdmissionController,
     AdmissionDecision,
     AdmissionRequest,
+    AdmissionSideState,
+    AdmissionTicketCompiler,
+    VisibleAdmissionEntry,
+    VisibleAdmissionIndex,
 )
 from beliefkv.policy.leases import CausalLeaseProjector
 from beliefkv.policy.causal_frontier import CausalFrontierScheduler
 from beliefkv.policy.residency import ResidencyClassifier
+from beliefkv.policy.reference.base import (
+    CapabilityReport,
+    IdentityMapping,
+    MetadataMode,
+    MetadataValue,
+    PolicyInput,
+    RunnableInvocation,
+)
+from beliefkv.policy.reference.snapshot_builder import PolicyInputSnapshotBuilder
+from beliefkv.policy.resource_snapshot import RuntimeResourceObservation
 from beliefkv.policy.shadow_controller import ShadowConfig, ShadowController, ShadowSignals
 from beliefkv.policy.transfer_cost import PCIeCostModel
 from beliefkv.policy.transfer_guard import TransferAttemptGuard, TransferGuardEvent
@@ -28,6 +46,7 @@ from beliefkv.runtime.page_index import PageIndexError, PageOwnershipIndex
 from beliefkv.runtime.protocol import (
     CommandAck,
     CommandKind,
+    CommandQueueClass,
     CommandStatus,
     ControlCommand,
     PageHandle,
@@ -54,6 +73,14 @@ class ControllerTickResult:
     bundle_preview_events: tuple[BundlePreviewEvent, ...] = ()
 
 
+@dataclass(frozen=True)
+class RuntimeEventChangeSet:
+    from_sequence: int
+    to_sequence: int
+    events: tuple[RuntimeEvent, ...]
+    full_rebuild_required: bool = False
+
+
 @dataclass
 class _InFlightCommand:
     resolved: ResolvedCommand
@@ -71,6 +98,7 @@ class BeliefKVController:
     ) -> None:
         self.config = config or BeliefKVConfig()
         self.graph = RuntimeCausalContextGraph()
+        self.data_consumers = ObservedDataConsumerIndex(self.graph)
         self.page_index = PageOwnershipIndex()
         self.frontier = CausalFrontierScheduler(self.graph)
         self.classifier = ResidencyClassifier(self.graph, self.page_index)
@@ -81,6 +109,11 @@ class BeliefKVController:
             self.frontier,
             reserve_hbm_bytes=self.config.reserve_hbm_bytes,
         )
+        # The embedded SGLang path uses this request-ID side index. The legacy
+        # AdmissionController remains available to the standalone simulator,
+        # but does not own runtime request objects or reserve runtime HBM.
+        self.visible_admission = VisibleAdmissionIndex()
+        self.admission_ticket_compiler = AdmissionTicketCompiler()
         self.shadow = ShadowController(
             self.graph,
             self.page_index,
@@ -155,6 +188,14 @@ class BeliefKVController:
             window=self.config.service_curve_window,
             min_samples=self.config.service_curve_min_samples,
         )
+        self.policy_snapshot_builder = PolicyInputSnapshotBuilder(
+            self.graph,
+            self.data_consumers,
+            self.page_index,
+            self.admission,
+            self.lease_projector,
+            self.service_curve,
+        )
         self.now_ms = 0.0
         self.signals = ShadowSignals(
             urgent_queue_depth=0,
@@ -181,11 +222,21 @@ class BeliefKVController:
         self._native_admission_capacity_bytes = 0
         self._pcie_utilization_observed = False
         self._gpu_compute_utilization_observed = False
+        self._transfer_epoch = 0
+        self._transition_by_workflow: dict[str, dict[str, object]] = {}
+        self._terminal_cleanup_handles: dict[str, set[PageHandle]] = {}
+        self._runtime_event_sequence = 0
+        self._runtime_event_journal: deque[tuple[int, RuntimeEvent]] = deque(
+            maxlen=262_144
+        )
 
     def process_runtime_event(self, event: RuntimeEvent) -> GraphDelta:
         self.now_ms = max(self.now_ms, event.ts_ms)
         delta = self.graph.apply(event)
+        self.data_consumers.apply(event)
+        self._observe_transition_batch((event,))
         self._after_runtime_event(event, delta)
+        self._append_runtime_events((event,))
         return delta
 
     def process_runtime_events(
@@ -194,10 +245,45 @@ class BeliefKVController:
         if not events:
             return []
         deltas = self.graph.apply_batch(events, atomic=True)
+        self.data_consumers.apply_batch(events, atomic=True)
+        self._observe_transition_batch(tuple(events))
         for event, delta in zip(events, deltas):
             self.now_ms = max(self.now_ms, event.ts_ms)
             self._after_runtime_event(event, delta)
+        self._append_runtime_events(tuple(events))
         return deltas
+
+    @property
+    def runtime_event_sequence(self) -> int:
+        return self._runtime_event_sequence
+
+    def runtime_events_since(self, sequence: int) -> RuntimeEventChangeSet:
+        if sequence < 0 or sequence > self._runtime_event_sequence:
+            raise ValueError("runtime event sequence is outside the valid range")
+        if sequence == self._runtime_event_sequence:
+            return RuntimeEventChangeSet(sequence, sequence, ())
+        reverse_records: list[tuple[int, RuntimeEvent]] = []
+        for item in reversed(self._runtime_event_journal):
+            if item[0] <= sequence:
+                break
+            reverse_records.append(item)
+        records = tuple(reversed(reverse_records))
+        full_rebuild = not records or records[0][0] != sequence + 1
+        return RuntimeEventChangeSet(
+            from_sequence=sequence,
+            to_sequence=self._runtime_event_sequence,
+            events=tuple(item[1] for item in records),
+            full_rebuild_required=full_rebuild,
+        )
+
+    def _append_runtime_events(self, events: tuple[RuntimeEvent, ...]) -> None:
+        for event in events:
+            self._runtime_event_sequence += 1
+            # Detach the worker journal from adapter-owned attribute mappings.
+            detached = RuntimeEvent.from_dict(copy.deepcopy(event.to_dict()))
+            self._runtime_event_journal.append(
+                (self._runtime_event_sequence, detached)
+            )
 
     def _after_runtime_event(self, event: RuntimeEvent, delta: GraphDelta) -> None:
         self.notify_resource_state_changed()
@@ -233,6 +319,28 @@ class BeliefKVController:
         if invocation is None or invocation.workflow_id != request.workflow_id:
             raise ValueError("request refers to an unknown invocation/workflow")
         self.admission.enqueue(request)
+
+    def register_visible_request(
+        self,
+        request: AdmissionRequest,
+        *,
+        transition_generation: int = 0,
+        bundle_generations: Mapping[str, str] | None = None,
+    ) -> VisibleAdmissionEntry:
+        """Track a native-queue request without taking queue or HBM ownership."""
+
+        context = self.graph.contexts.get(request.context_id)
+        if context is None or context.epoch != request.context_epoch:
+            raise ValueError("request refers to an unknown or stale context")
+        invocation = self.graph.invocations.get(request.invocation_id)
+        if invocation is None or invocation.workflow_id != request.workflow_id:
+            raise ValueError("request refers to an unknown invocation/workflow")
+        self.fairness.register(request.workflow_id)
+        return self.visible_admission.register(
+            request,
+            transition_generation=transition_generation,
+            bundle_generations=bundle_generations,
+        )
 
     def acknowledge_admission(self, request_id: str) -> int:
         return self.admission.acknowledge(request_id)
@@ -346,12 +454,155 @@ class BeliefKVController:
             charges[workflow_id] = charges.get(workflow_id, 0.0) + value
         return charges
 
+    def external_workflow_memory_charges(self) -> tuple[tuple[str, float], ...]:
+        return tuple(sorted(self._external_workflow_charges.items()))
+
+    def build_policy_input(
+        self,
+        observation: RuntimeResourceObservation,
+        *,
+        additional_runnable: Sequence[RunnableInvocation] = (),
+        identity_mappings: Sequence[IdentityMapping] = (),
+        optional_metadata: Mapping[str, MetadataValue] | None = None,
+        capabilities: CapabilityReport | None = None,
+        metadata_mode: MetadataMode = MetadataMode.ONLINE,
+    ) -> PolicyInput:
+        """Build one read-only common-policy snapshot at a runtime safe point."""
+
+        urgent_d2h, urgent_h2d = self.transfer_backlog_bytes()
+        observation = replace(
+            observation,
+            urgent_d2h_bytes=urgent_d2h,
+            urgent_h2d_bytes=urgent_h2d,
+        )
+        return self.policy_snapshot_builder.build(
+            observation,
+            additional_runnable=additional_runnable,
+            workflow_memory_charges=self.workflow_memory_charges(),
+            control_state=self.policy_control_state(observation.ts_ms),
+            identity_mappings=identity_mappings,
+            optional_metadata=optional_metadata,
+            transfer_telemetry=tuple(self.transfer_telemetry_history),
+            capabilities=capabilities,
+            metadata_mode=metadata_mode,
+        )
+
+    def policy_control_state(self, now_ms: float) -> dict[str, object]:
+        for workflow_id, state in self._transition_by_workflow.items():
+            opened_ts_ms = state.get("opened_ts_ms")
+            if (
+                state.get("open")
+                and isinstance(opened_ts_ms, (int, float))
+                and now_ms - float(opened_ts_ms)
+                >= self.config.joint_transition_settling_timeout_ms
+            ):
+                state["open"] = False
+                state["degraded"] = True
+                state["generation"] = int(state["generation"]) + 1
+                state["closed_ts_ms"] = now_ms
+        return {
+            "transfer_epoch": self._transfer_epoch,
+            "transitions": {
+                workflow_id: dict(state)
+                for workflow_id, state in sorted(
+                    self._transition_by_workflow.items()
+                )
+            },
+        }
+
+    def _observe_transition_batch(
+        self, events: tuple[RuntimeEvent, ...]
+    ) -> None:
+        relevant = {
+            RuntimeEventKind.INVOCATION_CREATE,
+            RuntimeEventKind.MESSAGE,
+            RuntimeEventKind.HANDOFF,
+            RuntimeEventKind.REACTIVATE,
+            RuntimeEventKind.JOIN_SATISFIED,
+        }
+        by_workflow: dict[str, list[RuntimeEvent]] = {}
+        for event in events:
+            if (
+                event.kind in relevant
+                or event.attributes.get("transition_open")
+                or event.attributes.get("transition_close")
+            ):
+                by_workflow.setdefault(event.workflow_id, []).append(event)
+        for workflow_id, workflow_events in by_workflow.items():
+            previous = self._transition_by_workflow.get(
+                workflow_id,
+                {
+                    "generation": 0,
+                    "open": False,
+                    "degraded": False,
+                    "opened_ts_ms": None,
+                    "closed_ts_ms": None,
+                },
+            )
+            state = dict(previous)
+            state["generation"] = int(state["generation"]) + 1
+            explicitly_open = any(
+                bool(event.attributes.get("transition_open"))
+                for event in workflow_events
+            )
+            explicitly_closed = any(
+                bool(event.attributes.get("transition_close"))
+                for event in workflow_events
+            )
+            if explicitly_open and not explicitly_closed:
+                state["open"] = True
+                state["degraded"] = False
+                state["opened_ts_ms"] = min(
+                    event.ts_ms for event in workflow_events
+                )
+                state["closed_ts_ms"] = None
+            else:
+                state["open"] = False
+                state["degraded"] = False
+                state["opened_ts_ms"] = None
+                state["closed_ts_ms"] = max(
+                    event.ts_ms for event in workflow_events
+                )
+            self._transition_by_workflow[workflow_id] = state
+
+    def _bump_transfer_epoch(self) -> None:
+        self._transfer_epoch += 1
+
+    def transfer_backlog_bytes(self) -> tuple[int, int]:
+        """Return urgent D2H/H2D bytes queued or awaiting ACK."""
+
+        commands = [
+            item
+            for item in self.command_queue.pending_commands()
+            if item.queue_class == CommandQueueClass.URGENT
+        ]
+        commands.extend(
+            item.resolved.command
+            for item in self._inflight.values()
+            if item.resolved.command.queue_class == CommandQueueClass.URGENT
+        )
+        d2h = 0
+        h2d = 0
+        for command in commands:
+            bundle = command.physical_bundle
+            if bundle is None:
+                continue
+            for action in bundle.page_actions:
+                if action.action == PhysicalPageAction.START_D2H:
+                    d2h += action.size_bytes
+                elif action.action == PhysicalPageAction.START_H2D:
+                    h2d += action.size_bytes
+        return d2h, h2d
+
     def tick(self, now_ms: float | None = None) -> ControllerTickResult:
         if now_ms is not None:
             if now_ms < self.now_ms:
                 raise ValueError("controller time cannot move backwards")
             self.now_ms = now_ms
-        self.classifier.release_terminal_owners()
+        self.classifier.release_terminal_owners(
+            on_release=self._record_terminal_cleanup_handles
+        )
+        self._prune_terminal_cleanup_handles()
         self.update_signals()
         predictions = self._predictions()
 
@@ -420,6 +671,32 @@ class BeliefKVController:
         elif reserved_liveness_target is not None:
             required = reserved_liveness_target.estimated_incremental_bytes
             protected_context_id = reserved_liveness_target.context_id
+        elif not pending_requests and not reserved_requests:
+            # Runtime-visible requests have no logical reservation. Publish only
+            # the oldest request's immediate pressure to the reactive transfer
+            # writer; native PrefillAdder remains the final capacity authority.
+            visible_pending = sorted(
+                (
+                    entry
+                    for entry in self.visible_admission.entries()
+                    if entry.state == AdmissionSideState.VISIBLE_PENDING
+                ),
+                key=lambda entry: (
+                    entry.request.submitted_ts_ms,
+                    entry.request.request_id,
+                ),
+            )
+            if visible_pending:
+                oldest_visible = visible_pending[0].request
+                allocatable_free = max(
+                    0,
+                    self.config.hbm_capacity_bytes
+                    - self.config.reserve_hbm_bytes
+                    - self.actual_hbm_used_bytes,
+                )
+                if oldest_visible.estimated_incremental_bytes > allocatable_free:
+                    required = oldest_visible.estimated_incremental_bytes
+                    protected_context_id = oldest_visible.context_id
 
         delegated_native_reclaim = bool(
             admission is not None
@@ -436,19 +713,49 @@ class BeliefKVController:
             host_available_bytes=self.signals.host_free_bytes,
             now_ms=self.now_ms,
         )
+        restore_entries = tuple(
+            entry
+            for entry in self.visible_admission.entries()
+            if entry.state == AdmissionSideState.WAIT_RESTORE
+        )
+        restore_workflow_order = self.fairness.ordered(
+            {entry.request.workflow_id for entry in restore_entries},
+            memory_charges=self.workflow_memory_charges(),
+            hbm_capacity_bytes=self.config.hbm_capacity_bytes,
+        )
+        restore_workflow_rank = {
+            workflow_id: rank
+            for rank, workflow_id in enumerate(restore_workflow_order)
+        }
+        ordered_restore_entries = sorted(
+            restore_entries,
+            key=lambda entry: (
+                self.now_ms - entry.request.submitted_ts_ms
+                < self.config.admission_force_progress_timeout_ms,
+                restore_workflow_rank.get(entry.request.workflow_id, 1 << 30),
+                entry.request.submitted_ts_ms,
+                entry.request.request_id,
+            ),
+        )
+        preferred_restore_context_ids = tuple(
+            dict.fromkeys(entry.request.context_id for entry in ordered_restore_entries)
+        )
         if not self._inflight and not delegated_native_reclaim:
-            planned = self.transfer_planner.plan_next(
-                now_ms=self.now_ms,
-                hbm_capacity_bytes=self.config.hbm_capacity_bytes,
-                actual_hbm_used_bytes=self.actual_hbm_used_bytes,
-                reserved_hbm_bytes=self.admission.reserved_bytes,
-                admission_required_bytes=required,
-                protected_context_id=protected_context_id,
-                allow_frontier_spill=protected_context_id is not None,
-                drop_unowned_enabled=not self._drop_unowned_blocked,
-                signals=self.signals,
-                predictions=predictions,
-            )
+            planned = self._plan_terminal_cleanup()
+            if planned is None:
+                planned = self.transfer_planner.plan_next(
+                    now_ms=self.now_ms,
+                    hbm_capacity_bytes=self.config.hbm_capacity_bytes,
+                    actual_hbm_used_bytes=self.actual_hbm_used_bytes,
+                    reserved_hbm_bytes=self.admission.reserved_bytes,
+                    admission_required_bytes=required,
+                    protected_context_id=protected_context_id,
+                    allow_frontier_spill=protected_context_id is not None,
+                    drop_unowned_enabled=not self._drop_unowned_blocked,
+                    signals=self.signals,
+                    predictions=predictions,
+                    preferred_restore_context_ids=preferred_restore_context_ids,
+                )
             if (
                 planned is not None
                 and (self.config.shadow_enabled or planned.kind != CommandKind.SHADOW_CONTEXT)
@@ -499,6 +806,8 @@ class BeliefKVController:
             elif action.action == PhysicalPageAction.START_H2D:
                 self.page_index.begin_transfer(handle, TransferDirection.H2D)
             inflight.started_handles.add(handle)
+        if handles:
+            self._bump_transfer_epoch()
 
     def acknowledge_command(self, ack: CommandAck) -> None:
         self.now_ms = max(self.now_ms, ack.completed_ts_ms)
@@ -546,6 +855,8 @@ class BeliefKVController:
                 self.page_index.commit_cpu(handle)
             elif action.action == PhysicalPageAction.DROP:
                 self.page_index.drop_page(handle)
+            elif action.action == PhysicalPageAction.DROP_HOST:
+                self.page_index.drop_host_copy(handle)
             elif action.action == PhysicalPageAction.PIN:
                 context_id = inflight.resolved.command.context_id
                 if context_id is not None:
@@ -598,6 +909,7 @@ class BeliefKVController:
         else:
             self.transfer_guard.cancel_attempt(ack.command_id)
         self._inflight.pop(ack.command_id)
+        self._bump_transfer_epoch()
         if command.context_id is not None:
             self._queued_by_context.pop(command.context_id, None)
         self.ack_history.append(ack)
@@ -605,6 +917,47 @@ class BeliefKVController:
         self.notify_resource_state_changed()
         self.page_index.assert_consistent()
         self.update_signals()
+
+    def _record_terminal_cleanup_handles(
+        self, context_id: str, handles: frozenset[PageHandle]
+    ) -> None:
+        if handles:
+            self._terminal_cleanup_handles.setdefault(context_id, set()).update(
+                handles
+            )
+
+    def _prune_terminal_cleanup_handles(self) -> None:
+        for context_id, handles in tuple(self._terminal_cleanup_handles.items()):
+            remaining = {
+                handle
+                for handle in handles
+                if (page := self.page_index.pages.get(handle)) is not None
+                and page.cpu_resident
+                and not page.owner_contexts
+            }
+            if remaining:
+                self._terminal_cleanup_handles[context_id] = remaining
+            else:
+                self._terminal_cleanup_handles.pop(context_id, None)
+
+    def _plan_terminal_cleanup(self) -> ControlCommand | None:
+        for context_id in sorted(self._terminal_cleanup_handles):
+            if context_id in self._queued_by_context:
+                continue
+            context = self.graph.contexts.get(context_id)
+            if context is None:
+                continue
+            command = self.transfer_planner.plan_terminal_cleanup(
+                now_ms=self.now_ms,
+                context_id=context_id,
+                context_epoch=context.epoch,
+                target_handles=tuple(
+                    sorted(self._terminal_cleanup_handles[context_id])
+                ),
+            )
+            if command is not None:
+                return command
+        return None
 
     def observe_transfer_telemetry(self, telemetry: TransferTelemetry) -> None:
         """Update performance models after the correctness ACK was committed."""
@@ -625,6 +978,7 @@ class BeliefKVController:
             command = self.command_queue.pop(allow_shadow=self.config.shadow_enabled)
             if command is None:
                 return None, None
+            self._bump_transfer_epoch()
             if self.transfer_guard.command_is_eligible(command, now_ms=self.now_ms):
                 break
             if command.context_id is not None:
@@ -668,6 +1022,17 @@ class BeliefKVController:
 
     def reset_transfer_attempts(self) -> None:
         self.transfer_guard.reset(now_ms=self.now_ms)
+        self._bump_transfer_epoch()
+
+    def enqueue_control_command(self, command: ControlCommand) -> bool:
+        """Queue one externally compiled, versioned physical command.
+
+        Runtime policies may use this entry point only from the scheduler safe
+        point. The normal per-context de-duplication and transfer epoch rules
+        remain authoritative.
+        """
+
+        return self._enqueue_if_new(command)
 
     def _enqueue_if_new(self, command: ControlCommand) -> bool:
         if command.context_id is not None:
@@ -675,6 +1040,7 @@ class BeliefKVController:
                 return False
             self._queued_by_context[command.context_id] = command.command_id
         self.command_queue.put(command)
+        self._bump_transfer_epoch()
         return True
 
     def _cancel_shadow_for_context(self, context_id: str) -> None:
@@ -682,6 +1048,7 @@ class BeliefKVController:
         if queued_id is not None and self.command_queue.cancel(queued_id):
             self._queued_by_context.pop(context_id, None)
             self._pending_cancellations.add(queued_id)
+            self._bump_transfer_epoch()
         for command_id, inflight in self._inflight.items():
             command = inflight.resolved.command
             if (
@@ -689,6 +1056,7 @@ class BeliefKVController:
                 and command.kind == CommandKind.SHADOW_CONTEXT
             ):
                 self._pending_cancellations.add(command_id)
+                self._bump_transfer_epoch()
 
     def _predictions(self) -> dict[str, RemainingTimePrediction]:
         if not self.config.predictor_enabled:

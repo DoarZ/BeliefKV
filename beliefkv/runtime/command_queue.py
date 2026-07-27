@@ -81,5 +81,33 @@ class TransferCommandQueue:
             for entry in self._shadow
         )
 
+    def pending_commands(self) -> tuple[ControlCommand, ...]:
+        """Return a deterministic, non-destructive queue snapshot."""
+
+        entries = [
+            *(
+                (0, item)
+                for item in self._urgent
+                if item.command.command_id not in self._cancelled_ids
+            ),
+            *(
+                (1, item)
+                for item in self._shadow
+                if item.command.command_id not in self._cancelled_ids
+            ),
+        ]
+        return tuple(
+            item.command
+            for _, item in sorted(
+                entries,
+                key=lambda value: (
+                    value[0],
+                    value[1].deadline_ms,
+                    value[1].negative_priority,
+                    value[1].sequence,
+                ),
+            )
+        )
+
     def __len__(self) -> int:
         return self.urgent_count + self.shadow_count

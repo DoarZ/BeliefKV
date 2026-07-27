@@ -18,10 +18,12 @@ git 信息时）、上游 AST 接口和 BeliefKV patch marker。检查失败时�
 `patches/sglang-0.5.2rc1-beliefkv.patch` 只增加窄接口：
 
 - HTTP/generation input 到 `Req` 的 `beliefkv_metadata` 传播；
-- 在进入 SGLang waiting queue 前执行 BeliefKV admission；
-- abort 时清理 BeliefKV deferred queue 和 reservation；
+- request 始终进入 SGLang waiting queue，BeliefKV 在每个 prefill epoch 编译短期 admission
+  ticket，并在 `PrefillAdder` 前后做局部校验；
+- abort 时清理 BeliefKV visible side state、当前 epoch ticket 和未完成事务；
 - scheduler safe point 驱动 ACK、控制器和迁移 backend；
-- SGLang 原生 queue policy 运行后，对带 metadata 的槽位做 workflow/causal 重排；
+- SGLang 原生 queue policy 后为 tagged request 提供 causal/ticket candidate view；无 ticket 的
+  request 本轮跳过但仍留在原生 waiting queue；
 - Radix split/insert/delete/lock 与 HiCache residency 变化触发 observer；
 - server flags `--enable-beliefkv` 和 `--beliefkv-config`。
 
@@ -52,7 +54,7 @@ allocator、Radix topology、KV tensor 和 DMA queue。
 }
 ```
 
-没有该字段的请求不会进入 BeliefKV admission。`relation_type` 只能是
+没有该字段的请求绕过 BeliefKV ticket gate。`relation_type` 只能是
 `root/call/spawn/message/handoff`，context 和 execution mode 也会严格校验。
 
 仅靠 request metadata 能恢复 invocation/context 关系，但工具开始/结束、join
@@ -68,9 +70,9 @@ I/O。设置为 JSONL 路径后，每条记录包含 `run_id + sequence + monoto
 
 ```text
 invocation_created
-  -> request_deferred
-  -> admission_decision
-  -> request_admitted
+  -> request_visible_pending
+  -> admission_ticket_epoch_started
+  -> ticket selected or skipped
   -> request_started
   -> request_finished
 ```
@@ -92,7 +94,9 @@ drain HiCache ACK
   -> admission/transfer planning
   -> 提交至多一个迁移 command
   -> SGLang 原生 queue policy
-  -> tagged workflow round-robin + causal tie-break
+  -> begin_prefill_epoch 编译 causal/active-set ticket
+  -> ticket gate + prefix rematch + PrefillAdder
+  -> end_prefill_epoch 提交实际 selection accounting
 ```
 
 ACK 必须先于 tree sync。否则同步完成的 `COMMIT_CPU` 或 `DROP` 会让控制面先看到

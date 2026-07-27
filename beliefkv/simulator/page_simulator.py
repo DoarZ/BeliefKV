@@ -414,6 +414,8 @@ class PageLevelSimulator:
                 self.metrics.urgent_h2d_bytes += action.size_bytes
             elif action.action == PhysicalPageAction.DROP:
                 self.metrics.dropped_bytes += action.size_bytes
+            elif action.action == PhysicalPageAction.DROP_HOST:
+                self.metrics.dropped_bytes += action.size_bytes
 
     def _record_tick(self, tick: ControllerTickResult) -> None:
         payload: dict[str, Any] = {

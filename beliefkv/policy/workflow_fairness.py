@@ -21,6 +21,11 @@ class WorkflowFairScheduler:
     def __init__(self, *, memory_penalty_ms: float = 5.0) -> None:
         self.accounts: dict[str, WorkflowAccount] = {}
         self.memory_penalty_ms = memory_penalty_ms
+        self._revision = 0
+
+    @property
+    def revision(self) -> int:
+        return self._revision
 
     def register(self, workflow_id: str, *, weight: float = 1.0) -> None:
         if weight <= 0:
@@ -28,16 +33,21 @@ class WorkflowFairScheduler:
         account = self.accounts.get(workflow_id)
         if account is None:
             self.accounts[workflow_id] = WorkflowAccount(workflow_id, weight)
-        else:
+            self._revision += 1
+        elif account.weight != weight:
             account.weight = weight
+            self._revision += 1
 
     def charge_service(self, workflow_id: str, service_ms: float) -> None:
         if service_ms < 0:
             raise ValueError("service_ms must be non-negative")
         self.register(workflow_id)
         account = self.accounts[workflow_id]
+        if service_ms == 0:
+            return
         account.attained_service_ms += service_ms
         account.dispatch_count += 1
+        self._revision += 1
 
     def select(
         self,

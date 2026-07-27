@@ -11,7 +11,7 @@ from pydantic import PrivateAttr
 pytest.importorskip("deepagents")
 
 from deepagents.backends.protocol import ExecuteResponse
-from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.tools import tool
 from langchain.agents import create_agent
@@ -19,6 +19,8 @@ from langchain.agents.middleware.types import ModelRequest
 from langchain.agents.structured_output import ToolStrategy
 
 from beliefkv.experiments.agent_protocol import (
+    ActivationDeadline,
+    ActivationDeadlineExceeded,
     AgentLoopGuardMiddleware,
     ChildCompletion,
     LoopGuardPolicy,
@@ -503,7 +505,6 @@ def test_planned_children_use_a_shorter_analysis_budget(tmp_path: Path) -> None:
         docker_image="fixture:latest",
         loop_guard=LoopGuardPolicy(
             repeated_call_limit=5,
-            consecutive_diagnostic_probe_limit=8,
             max_model_calls_without_completion=32,
             max_tool_calls_without_completion=64,
         ),
@@ -511,7 +512,6 @@ def test_planned_children_use_a_shorter_analysis_budget(tmp_path: Path) -> None:
 
     policy = _planned_child_loop_guard_policy(config)
     assert policy.repeated_call_limit == 3
-    assert policy.consecutive_diagnostic_probe_limit == 4
     assert policy.max_model_calls_without_completion == 12
     assert policy.max_tool_calls_without_completion == 16
 
@@ -558,6 +558,35 @@ def test_loop_guard_detects_repeated_and_alternating_calls() -> None:
     for index, path in enumerate(("/a", "/b", "/a", "/b", "/a", "/b")):
         alternating.extend(_tool_exchange("read_file", {"path": path}, str(index), path))
     assert analyze_agent_history(alternating, policy).reason == "alternating_tool_cycle"
+
+
+def test_loop_guard_resets_after_a_persistent_thread_completion() -> None:
+    old_activation = []
+    for index in range(4):
+        old_activation.extend(
+            _tool_exchange("read_file", {"path": f"/old-{index}"}, str(index), "old")
+        )
+    old_activation.extend(
+        _tool_exchange(
+            "AgenticPeerDecision",
+            {"complete": False, "next_role": "reviewer"},
+            "peer-decision",
+            "accepted",
+        )
+    )
+    current_activation = _tool_exchange(
+        "read_file", {"path": "/current"}, "current", "new evidence"
+    )
+
+    snapshot = analyze_agent_history(
+        [*old_activation, HumanMessage(content="Resume"), *current_activation],
+        LoopGuardPolicy(max_model_calls_without_completion=4),
+        completion_tool_names=frozenset({"AgenticPeerDecision"}),
+    )
+
+    assert snapshot.model_calls == 1
+    assert snapshot.tool_calls == 1
+    assert snapshot.reason is None
 
 
 def test_loop_guard_detects_errors_no_progress_and_completion_budget() -> None:
@@ -638,7 +667,64 @@ def test_loop_guard_detects_errors_no_progress_and_completion_budget() -> None:
     )
 
 
-def test_loop_guard_stops_consecutive_diagnostic_python_probes() -> None:
+def test_loop_guard_counts_distinct_structured_tool_outputs_as_progress() -> None:
+    messages = [
+        ToolMessage(
+            content=[{"type": "json", "value": index}],
+            tool_call_id=f"unmatched-{index}",
+            name="execute",
+        )
+        for index in range(8)
+    ]
+
+    snapshot = analyze_agent_history(
+        messages,
+        LoopGuardPolicy(
+            repeated_call_limit=99,
+            consecutive_no_progress_limit=3,
+        ),
+    )
+
+    assert snapshot.reason is None
+    assert snapshot.consecutive_no_progress == 0
+
+
+def test_loop_guard_counts_parallel_failures_as_one_decision_batch() -> None:
+    calls = [
+        {
+            "name": "read_file",
+            "args": {"path": f"/missing-{index}"},
+            "id": f"parallel-{index}",
+        }
+        for index in range(44)
+    ]
+    messages = [AIMessage(content="", tool_calls=calls)]
+    messages.extend(
+        ToolMessage(
+            content="Error: path_not_found",
+            tool_call_id=str(call["id"]),
+            name="read_file",
+        )
+        for call in calls
+    )
+
+    snapshot = analyze_agent_history(
+        messages,
+        LoopGuardPolicy(
+            repeated_call_limit=6,
+            consecutive_error_limit=6,
+            consecutive_no_progress_limit=8,
+        ),
+    )
+
+    assert snapshot.reason is None
+    assert snapshot.tool_calls == 44
+    assert snapshot.completed_tool_calls == 44
+    assert snapshot.consecutive_errors == 1
+    assert snapshot.consecutive_no_progress == 1
+
+
+def test_loop_guard_allows_distinct_productive_python_probes() -> None:
     messages = []
     for index in range(8):
         messages.extend(
@@ -651,7 +737,7 @@ def test_loop_guard_stops_consecutive_diagnostic_python_probes() -> None:
         )
 
     snapshot = analyze_agent_history(messages, LoopGuardPolicy())
-    assert snapshot.reason == "diagnostic_probe_loop"
+    assert snapshot.reason is None
     assert snapshot.consecutive_no_progress == 0
 
 
@@ -671,6 +757,84 @@ def test_loop_guard_switches_to_forced_completion_state() -> None:
         "guard_forcing_completion": True,
         "guard_reason": "repeated_tool_call",
         "guard_trigger_model_calls": 3,
+    }
+
+
+def test_loop_guard_tracks_and_enforces_activation_wall_clock() -> None:
+    now = [10.0]
+    guard = AgentLoopGuardMiddleware(
+        policy=LoopGuardPolicy(activation_wall_clock_s=5.0),
+        completion_schema=ChildCompletion,
+        completion_instruction="Return ChildCompletion.",
+        audit=None,
+        scope="wall-clock-test",
+        clock=lambda: now[0],
+    )
+
+    assert guard.before_model({"messages": []}, runtime=None) == {
+        "guard_activation_started_monotonic": 10.0
+    }
+    now[0] = 14.9
+    assert (
+        guard.before_model(
+            {
+                "messages": [],
+                "guard_activation_started_monotonic": 10.0,
+            },
+            runtime=None,
+        )
+        is None
+    )
+    now[0] = 15.0
+    assert guard.before_model(
+        {
+            "messages": [],
+            "guard_activation_started_monotonic": 10.0,
+        },
+        runtime=None,
+    ) == {
+        "guard_forcing_completion": True,
+        "guard_reason": "activation_wall_clock_exhausted",
+        "guard_trigger_model_calls": 0,
+    }
+
+
+def test_activation_deadline_caps_late_requests_by_remaining_budget() -> None:
+    now = [100.0]
+    deadline = ActivationDeadline(clock=lambda: now[0])
+
+    assert deadline.request_timeout_s(900.0) == 900.0
+    deadline.start(600.0)
+    assert deadline.request_timeout_s(900.0) == 600.0
+    now[0] = 275.0
+    assert deadline.request_timeout_s(900.0) == 425.0
+    assert deadline.request_timeout_s(30.0) == 30.0
+    now[0] = 700.0
+    with pytest.raises(ActivationDeadlineExceeded):
+        deadline.request_timeout_s(900.0)
+
+    deadline.clear()
+    assert deadline.request_timeout_s(900.0) == 900.0
+
+
+def test_loop_guard_uses_parent_activation_deadline_for_child_scope() -> None:
+    now = [10.0]
+    deadline = ActivationDeadline(clock=lambda: now[0])
+    deadline.start(5.0)
+    guard = AgentLoopGuardMiddleware(
+        policy=LoopGuardPolicy(activation_wall_clock_s=5.0),
+        completion_schema=ChildCompletion,
+        completion_instruction="Return ChildCompletion.",
+        audit=None,
+        scope="shared-wall-clock-test",
+        activation_deadline=deadline,
+    )
+
+    now[0] = 15.0
+    assert guard.before_model({"messages": []}, runtime=None) == {
+        "guard_forcing_completion": True,
+        "guard_reason": "activation_wall_clock_exhausted",
+        "guard_trigger_model_calls": 0,
     }
 
 

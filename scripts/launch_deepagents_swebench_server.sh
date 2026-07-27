@@ -19,10 +19,11 @@ export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.952}"
 export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-163840}"
 export CONTEXT_LENGTH="${CONTEXT_LENGTH:-262144}"
 export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
+export HICACHE_SIZE_GB="${HICACHE_SIZE_GB:-96}"
 
 exec "$(dirname "$0")/launch_qwen3_coder_qwencode_smoke.sh" \
   --enable-hierarchical-cache \
-  --hicache-ratio 2 \
+  --hicache-size "${HICACHE_SIZE_GB}" \
   --hicache-write-policy write_back \
   --enable-beliefkv \
   --beliefkv-config "${CONFIG_PATH}" \

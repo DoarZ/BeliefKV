@@ -119,6 +119,73 @@ def test_locked_large_extent_does_not_hide_independent_reclaimable_bundle() -> N
     assert by_handles[(free,)].bundle.marginal_reclaimable_bytes == 500
 
 
+def test_retraction_owner_bypass_is_scoped_to_selected_contexts() -> None:
+    graph, index = _runtime(
+        ("victim", "ctx-victim", "wf"),
+        ("foreign", "ctx-foreign", "wf"),
+    )
+    graph.apply(_event(3, RuntimeEventKind.LLM_SUBMIT, invocation_id="victim"))
+    graph.apply(_event(4, RuntimeEventKind.LLM_SUBMIT, invocation_id="foreign"))
+    private = PageHandle(1, 0)
+    shared = PageHandle(2, 0)
+    index.register_page(private, size_bytes=500)
+    index.register_page(shared, size_bytes=700)
+    index.bind_pages("ctx-victim", 0, (private, shared))
+    index.bind_pages("ctx-foreign", 0, (shared,))
+    builder = PhysicalBundleBuilder(graph, index)
+
+    blocked = builder.previews_for_context(
+        CommandKind.OFFLOAD_CONTEXT,
+        "ctx-victim",
+        0,
+        now_ms=5,
+    )
+    bypassed = builder.previews_for_context(
+        CommandKind.OFFLOAD_CONTEXT,
+        "ctx-victim",
+        0,
+        now_ms=5,
+        bypass_owner_context_ids=frozenset(("ctx-victim",)),
+    )
+
+    blocked_by_handles = {item.bundle.handles: item for item in blocked}
+    bypassed_by_handles = {item.bundle.handles: item for item in bypassed}
+    assert not blocked_by_handles[(private,)].eligible
+    assert bypassed_by_handles[(private,)].eligible
+    assert not bypassed_by_handles[(shared,)].eligible
+    assert {item.code for item in bypassed_by_handles[(shared,)].blockers} == {
+        TransferBlockerCode.ENGINE_BUSY
+    }
+
+
+def test_drop_context_builds_a_closure_complete_reclaim_intent() -> None:
+    graph, index = _runtime(("victim", "ctx", "wf"))
+    graph.apply(_event(2, RuntimeEventKind.LLM_SUBMIT, invocation_id="victim"))
+    parent = PageHandle(1, 0)
+    child = PageHandle(2, 0)
+    index.register_page(parent, size_bytes=300, radix_depth=1)
+    index.register_page(child, size_bytes=500, radix_depth=2, parent=parent)
+    index.bind_pages("ctx", 0, (parent, child))
+
+    previews = PhysicalBundleBuilder(graph, index).previews_for_context(
+        CommandKind.DROP_CONTEXT,
+        "ctx",
+        0,
+        now_ms=3,
+        bypass_owner_context_ids=frozenset(("ctx",)),
+    )
+    preview = next(
+        item for item in previews if item.bundle.handles == (parent, child)
+    )
+
+    assert preview.eligible
+    assert preview.bundle.marginal_reclaimable_bytes == 800
+    assert all(
+        action.action == PhysicalPageAction.DROP
+        for action in preview.page_actions
+    )
+
+
 def test_preview_reports_host_capacity_without_erasing_required_bytes() -> None:
     graph, index = _runtime(("parked", "ctx", "wf"))
     graph.apply(_event(2, RuntimeEventKind.TOOL_START, invocation_id="parked"))

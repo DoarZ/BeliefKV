@@ -55,7 +55,7 @@ KV pool 下验证请求能够在接近满载时持续前进。
 
 以上调试 run 及更早的 Deep Agents 中间产物已归档到
 `experiments/archive/20260717/raw/deepagents_swebench/`。最终验证 run 仍保留在
-`experiments/raw/deepagents_swebench/20260716T182104Z/`。
+`experiments/archive/20260727/superseded_raw/deepagents_swebench/20260716T182104Z/`。
 
 ## 4. 最终实验配置
 
@@ -73,8 +73,8 @@ KV pool 下验证请求能够在接近满载时持续前进。
 
 最终产物：
 
-- `experiments/raw/deepagents_swebench/20260716T182104Z/planned-8-ack-idempotent-exact/summary.json`
-- `experiments/raw/deepagents_swebench/20260716T182104Z/server-ack-idempotent/runtime_audit.jsonl`
+- `experiments/archive/20260727/superseded_raw/deepagents_swebench/20260716T182104Z/planned-8-ack-idempotent-exact/summary.json`
+- `experiments/archive/20260727/superseded_raw/deepagents_swebench/20260716T182104Z/server-ack-idempotent/runtime_audit.jsonl`
 
 ## 5. 最终结果
 

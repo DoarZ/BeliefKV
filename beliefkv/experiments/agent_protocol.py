@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
+import math
+import threading
+import time
 from dataclasses import asdict, dataclass
-from typing import Annotated, Any, Literal, Protocol, Sequence
+from typing import Annotated, Any, Callable, Literal, Protocol, Sequence
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import (
@@ -22,6 +24,61 @@ from typing_extensions import NotRequired
 
 class AuditSink(Protocol):
     def emit(self, event: str, **fields: Any) -> None: ...
+
+
+class ActivationDeadlineExceeded(TimeoutError):
+    """Raised before a model request that has no activation budget left."""
+
+
+class ActivationDeadline:
+    """Thread-safe absolute deadline shared by one activation and its children."""
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._started_at: float | None = None
+        self._deadline: float | None = None
+
+    def start(self, budget_s: float) -> None:
+        if not math.isfinite(budget_s) or budget_s <= 0:
+            raise ValueError("activation deadline budget must be positive")
+        now = self._clock()
+        with self._lock:
+            if self._deadline is not None:
+                raise RuntimeError("activation deadline is already active")
+            self._started_at = now
+            self._deadline = now + budget_s
+
+    def clear(self) -> None:
+        with self._lock:
+            self._started_at = None
+            self._deadline = None
+
+    def elapsed_s(self) -> float | None:
+        now = self._clock()
+        with self._lock:
+            if self._started_at is None:
+                return None
+            return max(0.0, now - self._started_at)
+
+    def remaining_s(self) -> float | None:
+        now = self._clock()
+        with self._lock:
+            if self._deadline is None:
+                return None
+            return max(0.0, self._deadline - now)
+
+    def request_timeout_s(self, cap_s: float) -> float:
+        if not math.isfinite(cap_s) or cap_s <= 0:
+            raise ValueError("single-request timeout cap must be positive")
+        remaining = self.remaining_s()
+        if remaining is None:
+            return cap_s
+        if remaining <= 0:
+            raise ActivationDeadlineExceeded(
+                "activation wall-clock deadline expired before model submission"
+            )
+        return min(cap_s, remaining)
 
 
 class ChildCompletion(BaseModel):
@@ -84,10 +141,10 @@ class LoopGuardPolicy:
     alternating_cycle_repetitions: int = 3
     consecutive_error_limit: int = 3
     consecutive_no_progress_limit: int = 5
-    consecutive_diagnostic_probe_limit: int = 8
-    max_model_calls_without_completion: int = 32
-    max_tool_calls_without_completion: int = 64
+    max_model_calls_without_completion: int = 48
+    max_tool_calls_without_completion: int = 128
     recovery_model_call_limit: int = 3
+    activation_wall_clock_s: float = 1800.0
 
     def __post_init__(self) -> None:
         values = (
@@ -95,7 +152,6 @@ class LoopGuardPolicy:
             self.alternating_cycle_repetitions,
             self.consecutive_error_limit,
             self.consecutive_no_progress_limit,
-            self.consecutive_diagnostic_probe_limit,
             self.max_model_calls_without_completion,
             self.max_tool_calls_without_completion,
             self.recovery_model_call_limit,
@@ -104,6 +160,11 @@ class LoopGuardPolicy:
             raise ValueError("loop guard limits must be positive")
         if self.alternating_cycle_repetitions < 2:
             raise ValueError("alternating cycle detection needs at least two repetitions")
+        if (
+            not math.isfinite(self.activation_wall_clock_s)
+            or self.activation_wall_clock_s <= 0
+        ):
+            raise ValueError("activation wall-clock budget must be positive")
 
 
 @dataclass(frozen=True)
@@ -128,6 +189,9 @@ class LoopGuardState(AgentState[Any]):
     guard_trigger_model_calls: NotRequired[
         Annotated[int, UntrackedValue, PrivateStateAttr]
     ]
+    guard_activation_started_monotonic: NotRequired[
+        Annotated[float, UntrackedValue, PrivateStateAttr]
+    ]
 
 
 def _canonical_tool_call(tool_call: dict[str, Any]) -> str:
@@ -145,21 +209,17 @@ def _canonical_tool_call(tool_call: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _is_diagnostic_python_probe(tool_call: dict[str, Any]) -> bool:
-    if tool_call.get("name") != "execute":
-        return False
-    command = tool_call.get("args", {}).get("command")
-    if not isinstance(command, str):
-        return False
-    pattern = r"(?:^|[;&|]\s*)(?:\S*/)?python(?:\d+(?:\.\d+)?)?\s+-c\b"
-    return re.search(pattern, command) is not None
-
-
 def _message_text(message: BaseMessage) -> str:
-    try:
-        return message.text
-    except (AttributeError, TypeError, ValueError):
-        return str(message.content)
+    content = message.content
+    if isinstance(content, str):
+        return content
+    return json.dumps(
+        content,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        default=str,
+    )
 
 
 def _tool_result_is_error(message: ToolMessage) -> bool:
@@ -192,32 +252,50 @@ def analyze_agent_history(
     *,
     completion_tool_names: frozenset[str] = frozenset(),
 ) -> LoopGuardSnapshot:
+    # A persistent peer thread can complete one activation and later be resumed.
+    # Guard budgets apply to the current activation, not the thread's lifetime.
+    last_completion = max(
+        (
+            index
+            for index, message in enumerate(messages)
+            if isinstance(message, ToolMessage)
+            and message.name in completion_tool_names
+        ),
+        default=-1,
+    )
+    messages = messages[last_completion + 1 :]
     model_calls = sum(isinstance(message, AIMessage) for message in messages)
-    calls_by_id: dict[str, tuple[str, str]] = {}
+    calls_by_id: dict[str, tuple[str, str, int]] = {}
     call_signatures: list[str] = []
+    call_batch_signatures: list[tuple[str, ...]] = []
     tool_names: list[str] = []
-    tool_calls: list[dict[str, Any]] = []
 
     for message in messages:
         if not isinstance(message, AIMessage):
             continue
+        batch_index = len(call_batch_signatures)
+        batch_signatures: list[str] = []
         for call in message.tool_calls:
             name = str(call.get("name", ""))
             if name in completion_tool_names:
                 continue
             signature = _canonical_tool_call(call)
             call_signatures.append(signature)
+            batch_signatures.append(signature)
             tool_names.append(name)
-            tool_calls.append(call)
             call_id = str(call.get("id", ""))
             if call_id:
-                calls_by_id[call_id] = (signature, name)
+                calls_by_id[call_id] = (signature, name, batch_index)
+        if batch_signatures:
+            call_batch_signatures.append(tuple(sorted(batch_signatures)))
 
     seen_signatures: set[str] = set()
     seen_outputs: set[str] = set()
     completed_tool_calls = 0
     consecutive_errors = 0
     consecutive_no_progress = 0
+    results_by_batch: dict[int, list[tuple[str, str, bool]]] = {}
+    unmatched_batch_index = len(call_batch_signatures)
     for message in messages:
         if not isinstance(message, ToolMessage):
             continue
@@ -225,32 +303,47 @@ def analyze_agent_history(
             continue
         call = calls_by_id.get(str(message.tool_call_id))
         signature = call[0] if call is not None else ""
+        batch_index = call[2] if call is not None else unmatched_batch_index
         output_digest = hashlib.sha256(
             _message_text(message).encode("utf-8", errors="replace")
         ).hexdigest()
         is_error = _tool_result_is_error(message)
-        novel_action = bool(signature) and signature not in seen_signatures
-        novel_observation = output_digest not in seen_outputs
-        made_progress = not is_error and (novel_action or novel_observation)
-
         completed_tool_calls += 1
-        consecutive_errors = consecutive_errors + 1 if is_error else 0
-        consecutive_no_progress = 0 if made_progress else consecutive_no_progress + 1
-        if signature:
-            seen_signatures.add(signature)
-        seen_outputs.add(output_digest)
+        results_by_batch.setdefault(batch_index, []).append(
+            (signature, output_digest, is_error)
+        )
+
+    for batch_index in sorted(results_by_batch):
+        batch_has_progress = False
+        batch_all_errors = True
+        for signature, output_digest, is_error in results_by_batch[batch_index]:
+            novel_action = bool(signature) and signature not in seen_signatures
+            novel_observation = output_digest not in seen_outputs
+            batch_has_progress |= not is_error and (
+                novel_action or novel_observation
+            )
+            batch_all_errors &= is_error
+            if signature:
+                seen_signatures.add(signature)
+            seen_outputs.add(output_digest)
+        consecutive_errors = (
+            consecutive_errors + 1 if batch_all_errors else 0
+        )
+        consecutive_no_progress = (
+            0 if batch_has_progress else consecutive_no_progress + 1
+        )
 
     reason: str | None = None
     repeated_limit = policy.repeated_call_limit
     if (
-        len(call_signatures) >= repeated_limit
-        and len(set(call_signatures[-repeated_limit:])) == 1
+        len(call_batch_signatures) >= repeated_limit
+        and len(set(call_batch_signatures[-repeated_limit:])) == 1
     ):
         reason = "repeated_tool_call"
 
     alternating_span = 2 * policy.alternating_cycle_repetitions
-    if reason is None and len(call_signatures) >= alternating_span:
-        tail = call_signatures[-alternating_span:]
+    if reason is None and len(call_batch_signatures) >= alternating_span:
+        tail = call_batch_signatures[-alternating_span:]
         if (
             len(set(tail[0::2])) == 1
             and len(set(tail[1::2])) == 1
@@ -260,16 +353,6 @@ def analyze_agent_history(
 
     if reason is None and consecutive_errors >= policy.consecutive_error_limit:
         reason = "consecutive_tool_errors"
-    diagnostic_limit = policy.consecutive_diagnostic_probe_limit
-    if (
-        reason is None
-        and len(tool_calls) >= diagnostic_limit
-        and all(
-            _is_diagnostic_python_probe(call)
-            for call in tool_calls[-diagnostic_limit:]
-        )
-    ):
-        reason = "diagnostic_probe_loop"
     if (
         reason is None
         and consecutive_no_progress >= policy.consecutive_no_progress_limit
@@ -309,6 +392,8 @@ class AgentLoopGuardMiddleware(AgentMiddleware[LoopGuardState, Any, Any]):
         audit: AuditSink | None,
         scope: str,
         finalization_tool_names: frozenset[str] = frozenset(),
+        clock: Callable[[], float] = time.monotonic,
+        activation_deadline: ActivationDeadline | None = None,
     ) -> None:
         super().__init__()
         self.policy = policy
@@ -317,6 +402,8 @@ class AgentLoopGuardMiddleware(AgentMiddleware[LoopGuardState, Any, Any]):
         self.audit = audit
         self.scope = scope
         self.finalization_tool_names = finalization_tool_names
+        self.clock = clock
+        self.activation_deadline = activation_deadline
 
     def _audit(self, event: str, **fields: Any) -> None:
         if self.audit is not None:
@@ -326,17 +413,47 @@ class AgentLoopGuardMiddleware(AgentMiddleware[LoopGuardState, Any, Any]):
         del runtime
         if not self.policy.enabled or state.get("guard_forcing_completion", False):
             return None
+        now = self.clock()
+        shared_elapsed_s = (
+            self.activation_deadline.elapsed_s()
+            if self.activation_deadline is not None
+            else None
+        )
+        activation_started = state.get("guard_activation_started_monotonic")
+        activation_started_now = shared_elapsed_s is None and activation_started is None
+        if activation_started is None:
+            activation_started = now
         snapshot = analyze_agent_history(
             state.get("messages", []),
             self.policy,
             completion_tool_names=self.completion_tool_names,
         )
-        if snapshot.reason is None:
-            return None
-        self._audit("agent_stuck_detected", **snapshot.to_dict())
+        elapsed_s = (
+            shared_elapsed_s
+            if shared_elapsed_s is not None
+            else max(0.0, now - float(activation_started))
+        )
+        reason = snapshot.reason
+        if reason is None and elapsed_s >= self.policy.activation_wall_clock_s:
+            reason = "activation_wall_clock_exhausted"
+        if reason is None:
+            return (
+                {"guard_activation_started_monotonic": now}
+                if activation_started_now
+                else None
+            )
+        self._audit(
+            "agent_stuck_detected",
+            **{
+                **snapshot.to_dict(),
+                "reason": reason,
+                "activation_elapsed_s": elapsed_s,
+                "activation_wall_clock_s": self.policy.activation_wall_clock_s,
+            },
+        )
         return {
             "guard_forcing_completion": True,
-            "guard_reason": snapshot.reason,
+            "guard_reason": reason,
             "guard_trigger_model_calls": snapshot.model_calls,
         }
 
@@ -356,8 +473,8 @@ class AgentLoopGuardMiddleware(AgentMiddleware[LoopGuardState, Any, Any]):
         attempt = max(1, current_calls - trigger_calls + 1)
         patch_applied = any(
             isinstance(message, ToolMessage)
-            and message.name == "apply_patch"
-            and _message_text(message).strip().startswith("Patch applied successfully")
+            and message.name in {"apply_patch", "edit_file", "write_file"}
+            and not _tool_result_is_error(message)
             for message in request.messages
         )
         recovery_stage = "test" if patch_applied else "patch"

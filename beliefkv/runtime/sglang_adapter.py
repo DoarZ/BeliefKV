@@ -262,12 +262,15 @@ class SGLangSourceContract:
                 "handle_generate_request",
                 "get_next_batch_to_run",
                 "get_new_batch_prefill",
+                "_beliefkv_running_retraction_safe_point",
+                "_apply_beliefkv_running_retraction",
                 "_add_admitted_beliefkv_request",
                 "move_ready_grammar_requests",
             ),
         },
         "python/sglang/srt/managers/schedule_batch.py": {
             "Req": ("__init__",),
+            "ScheduleBatch": ("retract_selected",),
         },
         "python/sglang/srt/mem_cache/radix_cache.py": {
             "TreeNode": ("__init__",),
@@ -289,6 +292,8 @@ class SGLangSourceContract:
                 "load_back",
                 "ready_to_load_host_cache",
                 "take_beliefkv_callback_errors",
+                "_beliefkv_transfer_submitted",
+                "_beliefkv_transfer_completed",
                 "check_hicache_events",
             ),
         },
@@ -313,11 +318,15 @@ class SGLangSourceContract:
         "python/sglang/srt/managers/scheduler.py": (
             "beliefkv_runtime.close()",
             "ready_requests = self.grammar_queue[:num_ready_reqs]",
+            "running_batch_retraction_barrier_required",
+            "Commit a plan only after the overlap pipeline has been drained.",
         ),
         "python/sglang/srt/mem_cache/hiradix_cache.py": (
             "force: bool = False",
             "allow_eviction: bool = True",
             "beliefkv_callback_errors",
+            "beliefkv_source: Optional[str] = None",
+            '"on_hicache_transfer_completed"',
         ),
     }
 

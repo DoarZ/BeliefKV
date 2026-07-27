@@ -37,6 +37,11 @@ class CausalFrontierScheduler:
         candidates = self.candidates(workflow_id)
         return candidates[0] if candidates else None
 
+    def describe_invocation(self, invocation_id: str) -> FrontierCandidate:
+        """Classify one observed invocation even while it is running."""
+
+        return self._candidate(self.graph.invocations[invocation_id])
+
     def _candidate(self, invocation: InvocationRecord) -> FrontierCandidate:
         join_straggler = self._is_join_straggler(invocation.invocation_id)
         unblock_depth = self._unblock_depth(invocation)

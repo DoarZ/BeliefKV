@@ -81,9 +81,9 @@ completion schema 能让部分 agent 自然结束，但不能单独保证 parent
 
 ## 5. 产物
 
-- `experiments/raw/deepagents_swebench/20260717T101611Z/planned-1-recursion200-guard-gate/`
-- `experiments/raw/deepagents_swebench/20260717T101611Z/planned-1-recursion200-semantic-only/`
-- `experiments/raw/deepagents_swebench/20260717T101611Z/planned-1-recursion200-guard-v2/`
+- `experiments/archive/20260727/superseded_raw/deepagents_swebench/20260717T101611Z/planned-1-recursion200-guard-gate/`
+- `experiments/archive/20260727/superseded_raw/deepagents_swebench/20260717T101611Z/planned-1-recursion200-semantic-only/`
+- `experiments/archive/20260727/superseded_raw/deepagents_swebench/20260717T101611Z/planned-1-recursion200-guard-v2/`
 
 回归测试：
 

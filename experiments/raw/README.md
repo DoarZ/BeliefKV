@@ -6,8 +6,10 @@ as reproducibility anchors. Superseded and interrupted runs are moved to
 
 ## Retained runs
 
-- `deepagents_swebench/20260716T182104Z/`: latest completed high-pressure
-  Deep Agents/SWE-bench runtime and KV migration validation.
+- `p5_gpu_smoke_8/20260726T165151Z/`: latest bounded GPU correctness smoke;
+  three of four workflows reached semantic completion.
+- `service_calibration/`: reusable online service-rate calibration inputs.
+- `protocol/`: protocol and policy-snapshot integration smoke evidence.
 - `codex-qwen14b-subagent-baseline-c4-r5*`: Codex/Qwen2.5-14B observational
   baseline retained for the r5 versus r16 comparison.
 - `codex-qwen14b-subagent-reactive-c4-r16*`: event-responsive Codex subagent

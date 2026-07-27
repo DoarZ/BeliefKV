@@ -20,6 +20,7 @@ from beliefkv.runtime.protocol import (
     CommandQueueClass,
     ControlCommand,
     PhysicalBundleIntent,
+    PageHandle,
 )
 
 
@@ -62,6 +63,7 @@ class ReactiveTransferPlanner:
         self._last_context_lease_fingerprints: dict[
             tuple[str, int], tuple[object, ...]
         ] = {}
+        self._restore_focus_context_id: str | None = None
 
     def plan_next(
         self,
@@ -76,6 +78,7 @@ class ReactiveTransferPlanner:
         drop_unowned_enabled: bool = True,
         signals: ShadowSignals,
         predictions: dict[str, RemainingTimePrediction] | None = None,
+        preferred_restore_context_ids: tuple[str, ...] = (),
     ) -> ControlCommand | None:
         if reserved_hbm_bytes < 0:
             raise ValueError("reserved_hbm_bytes must be non-negative")
@@ -106,11 +109,45 @@ class ReactiveTransferPlanner:
                 - self.config.reserve_hbm_bytes
                 - reserved_hbm_bytes,
                 predictions,
+                preferred_restore_context_ids=preferred_restore_context_ids,
             )
             if prefetch is not None:
                 return prefetch
         shadow = self.shadow.plan(now_ms, signals, predictions)
         return self._materialize_shadow(shadow, now_ms)
+
+    def plan_terminal_cleanup(
+        self,
+        *,
+        now_ms: float,
+        context_id: str,
+        context_epoch: int,
+        target_handles: tuple[PageHandle, ...],
+    ) -> ControlCommand | None:
+        if not target_handles:
+            return None
+        target_bytes = min(
+            self.config.urgent_chunk_bytes,
+            sum(
+                page.size_bytes
+                for handle in target_handles
+                if (page := self.page_index.pages.get(handle)) is not None
+                and page.cpu_resident
+            ),
+        )
+        if target_bytes <= 0:
+            return None
+        command = self._command(
+            CommandKind.DROP_TERMINAL_PRIVATE,
+            now_ms,
+            context_id=context_id,
+            context_epoch=context_epoch,
+            target_bytes=target_bytes,
+            priority=2.0e9,
+            metadata={"reason": "terminal_private_host_cleanup"},
+            target_handles=target_handles,
+        )
+        return command if self._command_is_eligible(command, now_ms) else None
 
     def _pressure_command(
         self,
@@ -295,11 +332,19 @@ class ReactiveTransferPlanner:
         now_ms: float,
         available_bytes: int,
         predictions: dict[str, RemainingTimePrediction],
+        *,
+        preferred_restore_context_ids: tuple[str, ...] = (),
     ) -> ControlCommand | None:
         if available_bytes <= 0:
             return None
+        preferred_rank = {
+            context_id: rank
+            for rank, context_id in enumerate(preferred_restore_context_ids)
+        }
         candidates: list[tuple[tuple, ControlCommand]] = []
         for context_id, context in self.graph.contexts.items():
+            if preferred_rank and context_id not in preferred_rank:
+                continue
             assessment = self.classifier.context(context_id, now_ms)
             prediction = predictions.get(context_id)
             predicted_imminent = (
@@ -339,15 +384,25 @@ class ReactiveTransferPlanner:
                 if not self._command_is_eligible(command, now_ms):
                     continue
                 rank = (
+                    preferred_rank.get(context_id, len(preferred_rank)),
                     -int(assessment.residency_class == ResidencyClass.IMMINENT),
                     prediction.p50_ms if prediction is not None else 0.0,
-                    bytes_needed,
+                    assessment.since_ms,
+                    -bytes_needed,
                     preview.bundle.bundle_id,
                 )
                 candidates.append((rank, command))
         if not candidates:
+            self._restore_focus_context_id = None
             return None
-        return min(candidates, key=lambda item: item[0])[1]
+        focused = [
+            item
+            for item in candidates
+            if item[1].context_id == self._restore_focus_context_id
+        ]
+        selected = min(focused or candidates, key=lambda item: item[0])[1]
+        self._restore_focus_context_id = selected.context_id
+        return selected
 
     def _command(
         self,
@@ -360,6 +415,7 @@ class ReactiveTransferPlanner:
         priority: float,
         metadata: dict | None = None,
         physical_bundle: PhysicalBundleIntent | None = None,
+        target_handles: tuple[PageHandle, ...] = (),
     ) -> ControlCommand:
         command = ControlCommand(
             command_id=f"reactive-{self._sequence}",
@@ -372,6 +428,7 @@ class ReactiveTransferPlanner:
             queue_class=CommandQueueClass.URGENT,
             metadata=metadata or {},
             physical_bundle=physical_bundle,
+            target_handles=target_handles,
         )
         self._sequence += 1
         return command

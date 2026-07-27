@@ -1,0 +1,135 @@
+digraph P3ActualMixedWorkflow {
+  graph [
+    rankdir=TB,
+    bgcolor="white",
+    pad=0.25,
+    nodesep=0.52,
+    ranksep=0.58,
+    fontname="DejaVu Sans",
+    fontsize=16,
+    labelloc="t",
+    label="Observed P3 workload: 12 concurrent workflow copies, 100 LLM calls"
+  ];
+  node [
+    shape=box,
+    style="rounded,filled",
+    color="#475569",
+    fillcolor="#f8fafc",
+    fontcolor="#172033",
+    fontname="DejaVu Sans",
+    fontsize=11,
+    margin="0.12,0.08"
+  ];
+  edge [
+    color="#64748b",
+    fontcolor="#334155",
+    fontname="DejaVu Sans",
+    fontsize=9,
+    arrowsize=0.72
+  ];
+
+  run [
+    shape=box,
+    style="filled",
+    color="#334155",
+    fillcolor="#e2e8f0",
+    label="RUN ENVELOPE\n12 independent root workflows, concurrency=12, max running=16\nturns/workflow=2..6, calls/workflow=6..10"
+  ];
+
+  subgraph cluster_workflow {
+    label="One observed workflow copy (repeated 12 times)";
+    color="#94a3b8";
+    style="rounded";
+    margin=18;
+
+    start [shape=circle, width=0.28, fixedsize=true, label="", fillcolor="#334155"];
+    coder_initial [
+      color="#2563eb",
+      fillcolor="#dbeafe",
+      label="Persistent Coder, turn 0\ninitial long SWE input\nFRESH context"
+    ];
+    fork [
+      shape=diamond,
+      color="#2563eb",
+      fillcolor="#eff6ff",
+      label="SPAWN x4"
+    ];
+    child1 [label="Leaf 1\nFRESH / background"];
+    child2 [label="Leaf 2\nFRESH / background"];
+    child3 [label="Leaf 3\nFRESH / background"];
+    child4 [label="Leaf 4\nFRESH / background"];
+    join [
+      shape=diamond,
+      color="#0891b2",
+      fillcolor="#cffafe",
+      label="JOIN_ALL\nparent parked"
+    ];
+    reviewer [
+      color="#b45309",
+      fillcolor="#fef3c7",
+      label="Persistent Reviewer\ncreated lazily"
+    ];
+    tester [
+      color="#b45309",
+      fillcolor="#fef3c7",
+      label="Persistent Tester\ncreated lazily"
+    ];
+    coder_peer [
+      color="#b45309",
+      fillcolor="#fef3c7",
+      label="Coder on later turn\nsame persistent context\nREACTIVATE when revisited"
+    ];
+    done [
+      shape=doublecircle,
+      width=0.42,
+      fixedsize=true,
+      color="#15803d",
+      fillcolor="#dcfce7",
+      label="END"
+    ];
+    peer_counts [
+      shape=note,
+      color="#b45309",
+      fillcolor="#fff7ed",
+      label="Later peer HANDOFFS\nC -> R: 6, C -> T: 1\nR -> T: 12, R -> C: 3\nT -> C: 5, T -> R: 1\nREACTIVATE: 17"
+    ];
+
+    start -> coder_initial [label="turn 0"];
+    coder_initial -> fork [color="#2563eb", fontcolor="#1d4ed8", label="model-selected fanout\n(observed: always 4)"];
+    {rank=same; child1; child2; child3; child4;}
+    fork -> child1 [color="#2563eb"];
+    fork -> child2 [color="#2563eb"];
+    fork -> child3 [color="#2563eb"];
+    fork -> child4 [color="#2563eb"];
+    child1 -> join [style=dashed, color="#0891b2", label="RETURN"];
+    child2 -> join [style=dashed, color="#0891b2"];
+    child3 -> join [style=dashed, color="#0891b2"];
+    child4 -> join [style=dashed, color="#0891b2"];
+
+    join -> reviewer [color="#b45309", fontcolor="#92400e", penwidth=1.8, label="first HANDOFF\n11/12 workflows"];
+    join -> tester [color="#b45309", fontcolor="#92400e", label="first HANDOFF\n1/12 workflows"];
+
+    {rank=same; coder_peer; reviewer; tester;}
+    coder_peer -> reviewer [constraint=false, color="#b45309"];
+    coder_peer -> tester [constraint=false, color="#b45309"];
+    reviewer -> tester [constraint=false, color="#b45309", penwidth=1.8];
+    reviewer -> coder_peer [constraint=false, color="#b45309"];
+    tester -> coder_peer [constraint=false, color="#b45309"];
+    tester -> reviewer [constraint=false, color="#b45309"];
+
+    coder_peer -> done [color="#15803d", style=dotted];
+    reviewer -> done [color="#15803d", style=dotted];
+    tester -> done [color="#15803d", style=dotted];
+    tester -> peer_counts [style=dotted, arrowhead=none, color="#d97706", constraint=false];
+  }
+
+  run -> start [style=dashed, color="#64748b", label="same runtime template"];
+
+  leaf_note [
+    shape=note,
+    color="#64748b",
+    fillcolor="#f1f5f9",
+    label="Leaf agents do not inherit parent KV.\n48 leaf calls added only 1,836\nuncached prompt tokens in total."
+  ];
+  child4 -> leaf_note [style=dotted, arrowhead=none, color="#94a3b8", constraint=false];
+}

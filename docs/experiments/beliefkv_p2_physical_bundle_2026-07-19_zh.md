@@ -1,7 +1,7 @@
 # BeliefKV P2：Physical Causal Lease 与原子 Bundle 执行
 
-日期：2026-07-19，2026-07-20 更新  
-状态：P2 可靠性修复与 CPU 故障注入 gate 已通过；真实 HiCache 高压复验因 GPU 被占用而待执行
+日期：2026-07-19，2026-07-21 更新
+状态：P2 CPU 与真实 GPU 可靠性 gate 已通过；同 manifest 配对性能 gate 待完成
 
 ## 1. 本阶段解决的问题
 
@@ -429,6 +429,93 @@ manifest 重跑。
 - 高压遥测校验：
   [`high_pressure_transfer_validation.json`](../../experiments/processed/p2_20260719T114541Z/high_pressure_transfer_validation.json)
 - 原始汇总：
-  [`summary.json`](../../experiments/raw/deepagents_swebench/20260719T114541Z/planned-8-p2-bundle-scope-pressure/summary.json)
+  [`summary.json`](../../experiments/archive/20260727/superseded_raw/deepagents_swebench/20260719T114541Z/planned-8-p2-bundle-scope-pressure/summary.json)
 
 实验退出后已确认两张 GPU 均为 0 MiB used，没有遗留 SGLang 或 workload 进程。
+
+## 9. 2026-07-21 可靠性修复版真实复验
+
+### 9.1 配置与 workload 边界
+
+复验固定旧 P2 run 的前 8 个 SymPy 实例和运行参数：
+
+- Qwen3-Coder-30B-A3B-Instruct-FP8，SGLang `0.5.2rc1`，TP=1；
+- GPU 0 为 RTX 6000 Ada，GPU 1 全程 0 MiB，`mem_fraction_static=0.952`；
+- KV pool 为 163,840 tokens / 15 GiB，HiCache ratio 2、write-back；
+- planned mode，并发 8，每个 workflow 创建 2 个 FRESH child；
+- prediction/shadow 关闭，reactive prefetch 开启；
+- 运行 3027.15 s，16 个 child、848 个 LLM request、673 个 tool call。
+
+8/8 workflow 都产生 `workflow_end`，control delivery failure 为 0，没有 recursion-limit 或
+runtime exception。其中 3/8 通过本地任务 correctness gate；其余 5 个以 `blocked` 或
+`no_patch_needed` 返回。实验脚本因此按任务正确性返回非零退出码，但这不是 SGLang、控制 socket
+或 KV 数据面失败。性能主表只能使用 3 个 measurement-valid workflow，P2 可靠性检查则使用
+全部系统终态和物理审计。
+
+### 9.2 修复闭环结果
+
+| 检查项 | 修复版结果 |
+|---|---:|
+| request started/finished | 848 / 848 |
+| transfer dispatch/ACK | 1502 / 1502 |
+| missing/orphan/order/byte violation | 0 / 0 / 0 / 0 |
+| watchdog / scheduler exception | 0 / 0 |
+| identical failed/zero-byte retry | 0 / 0 |
+| unknown blocker / active blocked attempt | 0 / 0 |
+| dispatch without matching preview | 0 |
+| HBM mirror exceeds allocator | 0 / 38,594 snapshots |
+| Host page-index mismatch | 0 / 38,594 snapshots |
+| offload planned/actual reclaim | 52,851,376,128 / 52,851,376,128 bytes |
+| reclaim realization | 100% |
+
+物理 DMA 包含 184 次 D2H、16,011,264,000 bytes，以及 520 次 H2D、17,784,274,944
+bytes。另有 87 次 H2D 在 DMA 前安全拒绝：79 次因为同 context 已成为 engine-visible，8 次
+因为 Radix extent generation 已变化。旧 run 的 281 次小 closure `device_capacity` reject 降为
+0；79 个 event-gated blocker 全部在匹配事件后释放，只产生 6 次 suppression，没有 retry
+without release。
+
+23 个 command-level partial 全部来自原生 `DROP_UNOWNED` 遇到非 leaf 的
+`descendant_closure`；bundle D2H 没有 partial/reject，What-if/JointPlan 后续不能把这部分原生
+drop partial 误记为 context bundle 失败。峰值 HBM mirror 为 16,096,690,176 bytes，Host KV
+为 4,924,145,664 bytes；SGLang resident-token pressure 峰值为 92.10%。
+
+### 9.3 尚未通过的性能与测量门槛
+
+- admission wait p50 为 41.22 ms，p95 为 61.46 s，p99 为 208.26 s；没有同代码、同语义路径
+  的 P1.5 配对 run，不能据此声称 JCT 或 admission 性能改善；
+- chronological service-curve holdout 的总体低估率为 13.48%，D2H 为 23.53%，高于 10%
+  目标；这说明当前 P90/P10 curve 对长跑 D2H 尾部仍不够保守；
+- `controller_timing_summary` 没有在 SIGINT shutdown 路径写出，无法由本 run 证明 controller
+  p99 开销低于 scheduler tick 的 5%；
+- 79 次 engine-visible H2D reject 和 8 次 extent mutation 虽然正确 fail closed，但仍是
+  preview-to-submit TOCTOU 开销，后续 JointPlan 应避免先产生注定失效的 prefetch intent。
+
+因此本轮只将 **P2 真实可靠性 gate** 标记为通过。P1.5/P2 配对性能 gate、service-curve
+保守性和 controller timing 仍是进入主动 P4 前的待办。
+
+### 9.4 产物
+
+- [修复版 summary](../../experiments/archive/20260727/superseded_raw/deepagents_swebench/20260721T054654Z/planned-8-p2-reliability-fixed/summary.json)
+- [transfer validator](../../experiments/processed/p2_20260721T054654Z/transfer_validation.json)
+- [HBM/Host KV 迁移时间线](../../experiments/processed/p2_20260721T054654Z/kv_transfer_timeline.html)
+- [时间线结构化数据](../../experiments/processed/p2_20260721T054654Z/kv_transfer_timeline.json)
+
+复验结束后已正常停止 SGLang，删除所有临时 SWE-bench 容器，并确认两张 GPU 均为 0 MiB。
+
+## 10. 2026-07-21 P3 审计后的适用范围修订
+
+后续 12-workflow mixed run 发现，SGLang 正常 request admission 会对 host-hit prefix 调用
+`HiRadixCache.init_load_back()`。这类 native demand-load 不经过 BeliefKV command queue，当前
+`transfer_telemetry.jsonl` 不记录其 start/complete/bytes。
+
+因此第 9 节的可靠性结论应严格解释为：
+
+- BeliefKV 显式 command 的 bundle、ACK、retry、allocator 和 telemetry 不变量通过；
+- 不能由该 validator 推导所有 SGLang HiCache DMA 都被记录；
+- 当前 H2D 总量、PCIe utilization 和迁移 timeline 是显式 command 下界；
+- P2 bundle correctness 结论不撤销，但 P1/P2 的全系统 transfer callback coverage 重新打开。
+
+修复要求是在 HiCache `write/load` enqueue 与 ACK drain 处记录 native operation，并与
+BeliefKV command 按 node/operation identity 去重。补齐前不得用现有 timeline 计算完整 PCIe
+占用或将未记录 demand-load 当成 recompute。证据见
+[P3 动态并发 GPU Characterization](beliefkv_p3_dynamic_gpu_validation_2026-07-21_zh.md)。

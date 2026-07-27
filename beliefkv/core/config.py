@@ -8,7 +8,7 @@ from typing import Any, Mapping
 @dataclass(frozen=True)
 class BeliefKVConfig:
     hbm_capacity_bytes: int = 24 * (1 << 30)
-    host_capacity_bytes: int = 64 * (1 << 30)
+    host_capacity_bytes: int = 96_000_000_000
     reserve_hbm_bytes: int = 1 << 30
     pcie_bandwidth_gbps: float = 24.0
     transfer_overhead_ms: float = 0.08
@@ -34,11 +34,47 @@ class BeliefKVConfig:
     resource_telemetry_interval_ms: float = 50.0
     service_curve_window: int = 256
     service_curve_min_samples: int = 8
+    queue_service_observer_enabled: bool = False
+    queue_service_observer_include_runtime_batches: bool = False
+    queue_service_observer_max_samples: int = 65_536
+    request_token_trace_enabled: bool = False
+    request_token_trace_path: str | None = None
     transfer_retry_guard_enabled: bool = True
     transfer_retry_max_same_snapshot_attempts: int = 1
     transfer_retry_unknown_base_ms: float = 10.0
     transfer_retry_unknown_max_ms: float = 1000.0
     transfer_retry_unknown_circuit_breaker_failures: int = 8
+    reference_policy_shadow_enabled: bool = True
+    reference_policy_snapshot_path: str | None = None
+    reference_policy_snapshot_min_interval_ms: float = 1000.0
+    reference_policy_snapshot_persist_interval_ms: float = 10_000.0
+    reference_policy_snapshot_max_pending: int = 8
+    reference_policy_hbm_bucket_bytes: int = 64 * 1024 * 1024
+    reference_policy_trace_sensitivity: str = "timing_sensitive"
+    joint_policy_enabled: bool = False
+    joint_policy_shadow_mode: bool = True
+    joint_observed_mode_enabled: bool = True
+    observed_admission_scheduling_enabled: bool = False
+    observed_admission_active_kv_high_watermark_ratio: float = 0.8
+    observed_admission_min_active_requests: int = 1
+    running_batch_retraction_enabled: bool = False
+    running_batch_retraction_min_stall_ms: float = 100.0
+    running_batch_retraction_min_reclaim_bytes: int = 64 * 1024 * 1024
+    running_batch_retraction_cooldown_ms: float = 1000.0
+    running_batch_retraction_decision_interval_ms: float = 50.0
+    running_batch_retraction_max_per_request: int = 3
+    running_batch_retraction_transaction_timeout_ms: float = 5000.0
+    running_batch_retraction_allow_recompute_drop: bool = False
+    fairness_lag_budget_ms: float = 50.0
+    residency_hysteresis_ms: float = 100.0
+    max_joint_workflow_candidates: int = 8
+    max_frontier_candidates_per_workflow: int = 4
+    max_total_frontier_candidates: int = 16
+    max_joint_package_evaluations: int = 8
+    max_joint_plan_budget_ms: float = 1.0
+    max_joint_plan_age_ms: float = 750.0
+    joint_transition_settling_timeout_ms: float = 250.0
+    joint_shadow_detailed_audit_interval_ms: float = 1000.0
 
     def __post_init__(self) -> None:
         if self.hbm_capacity_bytes <= 0 or self.host_capacity_bytes <= 0:
@@ -101,6 +137,12 @@ class BeliefKVConfig:
             raise ValueError(
                 "service_curve_min_samples must be within the service curve window"
             )
+        if self.queue_service_observer_max_samples <= 0:
+            raise ValueError("queue_service_observer_max_samples must be positive")
+        if self.request_token_trace_path is not None and not isinstance(
+            self.request_token_trace_path, str
+        ):
+            raise ValueError("request_token_trace_path must be a string or null")
         if self.transfer_retry_max_same_snapshot_attempts <= 0:
             raise ValueError(
                 "transfer_retry_max_same_snapshot_attempts must be positive"
@@ -122,6 +164,92 @@ class BeliefKVConfig:
             raise ValueError(
                 "transfer_retry_unknown_circuit_breaker_failures must be positive"
             )
+        if (
+            not math.isfinite(self.reference_policy_snapshot_min_interval_ms)
+            or self.reference_policy_snapshot_min_interval_ms < 0
+        ):
+            raise ValueError(
+                "reference_policy_snapshot_min_interval_ms must be non-negative"
+            )
+        if (
+            not math.isfinite(self.reference_policy_snapshot_persist_interval_ms)
+            or self.reference_policy_snapshot_persist_interval_ms < 0
+        ):
+            raise ValueError(
+                "reference_policy_snapshot_persist_interval_ms must be non-negative"
+            )
+        if self.reference_policy_snapshot_max_pending <= 0:
+            raise ValueError("reference_policy_snapshot_max_pending must be positive")
+        if self.reference_policy_hbm_bucket_bytes <= 0:
+            raise ValueError("reference_policy_hbm_bucket_bytes must be positive")
+        if self.reference_policy_trace_sensitivity not in {
+            "schedule_invariant",
+            "timing_sensitive",
+            "semantic_race_sensitive",
+        }:
+            raise ValueError("unsupported reference policy trace sensitivity")
+        active_kv_high_watermark = float(
+            self.observed_admission_active_kv_high_watermark_ratio
+        )
+        if (
+            not math.isfinite(active_kv_high_watermark)
+            or not 0 < active_kv_high_watermark <= 1
+        ):
+            raise ValueError(
+                "observed_admission_active_kv_high_watermark_ratio must be "
+                "in (0, 1]"
+            )
+        if self.observed_admission_min_active_requests < 0:
+            raise ValueError(
+                "observed_admission_min_active_requests must be non-negative"
+            )
+        if (
+            self.running_batch_retraction_enabled
+            and not self.observed_admission_scheduling_enabled
+        ):
+            raise ValueError(
+                "running batch retraction requires observed admission scheduling"
+            )
+        for field_name in (
+            "running_batch_retraction_min_stall_ms",
+            "running_batch_retraction_cooldown_ms",
+            "running_batch_retraction_decision_interval_ms",
+            "running_batch_retraction_transaction_timeout_ms",
+        ):
+            value = float(getattr(self, field_name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{field_name} must be finite and non-negative")
+        if self.running_batch_retraction_decision_interval_ms == 0:
+            raise ValueError("retraction decision interval must be positive")
+        if self.running_batch_retraction_min_stall_ms == 0:
+            raise ValueError("minimum retraction stall must be positive")
+        if self.running_batch_retraction_transaction_timeout_ms == 0:
+            raise ValueError("retraction transaction timeout must be positive")
+        if self.running_batch_retraction_min_reclaim_bytes <= 0:
+            raise ValueError("minimum retraction reclaim bytes must be positive")
+        if self.running_batch_retraction_max_per_request <= 0:
+            raise ValueError("maximum retractions per request must be positive")
+        for field_name in (
+            "fairness_lag_budget_ms",
+            "residency_hysteresis_ms",
+            "max_joint_plan_budget_ms",
+            "max_joint_plan_age_ms",
+            "joint_transition_settling_timeout_ms",
+            "joint_shadow_detailed_audit_interval_ms",
+        ):
+            value = float(getattr(self, field_name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{field_name} must be finite and non-negative")
+        if self.max_joint_plan_budget_ms == 0 or self.max_joint_plan_age_ms == 0:
+            raise ValueError("joint plan budget and age must be positive")
+        for field_name in (
+            "max_joint_workflow_candidates",
+            "max_frontier_candidates_per_workflow",
+            "max_total_frontier_candidates",
+            "max_joint_package_evaluations",
+        ):
+            if int(getattr(self, field_name)) <= 0:
+                raise ValueError(f"{field_name} must be positive")
         if self.predictor_model_path is not None and not isinstance(
             self.predictor_model_path, str
         ):
@@ -142,6 +270,12 @@ class BeliefKVConfig:
             self.runtime_event_log_path, str
         ):
             raise ValueError("runtime_event_log_path must be a string or null")
+        if self.reference_policy_snapshot_path is not None and not isinstance(
+            self.reference_policy_snapshot_path, str
+        ):
+            raise ValueError(
+                "reference_policy_snapshot_path must be a string or null"
+            )
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "BeliefKVConfig":

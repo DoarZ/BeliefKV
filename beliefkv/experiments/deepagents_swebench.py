@@ -949,9 +949,6 @@ def _planned_child_loop_guard_policy(
     return replace(
         policy,
         repeated_call_limit=min(policy.repeated_call_limit, 3),
-        consecutive_diagnostic_probe_limit=min(
-            policy.consecutive_diagnostic_probe_limit, 4
-        ),
         max_model_calls_without_completion=min(
             policy.max_model_calls_without_completion, 12
         ),
@@ -1595,7 +1592,7 @@ def _trace_summary(path: Path) -> dict[str, Any]:
     }
 
 
-def _agent_control_summary(path: Path) -> dict[str, Any]:
+def summarize_agent_control(path: Path) -> dict[str, Any]:
     records = [
         json.loads(line)
         for line in path.read_text(encoding="utf-8").splitlines()
@@ -1761,7 +1758,7 @@ def _run_workflow(
         "correctness_gate": correctness_gate,
         "measurement_valid": bool(correctness_gate.get("passed"))
         and not bool(control_delivery.get("degraded")),
-        "agent_control": _agent_control_summary(sandbox_audit_path),
+        "agent_control": summarize_agent_control(sandbox_audit_path),
         "runtime_control_delivery": control_delivery,
         "trace": _trace_summary(trace_path),
     }

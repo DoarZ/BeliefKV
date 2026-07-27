@@ -33,6 +33,15 @@ class TimelineResourcePoint:
     host_used_bytes: int | None
     host_capacity_bytes: int | None
     source: str
+    untracked_allocator_delta_bytes: int | None = None
+    engine_locked_gpu_bytes: int | None = None
+    engine_lock_ref_gpu_bytes: int | None = None
+    engine_lock_full_attribution_coverage: float | None = None
+    locked_but_not_served_gpu_bytes_100ms: int | None = None
+    locked_but_not_served_gpu_bytes_500ms: int | None = None
+    closure_blocked_gpu_bytes: int | None = None
+    migratable_gpu_bytes: int | None = None
+    dual_resident_gpu_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +134,22 @@ def render_transfer_timeline(
     return output_path, data_path
 
 
+def summarize_transfer_timeline(
+    transfers: Iterable[TimelineTransfer],
+    resources: Iterable[TimelineResourcePoint],
+    *,
+    start_ts_ms: float,
+    end_ts_ms: float,
+) -> dict[str, Any]:
+    """Build the renderer's complete summary for synthetic or replay timelines."""
+    return _summarize(
+        list(transfers),
+        list(resources),
+        start_ts_ms,
+        end_ts_ms,
+    )
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with path.resolve().open("r", encoding="utf-8") as stream:
@@ -181,7 +206,9 @@ def _extract_telemetry(records: Iterable[dict[str, Any]]) -> list[TimelineTransf
                 ),
                 command_kind=str(record.get("command_kind", "")),
                 reason=str(record.get("reason", "")),
-                measurement="backend_telemetry",
+                measurement=str(
+                    record.get("telemetry_origin", "backend_telemetry")
+                ),
             )
         )
     return result
@@ -236,18 +263,53 @@ def _extract_legacy_transfers(
 def _extract_resources(
     records: Iterable[dict[str, Any]],
 ) -> list[TimelineResourcePoint]:
-    return [
-        TimelineResourcePoint(
-            ts_ms=float(record["ts_ms"]),
-            hbm_used_bytes=_optional_int(record.get("hbm_used_bytes")),
-            hbm_capacity_bytes=_optional_int(record.get("hbm_capacity_bytes")),
-            host_used_bytes=_optional_int(record.get("host_used_bytes")),
-            host_capacity_bytes=_optional_int(record.get("host_capacity_bytes")),
-            source="runtime_resource_snapshot",
+    result: list[TimelineResourcePoint] = []
+    for record in records:
+        if record.get("event") != "resource_snapshot":
+            continue
+        hbm_used = _optional_int(record.get("hbm_used_bytes"))
+        indexed_gpu = _optional_int(record.get("page_index_gpu_bytes"))
+        untracked_delta = _optional_int(
+            record.get("untracked_allocator_delta_bytes")
         )
-        for record in records
-        if record.get("event") == "resource_snapshot"
-    ]
+        if untracked_delta is None and hbm_used is not None and indexed_gpu is not None:
+            untracked_delta = max(0, hbm_used - indexed_gpu)
+        result.append(
+            TimelineResourcePoint(
+                ts_ms=float(record["ts_ms"]),
+                hbm_used_bytes=hbm_used,
+                hbm_capacity_bytes=_optional_int(record.get("hbm_capacity_bytes")),
+                host_used_bytes=_optional_int(record.get("host_used_bytes")),
+                host_capacity_bytes=_optional_int(record.get("host_capacity_bytes")),
+                source="runtime_resource_snapshot",
+                untracked_allocator_delta_bytes=untracked_delta,
+                engine_locked_gpu_bytes=_optional_int(
+                    record.get("engine_locked_gpu_bytes")
+                ),
+                engine_lock_ref_gpu_bytes=_optional_int(
+                    record.get("engine_lock_ref_gpu_bytes")
+                ),
+                engine_lock_full_attribution_coverage=_optional_float(
+                    record.get("engine_lock_full_attribution_coverage")
+                ),
+                locked_but_not_served_gpu_bytes_100ms=_optional_int(
+                    record.get("locked_but_not_served_gpu_bytes_100ms")
+                ),
+                locked_but_not_served_gpu_bytes_500ms=_optional_int(
+                    record.get("locked_but_not_served_gpu_bytes_500ms")
+                ),
+                closure_blocked_gpu_bytes=_optional_int(
+                    record.get("closure_blocked_gpu_bytes")
+                ),
+                migratable_gpu_bytes=_optional_int(
+                    record.get("migratable_gpu_bytes")
+                ),
+                dual_resident_gpu_bytes=_optional_int(
+                    record.get("dual_resident_gpu_bytes")
+                ),
+            )
+        )
+    return result
 
 
 def _extract_sglang_metrics(
@@ -311,18 +373,29 @@ def _summarize(
             )
         else:
             entry["no_dma_count"] += 1
-    hbm_values = [
+    runtime_hbm_values = [
         item.hbm_used_bytes
         for item in resources
         if item.source == "runtime_resource_snapshot"
         and item.hbm_used_bytes is not None
     ]
-    protected_kv_values = [
-        item.hbm_used_bytes
-        for item in resources
-        if item.source == "sglang_metrics_derived_hbm"
-        and item.hbm_used_bytes is not None
+    all_hbm_values = [
+        item.hbm_used_bytes for item in resources if item.hbm_used_bytes is not None
     ]
+    diagnostic_fields = {
+        "untracked_allocator_delta": "untracked_allocator_delta_bytes",
+        "engine_locked_gpu": "engine_locked_gpu_bytes",
+        "engine_lock_ref_gpu": "engine_lock_ref_gpu_bytes",
+        "locked_but_not_served_gpu_100ms": (
+            "locked_but_not_served_gpu_bytes_100ms"
+        ),
+        "locked_but_not_served_gpu_500ms": (
+            "locked_but_not_served_gpu_bytes_500ms"
+        ),
+        "closure_blocked_gpu": "closure_blocked_gpu_bytes",
+        "migratable_gpu": "migratable_gpu_bytes",
+        "dual_resident_gpu": "dual_resident_gpu_bytes",
+    }
     host_values = [
         item.host_used_bytes for item in resources if item.host_used_bytes is not None
     ]
@@ -330,6 +403,25 @@ def _summarize(
     resource_sources = sorted({resource.source for resource in resources})
     physical_transfers = [item for item in transfers if _is_physical_transfer(item)]
     no_dma_records = [item for item in transfers if not _is_physical_transfer(item)]
+    lock_service_samples = [
+        item for item in resources if item.engine_lock_ref_gpu_bytes is not None
+    ]
+    full_attribution_coverage = [
+        item.engine_lock_full_attribution_coverage
+        for item in lock_service_samples
+        if item.engine_lock_full_attribution_coverage is not None
+    ]
+
+    def stale_ratios(field_name: str) -> list[float]:
+        return [
+            float(stale_bytes) / item.engine_lock_ref_gpu_bytes
+            for item in lock_service_samples
+            if item.engine_lock_ref_gpu_bytes
+            and (stale_bytes := getattr(item, field_name)) is not None
+        ]
+
+    stale_ratio_100ms = stale_ratios("locked_but_not_served_gpu_bytes_100ms")
+    stale_ratio_500ms = stale_ratios("locked_but_not_served_gpu_bytes_500ms")
     return {
         "duration_ms": max(0.0, end_ts_ms - start_ts_ms),
         # transfer_count remains as a compatibility alias, but now has the only
@@ -342,15 +434,46 @@ def _summarize(
             item.status != "completed" for item in no_dma_records
         ),
         "resource_sample_count": len(resources),
+        "lock_service_sample_count": len(lock_service_samples),
         "directions": by_direction,
         "callback_duration_p50_ms": percentile(physical_durations, 50),
         "callback_duration_p90_ms": percentile(physical_durations, 90),
         "partial_or_failed_count": sum(
             transfer.status != "completed" for transfer in physical_transfers
         ),
-        "peak_hbm_used_bytes": max(hbm_values, default=None),
-        "peak_protected_kv_bytes": max(protected_kv_values, default=None),
+        "peak_hbm_used_bytes": max(
+            runtime_hbm_values or all_hbm_values, default=None
+        ),
+        **{
+            f"peak_{name}_bytes": max(
+                (
+                    value
+                    for item in resources
+                    if (value := getattr(item, field_name)) is not None
+                ),
+                default=None,
+            )
+            for name, field_name in diagnostic_fields.items()
+        },
         "peak_host_used_bytes": max(host_values, default=None),
+        "engine_lock_full_attribution_coverage_p50": percentile(
+            full_attribution_coverage, 50
+        ),
+        "engine_lock_full_attribution_coverage_p90": percentile(
+            full_attribution_coverage, 90
+        ),
+        "locked_but_not_served_lower_bound_ratio_100ms_p50": percentile(
+            stale_ratio_100ms, 50
+        ),
+        "locked_but_not_served_lower_bound_ratio_100ms_p90": percentile(
+            stale_ratio_100ms, 90
+        ),
+        "locked_but_not_served_lower_bound_ratio_500ms_p50": percentile(
+            stale_ratio_500ms, 50
+        ),
+        "locked_but_not_served_lower_bound_ratio_500ms_p90": percentile(
+            stale_ratio_500ms, 90
+        ),
         "host_telemetry_available": bool(host_values),
         "measurement_modes": measurement_modes,
         "resource_sources": resource_sources,
@@ -372,7 +495,9 @@ def _render_html(timeline: TransferTimeline, *, title: str) -> str:
         if summary["host_telemetry_available"]
         else "unavailable in source trace"
     )
-    protected_state = _format_bytes(summary["peak_protected_kv_bytes"])
+    untracked_state = _format_bytes(
+        summary["peak_untracked_allocator_delta_bytes"]
+    )
     measurement_modes = summary["measurement_modes"]
     legacy_measurement = "legacy_dispatch_ack_aggregate" in measurement_modes
     measurement_note = (
@@ -389,10 +514,28 @@ def _render_html(timeline: TransferTimeline, *, title: str) -> str:
         resource_notes.append(
             "Allocator HBM/Host occupancy: runtime_resource_snapshot"
         )
+        if any(
+            item.untracked_allocator_delta_bytes is not None
+            for item in timeline.resources
+            if item.source == "runtime_resource_snapshot"
+        ):
+            resource_notes.append(
+                "untracked allocator delta: max(allocator HBM - indexed GPU KV, 0); "
+                "this is not classified as protected KV"
+            )
+        if any(
+            item.locked_but_not_served_gpu_bytes_100ms is not None
+            for item in timeline.resources
+        ):
+            resource_notes.append(
+                "locked-but-not-served uses completed GPU batches as service "
+                "evidence and exact running-request Radix lock paths; values are "
+                "a conservative physical-byte lower bound"
+            )
     if "sglang_metrics_derived_hbm" in resource_sources:
         resource_notes.append(
-            "protected/non-evictable KV: SGLang num_used_tokens; sampled metrics "
-            "can miss short-lived changes"
+            "sampled HBM occupancy: SGLang num_used_tokens; sampled metrics can "
+            "miss short-lived changes"
         )
     resource_note = "; ".join(resource_notes) or "No occupancy source"
     legend_items = []
@@ -400,9 +543,34 @@ def _render_html(timeline: TransferTimeline, *, title: str) -> str:
         legend_items.append(
             '<span class="key" style="--key:var(--hbm)">Allocator HBM occupancy</span>'
         )
-    if "sglang_metrics_derived_hbm" in resource_sources:
+    diagnostic_legends = (
+        (
+            "untracked_allocator_delta_bytes",
+            "untracked",
+            "Untracked allocator delta",
+        ),
+        ("engine_locked_gpu_bytes", "locked", "Engine-locked KV"),
+        (
+            "locked_but_not_served_gpu_bytes_100ms",
+            "stale100",
+            "Locked, no completed service >100 ms",
+        ),
+        (
+            "locked_but_not_served_gpu_bytes_500ms",
+            "stale500",
+            "Locked, no completed service >500 ms",
+        ),
+        ("closure_blocked_gpu_bytes", "closure", "Closure-blocked KV"),
+        ("migratable_gpu_bytes", "migratable", "Migratable KV"),
+        ("dual_resident_gpu_bytes", "dual", "Dual-resident KV"),
+    )
+    for field_name, color_name, label in diagnostic_legends:
+        if not any(
+            getattr(item, field_name) is not None for item in timeline.resources
+        ):
+            continue
         legend_items.append(
-            '<span class="key key-dashed" style="--key:var(--protected)">Protected/non-evictable KV</span>'
+            f'<span class="key key-dashed" style="--key:var(--{color_name})">{label}</span>'
         )
     if summary["host_telemetry_available"]:
         legend_items.append(
@@ -423,7 +591,7 @@ def _render_html(timeline: TransferTimeline, *, title: str) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{escape(title)}</title>
 <style>
-:root {{ color-scheme: light; --ink:#18212a; --muted:#66717d; --line:#d8dee5; --panel:#f6f8fa; --hbm:#147d73; --protected:#7656a3; --host:#3968a8; --d2h:#16877d; --h2d:#c97718; --bad:#a23d45; }}
+:root {{ color-scheme: light; --ink:#18212a; --muted:#66717d; --line:#d8dee5; --panel:#f6f8fa; --hbm:#147d73; --untracked:#7656a3; --locked:#a23d45; --stale100:#d15f4b; --stale500:#6f1d2a; --closure:#c97718; --migratable:#2d6f3e; --dual:#3968a8; --host:#59636e; --d2h:#16877d; --h2d:#c97718; --bad:#a23d45; }}
 * {{ box-sizing:border-box; }}
 body {{ margin:0; color:var(--ink); background:#fff; font:14px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; letter-spacing:0; }}
 header {{ padding:24px 28px 18px; border-bottom:1px solid var(--line); }}
@@ -460,7 +628,7 @@ td.context {{ max-width:320px; overflow:hidden; text-overflow:ellipsis; }}
 <div class="stat"><div class="label">Telemetry records</div><div class="value">{summary['telemetry_record_count']}</div></div>
 <div class="stat"><div class="label">No-DMA rejects</div><div class="value">{summary['no_dma_rejected_count']}</div></div>
 <div class="stat"><div class="label">Peak allocator HBM</div><div class="value">{_format_bytes(summary['peak_hbm_used_bytes'])}</div></div>
-<div class="stat"><div class="label">Peak protected KV</div><div class="value">{protected_state}</div></div>
+<div class="stat"><div class="label">Peak untracked delta</div><div class="value">{untracked_state}</div></div>
 <div class="stat"><div class="label">Peak Host KV</div><div class="value">{host_state}</div></div>
 <div class="stat"><div class="label">P90 callback</div><div class="value">{summary['callback_duration_p90_ms']:.2f} ms</div></div>
 </section>
@@ -533,18 +701,19 @@ def _render_svg(timeline: TransferTimeline) -> str:
     parts.append(
         f'<text x="{left}" y="24" fill="#18212a" font-size="13" font-weight="600">KV tier occupancy (% of each tier capacity)</text>'
     )
-    hbm_points = [
+    runtime_hbm_points = [
         (point.ts_ms, point.hbm_used_bytes)
         for point in timeline.resources
         if point.source == "runtime_resource_snapshot"
         and point.hbm_used_bytes is not None
     ]
-    protected_kv_points = [
+    sampled_hbm_points = [
         (point.ts_ms, point.hbm_used_bytes)
         for point in timeline.resources
         if point.source == "sglang_metrics_derived_hbm"
         and point.hbm_used_bytes is not None
     ]
+    hbm_points = runtime_hbm_points or sampled_hbm_points
     host_points = [
         (point.ts_ms, point.host_used_bytes)
         for point in timeline.resources
@@ -554,10 +723,45 @@ def _render_svg(timeline: TransferTimeline) -> str:
         parts.append(
             f'<path class="allocator-hbm-series" d="{_step_path(hbm_points, x, lambda value: y(value, hbm_capacity))}" fill="none" stroke="#147d73" stroke-width="2.5"/>'
         )
-    if protected_kv_points:
-        parts.append(
-            f'<path class="protected-kv-series" d="{_step_path(protected_kv_points, x, lambda value: y(value, hbm_capacity))}" fill="none" stroke="#7656a3" stroke-width="2" stroke-dasharray="7 5"/>'
-        )
+    diagnostic_series = (
+        (
+            "untracked-allocator-series",
+            "untracked_allocator_delta_bytes",
+            "#7656a3",
+            "7 5",
+        ),
+        ("engine-locked-series", "engine_locked_gpu_bytes", "#a23d45", "3 4"),
+        (
+            "locked-not-served-100ms-series",
+            "locked_but_not_served_gpu_bytes_100ms",
+            "#d15f4b",
+            "5 3",
+        ),
+        (
+            "locked-not-served-500ms-series",
+            "locked_but_not_served_gpu_bytes_500ms",
+            "#6f1d2a",
+            "10 3",
+        ),
+        (
+            "closure-blocked-series",
+            "closure_blocked_gpu_bytes",
+            "#c97718",
+            "8 4",
+        ),
+        ("migratable-series", "migratable_gpu_bytes", "#2d6f3e", "12 4"),
+        ("dual-resident-series", "dual_resident_gpu_bytes", "#3968a8", "2 4"),
+    )
+    for class_name, field_name, color, dash in diagnostic_series:
+        points = [
+            (point.ts_ms, getattr(point, field_name))
+            for point in timeline.resources
+            if getattr(point, field_name) is not None
+        ]
+        if points:
+            parts.append(
+                f'<path class="{class_name}" d="{_step_path(points, x, lambda value: y(value, hbm_capacity))}" fill="none" stroke="{color}" stroke-width="2" stroke-dasharray="{dash}"/>'
+            )
     if host_points:
         parts.append(
             f'<path d="{_step_path(host_points, x, lambda value: y(value, host_capacity))}" fill="none" stroke="#3968a8" stroke-width="2.5"/>'
@@ -659,7 +863,10 @@ def _transfer_row(transfer: TimelineTransfer, base_ts_ms: float) -> str:
 def _is_physical_transfer(transfer: TimelineTransfer) -> bool:
     """Return whether the backend observed any bytes moved for this operation."""
 
-    return transfer.actual_bytes > 0
+    return (
+        transfer.actual_bytes > 0
+        and transfer.direction in {"d2h", "h2d", "mixed"}
+    )
 
 
 def _format_bytes(value: int | None) -> str:
@@ -685,6 +892,10 @@ def _format_duration(value_ms: float) -> str:
 
 def _optional_int(value: Any) -> int | None:
     return int(value) if value is not None else None
+
+
+def _optional_float(value: Any) -> float | None:
+    return float(value) if value is not None else None
 
 
 def _atomic_write(path: Path, content: str) -> None:

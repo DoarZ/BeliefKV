@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Callable
 
 from beliefkv.control.causal_graph import InvocationState, RuntimeCausalContextGraph
 from beliefkv.runtime.page_index import PageOwnershipIndex, PhysicalPageRecord
+from beliefkv.runtime.protocol import PageHandle
 
 
 class ResidencyClass(str, Enum):
@@ -99,13 +101,25 @@ class ResidencyClassifier:
             strongest.since_ms,
         )
 
-    def release_terminal_owners(self) -> set[str]:
+    def release_terminal_owners(
+        self,
+        *,
+        on_release: Callable[[str, frozenset[PageHandle]], None] | None = None,
+    ) -> set[str]:
         """Drop semantic ownership only for non-persistent dead contexts."""
 
         released: set[str] = set()
         for context_id in tuple(self.graph.contexts):
             assessment = self.context(context_id, now_ms=0.0)
             if assessment.residency_class == ResidencyClass.DEAD_UNOWNED:
+                private_host_handles = frozenset(
+                    page.handle
+                    for page in self.page_index.context_pages(context_id)
+                    if page.cpu_resident
+                    and set(page.owner_contexts) == {context_id}
+                )
+                if on_release is not None:
+                    on_release(context_id, private_host_handles)
                 self.page_index.unbind_context(context_id)
                 released.add(context_id)
         return released
