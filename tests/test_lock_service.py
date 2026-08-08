@@ -104,6 +104,20 @@ def test_forget_removes_terminal_request_record() -> None:
     assert not ledger.tracks("terminal")
 
 
+def test_progress_record_exposes_latest_immutable_service_evidence() -> None:
+    ledger = RequestServiceLedger()
+    _select(ledger, "running")
+    ledger.observe_completed("running", ts_ms=10.0, phase="decode")
+
+    record = ledger.progress_record("running")
+
+    assert record is not None
+    assert record.last_completed_service_ts_ms == 10.0
+    assert record.last_service_phase == "decode"
+    assert record.completed_service_count == 1
+    assert ledger.progress_record("missing") is None
+
+
 def test_tentative_unlock_projects_radix_closure_without_mutation() -> None:
     index = PageOwnershipIndex()
     parent = PageHandle(1, 0)

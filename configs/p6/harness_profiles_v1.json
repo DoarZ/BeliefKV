@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "profile_id": "p6-repository-harness-v1",
+  "instances": {
+    "psf__requests-5414": {
+      "repo": "psf/requests",
+      "source_image": "swebench/sweb.eval.x86_64.psf_1776_requests-5414:latest",
+      "runtime_image": "beliefkv/sweb.eval.x86_64.psf_1776_requests-5414:harness-v1",
+      "preflight_policy": "psf_requests_pytest_httpbin_v1"
+    }
+  }
+}

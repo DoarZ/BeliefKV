@@ -17,6 +17,10 @@ from beliefkv.core.events import (
     RuntimeEvent,
     RuntimeEventKind,
 )
+from beliefkv.runtime.agent_safety import (
+    ActivationDeadline,
+    ActivationDeadlineExceeded,
+)
 from beliefkv.runtime.agent_runtime_adapter import RuntimeEventSink
 from beliefkv.runtime.sglang_adapter import BeliefKVRequestMetadata
 
@@ -57,6 +61,7 @@ class PeerTurnRequest:
     metadata: BeliefKVRequestMetadata
     is_subagent: bool = False
     must_complete: bool = False
+    workflow_deadline: ActivationDeadline | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,7 @@ class PeerTurnResult:
     output_tokens: int = 0
     subagent_tasks: tuple[SubagentTask, ...] = ()
     final_context_epoch: int | None = None
+    terminal_outcome: str | None = None
 
     def __post_init__(self) -> None:
         if not self.summary:
@@ -79,6 +85,8 @@ class PeerTurnResult:
             raise ValueError("final_context_epoch must be non-negative")
         if self.complete and self.subagent_tasks:
             raise ValueError("a complete turn cannot create new subagent work")
+        if not self.complete and self.terminal_outcome is not None:
+            raise ValueError("only a complete turn can carry a terminal outcome")
 
 
 class PeerAgentBackend(Protocol):
@@ -170,18 +178,23 @@ class LangGraphPeerWorkflow:
         trace_sensitivity: TraceSensitivity = TraceSensitivity.SEMANTIC_RACE_SENSITIVE,
         llm_event_source: LLMEventSource = LLMEventSource.WORKFLOW,
         parallel_subagents: bool = False,
+        workflow_timeout_s: float | None = None,
         clock_ms: Callable[[], float] | None = None,
     ) -> None:
         if not workflow_id:
             raise ValueError("workflow_id must be non-empty")
         if max_turns <= 0:
             raise ValueError("max_turns must be positive")
+        if workflow_timeout_s is not None and workflow_timeout_s <= 0:
+            raise ValueError("workflow timeout must be positive")
         self.backend = backend
         self.workflow_id = workflow_id
         self.max_turns = max_turns
         self.trace_sensitivity = trace_sensitivity
         self.llm_event_source = llm_event_source
         self.parallel_subagents = parallel_subagents
+        self.workflow_timeout_s = workflow_timeout_s
+        self.workflow_deadline = ActivationDeadline()
         self.emitter = _RuntimeEmitter(
             event_sink,
             workflow_id,
@@ -192,15 +205,30 @@ class LangGraphPeerWorkflow:
         self._metadata_by_invocation: dict[str, BeliefKVRequestMetadata] = {}
         self._epoch_by_invocation: dict[str, int] = {}
         self._terminal_invocations: set[str] = set()
+        self._active_joins: set[str] = set()
         self._task_digest = ""
+        self._last_turn_count = 0
 
     def run(self, task: str) -> PeerWorkflowResult:
         if not task:
             raise ValueError("task must be non-empty")
         self._task_digest = hashlib.sha256(task.encode("utf-8")).hexdigest()
+        deadline_timer: threading.Timer | None = None
+        if self.workflow_timeout_s is not None:
+            self.workflow_deadline.start(self.workflow_timeout_s)
+            deadline_timer = threading.Timer(
+                self.workflow_timeout_s,
+                self._cancel_backend,
+                kwargs={"reason": "workflow_timeout"},
+            )
+            deadline_timer.daemon = True
+            deadline_timer.start()
         self.emitter.emit(
             RuntimeEventKind.WORKFLOW_START,
-            attributes={"task_sha256": self._task_digest},
+            attributes={
+                "task_sha256": self._task_digest,
+                "workflow_timeout_s": self.workflow_timeout_s,
+            },
         )
         self._ensure_peer(PeerRole.CODER)
         graph = self._build_graph()
@@ -218,7 +246,30 @@ class LangGraphPeerWorkflow:
                 config={"recursion_limit": max(32, self.max_turns * 4)},
             )
         except BaseException as error:
+            if self.workflow_deadline.expired():
+                self._cancel_backend(reason="workflow_timeout")
+                self._cancel_live_invocations("workflow_timeout")
+                self._finish_active_joins("workflow_timeout")
+                self.emitter.emit(
+                    RuntimeEventKind.WORKFLOW_END,
+                    attributes={
+                        "outcome": "workflow_timeout",
+                        "turn_count": self._last_turn_count,
+                        "exception_type": type(error).__name__,
+                    },
+                )
+                events = tuple(self.emitter.events)
+                return PeerWorkflowResult(
+                    workflow_id=self.workflow_id,
+                    completed=False,
+                    turn_count=self._last_turn_count,
+                    termination_reason="workflow_timeout",
+                    transition_hash=_transition_hash(events),
+                    trace_sensitivity=self.trace_sensitivity,
+                    events=events,
+                )
             self._finish_live_invocations("runtime_error")
+            self._finish_active_joins("runtime_error")
             self.emitter.emit(
                 RuntimeEventKind.WORKFLOW_END,
                 attributes={
@@ -227,6 +278,11 @@ class LangGraphPeerWorkflow:
                 },
             )
             raise
+        finally:
+            if deadline_timer is not None:
+                deadline_timer.cancel()
+            if self.workflow_timeout_s is not None:
+                self.workflow_deadline.clear()
         self._finish_live_invocations(
             str(state["termination_reason"] or "completed")
         )
@@ -269,6 +325,8 @@ class LangGraphPeerWorkflow:
     def _node(self, role: PeerRole) -> Callable[[_PeerState], dict[str, object]]:
         def run(state: _PeerState) -> dict[str, object]:
             turn = int(state["turn"])
+            if self.workflow_timeout_s is not None and self.workflow_deadline.expired():
+                raise ActivationDeadlineExceeded("workflow wall-clock deadline expired")
             if turn >= self.max_turns:
                 return {
                     "current_role": role.value,
@@ -299,8 +357,16 @@ class LangGraphPeerWorkflow:
                     history=tuple(state["history"]),
                     metadata=metadata,
                     must_complete=turn == self.max_turns - 1,
+                    workflow_deadline=(
+                        self.workflow_deadline
+                        if self.workflow_timeout_s is not None
+                        else None
+                    ),
                 )
             )
+            if self.workflow_timeout_s is not None and self.workflow_deadline.expired():
+                raise ActivationDeadlineExceeded("workflow wall-clock deadline expired")
+            self._last_turn_count = max(self._last_turn_count, turn + 1)
             if result.final_context_epoch is not None:
                 self._epoch_by_invocation[metadata.invocation_id] = max(
                     self._epoch_by_invocation[metadata.invocation_id],
@@ -312,12 +378,17 @@ class LangGraphPeerWorkflow:
                         "context_epoch": result.final_context_epoch,
                     }
                 )
+            self_continuation = (
+                not result.complete
+                and result.next_role is not None
+                and result.next_role == role
+            )
             action_kinds = (
                 ["final_answer"]
                 if result.complete
                 else [
                     *(["spawn"] if result.subagent_tasks else []),
-                    "handoff",
+                    "continue" if self_continuation else "handoff",
                 ]
             )
             if self.llm_event_source == LLMEventSource.WORKFLOW:
@@ -377,16 +448,26 @@ class LangGraphPeerWorkflow:
                 self._run_subagents(role, metadata, turn, result.subagent_tasks, state)
             history = (*state["history"], f"{role.value}:{result.summary}")
             if result.complete:
-                self._return_invocation(metadata, outcome="semantic_complete")
+                terminal_outcome = result.terminal_outcome or "semantic_complete"
+                self._return_invocation(metadata, outcome=terminal_outcome)
                 return {
                     "current_role": role.value,
                     "next_role": "end",
                     "turn": turn + 1,
                     "history": history,
                     "done": True,
-                    "termination_reason": "semantic_complete",
+                    "termination_reason": terminal_outcome,
                 }
             assert result.next_role is not None
+            if self_continuation:
+                return {
+                    "current_role": role.value,
+                    "next_role": role.value,
+                    "turn": turn + 1,
+                    "history": history,
+                    "done": False,
+                    "termination_reason": "",
+                }
             target_existed = result.next_role.value in self._metadata_by_role
             target = self._ensure_peer(result.next_role)
             self.emitter.emit(
@@ -532,6 +613,7 @@ class LangGraphPeerWorkflow:
             member_invocation_ids=tuple(child.invocation_id for _, child in children),
             attributes={"mode": "all", "parent_role": parent_role.value},
         )
+        self._active_joins.add(join_id)
         self.emitter.emit(
             RuntimeEventKind.JOIN_WAIT,
             invocation_id=parent.invocation_id,
@@ -620,6 +702,7 @@ class LangGraphPeerWorkflow:
             join_id=join_id,
             confidence=EventConfidence.OBSERVED_EXACT,
         )
+        self._active_joins.discard(join_id)
 
     def _invoke_subagent(
         self,
@@ -635,6 +718,11 @@ class LangGraphPeerWorkflow:
                 history=history,
                 metadata=child,
                 is_subagent=True,
+                workflow_deadline=(
+                    self.workflow_deadline
+                    if self.workflow_timeout_s is not None
+                    else None
+                ),
             )
         )
 
@@ -662,6 +750,38 @@ class LangGraphPeerWorkflow:
     def _finish_live_invocations(self, outcome: str) -> None:
         for metadata in self._metadata_by_invocation.values():
             self._return_invocation(metadata, outcome=outcome)
+
+    def _cancel_live_invocations(self, outcome: str) -> None:
+        for metadata in self._metadata_by_invocation.values():
+            if metadata.invocation_id in self._terminal_invocations:
+                continue
+            self._terminal_invocations.add(metadata.invocation_id)
+            self.emitter.emit(
+                RuntimeEventKind.INVOCATION_CANCEL,
+                invocation_id=metadata.invocation_id,
+                context_id=metadata.context_id,
+                context_epoch=self._epoch_by_invocation.get(
+                    metadata.invocation_id, metadata.context_epoch
+                ),
+                return_target_id=metadata.return_target_id,
+                confidence=EventConfidence.OBSERVED_EXACT,
+                attributes={"outcome": outcome},
+            )
+
+    def _finish_active_joins(self, outcome: str) -> None:
+        for join_id in sorted(self._active_joins):
+            self.emitter.emit(
+                RuntimeEventKind.JOIN_TIMEOUT,
+                join_id=join_id,
+                confidence=EventConfidence.OBSERVED_EXACT,
+                attributes={"outcome": outcome},
+            )
+        self._active_joins.clear()
+
+    def _cancel_backend(self, *, reason: str) -> None:
+        cancel = getattr(self.backend, "cancel", None)
+        if callable(cancel):
+            cancel(reason=reason)
 
     @staticmethod
     def _request_id(metadata: BeliefKVRequestMetadata, turn: int) -> str:

@@ -101,6 +101,7 @@ class TransferAttemptGuard:
         self._inflight: dict[str, _AttemptSnapshot] = {}
         self._blocked: dict[TransferAttemptKey, BlockedTransferAttempt] = {}
         self._unknown_failure_counts: dict[TransferAttemptKey, int] = {}
+        self._generations: dict[TransferAttemptKey, int] = {}
         self._events: list[TransferGuardEvent] = []
         self._blocked_count = 0
         self._suppressed_count = 0
@@ -172,6 +173,31 @@ class TransferAttemptGuard:
             return True
         return self._key_is_eligible(
             self._key_for_command(command), now_ms=now_ms
+        )
+
+    def suppression_blockers(
+        self, command: ControlCommand
+    ) -> tuple[TransferBlocker, ...]:
+        """Describe the physical failure suppressing an accepted command."""
+
+        if (
+            command.context_id is None
+            or command.context_epoch is None
+            or not self.enabled
+            or command.kind not in _GUARDED_KINDS
+        ):
+            return ()
+        blocked = self._blocked.get(self._key_for_command(command))
+        if blocked is None:
+            return ()
+        detail = f"retry suppressed after {blocked.last_command_id}"
+        return tuple(
+            TransferBlocker(
+                code=code,
+                required_bytes=blocked.required_bytes,
+                detail=detail,
+            )
+            for code in blocked.blocker_codes
         )
 
     def begin_attempt(self, command: ControlCommand, *, now_ms: float) -> str:
@@ -255,6 +281,7 @@ class TransferAttemptGuard:
             ),
         )
         self._blocked[attempt.key] = blocked
+        self._generations[attempt.key] = self._generations.get(attempt.key, 0) + 1
         self._blocked_count += 1
         self._emit("transfer_attempt_blocked", now_ms, blocked)
 
@@ -335,6 +362,17 @@ class TransferAttemptGuard:
             bundle_id=bundle.bundle_id,
             closure_fingerprint=bundle.generation_fingerprint,
         )
+
+    def generation_for(self, command: ControlCommand) -> int:
+        """Return the event generation for this exact physical attempt."""
+
+        if (
+            command.context_id is None
+            or command.context_epoch is None
+            or command.kind not in _GUARDED_KINDS
+        ):
+            return 0
+        return self._generations.get(self._key_for_command(command), 0)
 
     def _target_handles_fingerprint(
         self, handles: tuple[PageHandle, ...]
@@ -555,6 +593,7 @@ class TransferAttemptGuard:
     ) -> None:
         if self._blocked.pop(blocked.key, None) is None:
             return
+        self._generations[blocked.key] = self._generations.get(blocked.key, 0) + 1
         self._released_count += 1
         self._emit(
             "transfer_retry_released",

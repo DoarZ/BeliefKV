@@ -59,6 +59,50 @@ class CommandStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class EnqueueStatus(str, Enum):
+    """Result of acquiring canonical ownership for a control command."""
+
+    ENQUEUED = "enqueued"
+    ADOPT_EXISTING = "adopt_existing"
+    RETRY_GUARD_BLOCKED = "retry_guard_blocked"
+    CONTEXT_CONFLICT = "context_conflict"
+    STALE_CERTIFICATE = "stale_certificate"
+
+
+@dataclass(frozen=True)
+class EnqueueOutcome:
+    """Typed command admission result used by transactional restore."""
+
+    status: EnqueueStatus
+    canonical_command_id: str | None
+    attempt_key: tuple[object, ...]
+    blocker_codes: tuple[str, ...] = ()
+    wake_conditions: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.status in {
+            EnqueueStatus.ENQUEUED,
+            EnqueueStatus.ADOPT_EXISTING,
+        } and not self.canonical_command_id:
+            raise ValueError("accepted enqueue outcome requires a canonical command")
+        object.__setattr__(
+            self, "blocker_codes", tuple(sorted(set(self.blocker_codes)))
+        )
+        object.__setattr__(
+            self, "wake_conditions", tuple(sorted(set(self.wake_conditions)))
+        )
+
+    @property
+    def accepted(self) -> bool:
+        return self.status in {
+            EnqueueStatus.ENQUEUED,
+            EnqueueStatus.ADOPT_EXISTING,
+        }
+
+    def __bool__(self) -> bool:
+        return self.accepted
+
+
 class TransferBlockerCode(str, Enum):
     """Machine-readable reason why a physical transfer could not proceed."""
 
@@ -220,6 +264,13 @@ class TransferTelemetry:
     context_epoch: int | None = None
     command_kind: str = ""
     compute_phase: str = "unknown"
+    host_copy_state: str = "unknown"
+    pinned_host: bool | None = None
+    native_concurrent_bytes: int = 0
+    allocator_wait_ms: float | None = None
+    allocator_submit_ms: float | None = None
+    callback_overhead_ms: float | None = None
+    start_timestamp_semantics: str = "unavailable"
 
     def __post_init__(self) -> None:
         if not self.command_id:
@@ -239,13 +290,26 @@ class TransferTelemetry:
                 )
         if self.compute_wait_ms is not None and self.compute_wait_ms < 0:
             raise ValueError("compute_wait_ms must be non-negative when observed")
+        for value, name in (
+            (self.allocator_wait_ms, "allocator_wait_ms"),
+            (self.allocator_submit_ms, "allocator_submit_ms"),
+            (self.callback_overhead_ms, "callback_overhead_ms"),
+        ):
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be non-negative when observed")
         if self.actual_bytes < 0 or self.closure_bytes < 0:
             raise ValueError("transfer byte counts must be non-negative")
         if self.actual_bytes > self.closure_bytes:
             raise ValueError("actual_bytes cannot exceed selected closure_bytes")
         if self.merged_operation_count < 0 or self.page_count < 0:
             raise ValueError("operation and page counts must be non-negative")
+        if self.native_concurrent_bytes < 0:
+            raise ValueError("native concurrent bytes must be non-negative")
         if not self.source_tier or not self.target_tier:
             raise ValueError("source_tier and target_tier must be non-empty")
+        if not self.host_copy_state:
+            raise ValueError("host copy state must be non-empty")
+        if not self.start_timestamp_semantics:
+            raise ValueError("start timestamp semantics must be non-empty")
         if self.context_epoch is not None and self.context_epoch < 0:
             raise ValueError("context_epoch must be non-negative")

@@ -109,5 +109,18 @@ class TransferCommandQueue:
             )
         )
 
+    def get(self, command_id: str) -> ControlCommand | None:
+        """Return an active queued command without changing queue order."""
+
+        if command_id not in self._active_ids:
+            return None
+        for entry in (*self._urgent, *self._shadow):
+            if (
+                entry.command.command_id == command_id
+                and command_id not in self._cancelled_ids
+            ):
+                return entry.command
+        return None
+
     def __len__(self) -> int:
         return self.urgent_count + self.shadow_count

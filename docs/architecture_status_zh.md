@@ -1,9 +1,10 @@
 # BeliefKV 最新架构与实现状态
 
-更新日期：2026-07-27
+更新日期：2026-08-01
 
-状态基线：当前工作区，包括 Git HEAD `d76af28` 以及截至 2026-07-27 的 P5A--P5C
-实现。本文描述当前磁盘上的实际代码，不只描述已提交文件。
+状态基线：P5G system correctness gate 已通过并冻结架构；P6.0 已在最新 autonomous w4 上完成严格
+identity coverage 与版本化训练证据导出。P6 online path 仍关闭。本文描述
+当前磁盘上的实际代码，不只描述已提交文件。
 
 本文回答三个问题：
 
@@ -22,8 +23,8 @@
 
 ## 1. 当前最重要的架构结论
 
-BeliefKV 当前有在线 reactive、JointPlan shadow 和默认关闭的 P5 observed-control 三条路径；
-它们已共享 visible admission/physical bundle 基础，但尚未统一为正式在线 JointPlan。
+BeliefKV 保留 P2 reactive 和 P4 shadow 作为独立实验模式；启用 P5 时，在线决策已收敛为单一
+JointPlan authority。reactive transfer planner 在 P5 下不能重新成为第二个 victim/迁移策略源。
 
 ```text
 在线执行主路径（P2）
@@ -38,14 +39,14 @@ RuntimeEvent / request metadata / allocator observation
   -> actual-byte ACK
   -> residency commit + telemetry
 
-统一策略研究路径（P2.5/P3）
+统一策略路径（P2.5--P5）
 RCCG + consumer index + PageOwnershipIndex + resource observation
   -> PolicyInputSnapshotBuilder
-  -> immutable PolicyInput
-  -> B0 reactive baseline / ScenarioPhysicalizer
-  -> WhatIfPacker / JointPlanOracle / TraceOrderJointOracle
-  -> rolling token-Radix + allocator + queue/service replay
-  -> shadow/replay PolicyOutput, O0-O3 and HBM/Host timeline
+  -> latest-wins AsyncSemanticJointPlanner
+  -> SemanticPlan(execution/admission/context-tier/retraction)
+  -> scheduler safe point local validation
+  -> current PhysicalBundle materialization (at most one transfer transaction)
+  -> JointPlanEpoch -> ticket / residency / retraction
 
 延后比较路径（P8，默认关闭）
 immutable PolicyInput + frozen trace
@@ -53,29 +54,191 @@ immutable PolicyInput + frozen trace
   -> common-denominator native systems when compatible
 ```
 
-第一条路径已经接入真实 SGLang。第二条路径中的 observed JointPlan 已通过增量 latest-wins
-异步 worker 接入 scheduler safe point；完整 `PolicyInput` 由 worker-owned mirror 构造，不再
-阻塞 scheduler thread，但仍然是只读 shadow 路径，**尚未替换
-`BeliefKVController.tick()` 的在线 admission、迁移和 waiting queue 排序**。
-
-P5A observed active-set admission、P5B selective running-batch retraction 和 P5C
-`RETRACT -> physical action -> ACK -> replacement ticket` 已完成 CPU/接口实现并保持默认关闭；
-它们尚未通过真实 GPU correctness/performance gate，不能描述为完整在线策略已部署。
+P5 的异步 planner 不再绑定 page、extent generation 或 closure handle。它只输出较慢变化的语义
+顺序和 context 级目标；safe point 对最大有效 action slice 做局部校验，并只物化下一批请求和至多
+一个迁移事务。`BOUNDED_SEED/OPTIMIZED/EMERGENCY/NO_ACTION` 使用同一 epoch 合约；running
+retraction 必须有显式 `RetractionIntent` 和 `source_joint_plan_id`。
 
 第一条路径现在同时记录 BeliefKV 显式 command 与 SGLang native demand-load/write-back 回调。
 两者统一进入 transfer timeline，并用 `telemetry_origin` 区分；native 路径仍绕过 BeliefKV
 command queue，因此控制归因与数据面完成事件必须分开解释。
 
-因此，当前版本不能描述为“在线 JointPlan 已部署”。准确说法是：
+因此，当前版本可以描述为“在线 JointPlan 代码路径已接入，P6.0/P6.1 训练前基础设施开始实现”，
+但不能描述为“P5 已通过实验门槛”或“预测策略已在线启用”。P5G GPU clean-completion gate
+通过前，P6 只允许离线 analyzer/coverage 工作。
 
-> P2 的 bundle-aware reactive 控制器已经在线；P2.5/P3 已经建立统一策略契约与动态观测；
-> P4 observed JointPlan runtime shadow 已接入；P5A--P5C 的 observed-control 机制已实现但默认
-> 关闭并等待真实 GPU gate。早期 B1-B4 策略草图已删除，外部 baseline 在系统冻结后的 P8
-> 按稳定 workload 和真实 metadata 条件选择。
+2026-07-28 增加 P5E running-retraction restore obligation。此前 retraction 只保证 victim D2H 和
+replacement admission，没有持久保证被 requeue 的 victim 能再次完成 H2D 并获得 GPU service；真实
+w4 trace 中两个 victim 因此在 requeue 后停留 900 秒并触发 execution timeout。修复后的状态机为：
+
+```text
+RETRACTION_PREPARED -> D2H_INFLIGHT -> PARKED_WAIT
+  -> EVICT_FOR_RESTORE -> H2D_INFLIGHT -> RESTORE_ACKED
+  -> TICKET_READY -> SATISFIED
+```
+
+每笔 committed running retraction 现在必须先通过 fail-closed obligation capacity/path 检查，并在
+retraction 前保存 request Radix path extent。obligation 不随异步 JointPlan stale/invalidation 消失；
+容量不足时 safe point 先选择不包含目标 context 的物理可行 D2H funding bundle，收到 ACK 且
+allocator/page revision 前进后再提交目标 H2D。cooldown 只限制再次成为 retraction victim，不再覆盖
+restore dependency。相同 page/topology/allocator/transfer stamp 下不会重试失败命令；超过 2 秒启用
+restore-debt admission barrier，所有 blocked obligation 都带具名 blocker 和状态 stamp。
+
+bounded/emergency JointPlan seed 也会保留 restore requirements，所有命令携带
+`source_joint_plan_id`。H2D ACK 后重新匹配 request prefix，首次重新获得 GPU service 才将 obligation
+标记为 `SATISFIED`；abort、cache reset 和 shutdown 分别进入显式终态。CPU 集成测试覆盖
+`requeue -> D2H funding -> ACK -> H2D -> ACK -> ticket -> service`，当前全量结果为
+`431 passed, 8 skipped`。
+
+同日固定 w4 trace 进一步暴露 ordinary-waiting restore 缺口：两个从未 physical start 的 child
+request 在 waiting 期间被 native HiCache write-back，ticket gate 发现 CPU-only prefix 后只设置
+`WAIT_RESTORE`，却没有创建可驱动 H2D 的 obligation。当前修复将该事件归因为
+`ordinary_waiting_prefix`，直接创建独立于 JOIN/readset plan freshness 的 durable restore debt；H2D
+ACK 后 `TICKET_READY` debt 以创建时间顺序进入 admission liveness priority。确定性测试已覆盖
+`ordinary waiting -> CPU path detection -> H2D -> ACK -> TICKET_READY`。2026-07-28 固定 w4 GPU
+trace 进一步真实触发 6 个 `ordinary_waiting_prefix` debt，6/6 均在 H2D ACK 后重新获得 GPU
+service；同轮 66 个 running-retraction debt 也全部进入 `SATISFIED`，且 HBM funding 分支真实释放
+4,419,256,320 bytes。214 次 dispatch 全部收到 ACK，无 orphan transaction。
+
+该 GPU trace 同时暴露了 workload 终止性缺口：cyclic persistent peer 在 1,800 秒 activation
+deadline 后仍继续提交到 context epoch 74，也超过 48-call stuck guard，最终需要人工中止。根因是
+旧实现把 deadline 和 guard 限制在单次 persistent-peer activation，外层 `graph.invoke()` 与 runner
+future 没有共享的绝对 deadline 和 cancellation supervisor。
+
+2026-07-28 已完成 CPU 侧修复：一个绝对 workflow deadline 由 root、persistent peer 和所有 child
+共享；到期后统一 abort 活跃 SGLang request、取消 child 与 JOIN，并终止该 workflow 的隔离 sandbox。
+普通工具错误原样返回模型并规范为 `ToolMessage.status="error"`，runtime 记录 error class、参数签名和
+写工具前后 workspace digest。物理失败与 `duplicate_suppressed` 意图分开计数，并以 failure episode ID
+关联。后续审阅将在线边界进一步收缩：重复调用、错误率和无进展模式只记录 telemetry，不再禁用工具、
+修改 prompt 或强制返回 `BLOCKED`；历史 `NORMAL/SUSPECT/RECOVERY/FINALIZE` 状态机仅保留为显式
+回归开关。相同参数的成功工具调用若连续两次既无有效输出也不改变 workspace epoch，第三次起由 circuit
+breaker 阻断物理执行。默认路径只有 512 superstep 和绝对 workflow deadline 能触发进程级安全收尾，
+其中 graph step 481 起保留 32 step 做有界终态收尾。该逻辑位于独立的
+`runtime/agent_safety.py` 与 `runtime/langchain_tool_safety.py`，KV policy 只消费终态事件，不参与判断
+工具或任务是否成功。CPU 回归为 core/server `431 passed, 8 skipped`，agent runtime 聚焦集
+`73 passed`。
+
+2026-07-29 已执行一次固定 w4 clean-completion gate。99/99 command 收到 ACK，25/27 restore
+obligation 恢复 service，退出前 request/transaction 全部清空；但 `restore-23` 的 3.426 GB H2D
+ACK 后没有保留约 600 MB admission 空间，native admission 随后返回 `NO_TOKEN`。overdue debt
+barrier 最终形成 `0 running + 7 waiting`，直到 900 秒 execution timeout 取消该请求。最终 0/4
+workflow clean completion，且 Ctrl-C 只把 shutdown summary 写到 `preparing`。因此完整 P5 gate
+仍未通过，也不能执行性能比较。详见
+`docs/experiments/beliefkv_p5e_clean_completion_w4_2026-07-29_zh.md`。
+
+同日已完成针对该失败的 CPU 侧修复。新增 request-indexed `RestoreLease` 状态机，并以真实
+SGLang KV allocator token 预留 admission 容量；lease 在 H2D 前建立，H2D ACK 后额外 pin
+restored Radix prefix，prefix rematch 后仅向 owner ticket 发放 reservation credit。native
+`PrefillAdder` 尝试前临时释放预留 token，失败则立即重新获取，成功则由 request lock 接管
+prefix，直到首次 GPU service 或 terminal/cancel/reset/shutdown 才结束 lease。全局 debt barrier
+改为“lease 保护剩余容量可继续工作”；lease 无法建立且 engine idle 时只允许一次 bounded small
+bypass。全量 CPU 回归为 `435 passed, 8 skipped`；真实 w4 GPU clean-completion 复验尚未执行。
+
+随后一次固定 w4 复验确认了另一类 restore liveness 缺口：`restore-18` 的逻辑 debt 仍引用 15 个
+CPU-only extent，但这些 extent 已不再是当前 context owner 集合的一部分，因而无法生成
+`PREFETCH_CONTEXT` physical preview。当前 CPU 侧修复只针对 `ordinary_waiting_prefix`：每次恢复先
+以 waiting request 的当前 Radix 路径校验 handle generation，并用 `replace=True` 原子重绑该 context
+的 physical ownership；若重绑后仍无 preview，则先以同一个 `RestoreLease` 预留完整 native admission
+容量，再把 debt 标记为 `native_admission_fallback`，交给 SGLang HiCache 原生 load-back，失效时允许
+按 raw prompt 重算。native admission 返回 `NO_TOKEN` 时仍走既有 rollback/reacquire，不会绕过 HBM
+容量约束；running-retraction obligation 不允许使用该 fallback。focused restore/admission/retraction
+回归为 `123 passed`，全量 CPU 回归为 `437 passed, 8 skipped`。
+
+2026-07-29 固定 w4 GPU 复验真实触发 32 笔 running-retraction 和 17 笔 ordinary-waiting
+obligation，49/49 全部 `SATISFIED`；0 次 `physical_preview_unavailable`，因此上一轮 parent restore
+永久停滞未复现。170 个 command 全部收到 ACK，0 missing/orphan/order violation。该修复同时产生
+160 次 ownership rebind，说明 liveness 已恢复但 context owner 仍被物理同步反复改写。完整
+clean-completion gate 仍失败：4/4 workflow 达到 1,800 秒绝对 deadline，主要剩余问题转为 parent
+语义终止、late dynamic spawn 的剩余预算，以及 2 个瞬时 Host/page-index mismatch、1 个 physical-start
+checkpoint 缺口和未完成的 shutdown summary。详见
+`docs/experiments/beliefkv_p5e_restore_rebind_w4_2026-07-29_zh.md`。
+
+2026-07-30 的下一次固定 w4 压力复验中，物理迁移仍保持 125/125 command/ACK 完整，52 个 restore
+obligation 中 51 个恢复 service；唯一失败的 `restore-52` 在前一 restore 满足后仅 1.77 秒便再次
+成为 running-retraction victim。其 H2D 已完成，但后续 7 次 funding 释放的 11.89 GB capacity
+没有归属于该 debt，同时 active lease 使 normal-admission barrier 过早关闭，最终持续 blocked
+423.96 秒。该轮是 liveness characterization，不用于性能结论，详见
+`docs/experiments/beliefkv_p5e_restore_funding_fix_w4_2026-07-30_zh.md`。
+
+当前 CPU 修复增加两项闭环机制：`RestoreServiceGrace` 从首次恢复 service 开始按已完成 batch 后
+`output_ids` 的真实增量累计，默认完成 32 个 decode token 或正常结束当前 request 前禁止再次
+retraction；funding ACK 则把实际 reclaim 中用于弥补 allocator deficit 的部分立即分配成该
+obligation 独占的 allocator escrow，随后在同一 safe point 转换为 owner lease 与 H2D headroom。
+active lease 不再关闭 overdue debt barrier，cancel/cache reset/shutdown 会统一回滚 escrow、lease
+和 grace。全量 CPU 回归为 `442 passed, 8 skipped`；固定 w4 GPU 复验尚未执行。
+
+2026-07-31 根据 restore-30 的失败证据增加 P5G `Transactional Restore Coordinator`。该次故障中，
+request 已从 running 回到 native waiting，但历史 `_active_request_ids` 仍使四次 H2D 被错误判定为
+`ENGINE_BUSY`；随后 lease grant/rollback 改变 allocator revision，自身写入又触发 963 轮无效恢复
+尝试。P5G 不再把历史 active 集合当作 ownership，而是在 scheduler safe point 从 queue location、
+`req_pool_idx`、Radix lock、native load 和 explicit transfer 重建正交
+`NativeRequestPhysicalSnapshot`。
+
+restore 提交改为 `preflight -> reservation/pin prepare -> enqueue-or-adopt -> commit`，失败逆序回滚。
+controller 返回类型化 `EnqueueOutcome`；相同 context/epoch/kind/bundle generation/closure/target
+residency 的命令共享 canonical command，并由 ACK 多订阅表唤醒全部 restore transaction。失败重试
+使用 `ExternalProgressToken`，只响应 engine owner、closure、capacity threshold、command ownership、
+guard 或 native load 的相关变化，不响应无关 allocator revision 和本事务自己的 lease 写入。
+
+最老 restore 超过活性门槛时显式进入
+`NORMAL_JOINT -> RESTORE_DRAIN_REQUESTED -> RESTORE_DRAIN_ACTIVE`；ACTIVE 状态使当前在线计划失效，
+coordinator 成为唯一 admission/residency authority，普通 JointPlan 只保留 shadow 能力。当前已完成
+CPU 机制与故障注入，包括 stale active ID、guard-blocked 零 lease allocation、canonical ACK 多订阅、
+partial/rejected/stale ACK、native/explicit load 冲突、context epoch 冲突和 drain 权限切换；固定 w4
+GPU clean-completion 当时尚未执行。
+
+2026-07-31 进一步执行了固定 w4 ownership-overhead characterization。首轮真实暴露 Host-only
+Radix leaf 在 H2D 前被错误 `inc_lock_ref()` 的崩溃；现已改为 H2D 前只持有 capacity reservation，
+由 HiCache 保护 native loading path，H2D ACK 后再建立持久 GPU prefix pin。修复后的单次复验覆盖
+35 次 deferred-pin/H2D/post-ACK pin、14 次 running retraction 和 89 条 transfer ACK，受控 shutdown
+后 0 pending transaction。105 次 native ownership rebuild 的 P50/P95/P99 为
+0.052/0.156/0.523 ms，最大 5.454 ms，每次最多扫描 12 个 request。w4 量级下开销可控，但 P99
+略高于暂定 0.5 ms 门槛，且该轮达到样本数后主动停止，不是 clean-completion gate。w24/w32 前需
+改为每个相关 safe point 构造一次、按 context 索引复用的 immutable physical snapshot。详见
+`docs/experiments/beliefkv_p5g_ownership_snapshot_overhead_w4_2026-07-31_zh.md`。
+
+2026-07-31 随后只运行了一次完整固定 w4 P5G gate。数据面 246/246 lifecycle cleanup command/ACK
+完整，HBM/Host page-index 一致，953 个 request 均完成 physical start/finish，运行中没有 API timeout、
+queue timeout、OOM 或 admission stall；但 workload 只有 1/4 semantic complete、0/4 clean JCT，失败
+分别来自 self-handoff runtime error、LangGraph recursion limit、7,200 秒 workflow timeout，以及一次
+`repeated_failed_tool_call` 使已完成 workflow 的 `guard_valid=false`。其中 `native_protocol_valid` 只是
+严格诊断字段，不参与当前 clean-JCT 判定。该轮虽记录 2,923 次 native D2H 与 20 次 native H2D，却没有创建 restore obligation
+或显式迁移，因此 lazy ownership snapshot `call_count=0`，P5G transactional restore 未被覆盖。shutdown
+prepare 时物理事务为空，但 SIGINT 在 `SHUTDOWN_ACK` 和 audit flush 前终止进程，summary 停在
+`preparing/final=false`，独立 telemetry 少 1 条 D2H。详见
+`docs/experiments/beliefkv_p5g_clean_completion_w4_2026-07-31_zh.md`。
+
+准确说法是：
+
+> P2 reactive、P4 shadow 和 P5 unified JointPlan 是显式隔离的实验模式；P5G transactional
+> restore 已通过全量 CPU 与 fault-injection gate；普通压力下旧 restore 路径已有 GPU 证据，但
+> P5G fixed-w4 ownership reconstruction 已有 GPU characterization；完整 fixed-w4 已执行但因 runtime
+> 终止性、零 restore-transaction coverage 和 shutdown 未 ACK 而失败，P5 接口尚不能冻结。
 
 BeliefKV 不是 metadata-free：它要求 invocation/context identity 和已经发生的 spawn、wait、return、
 message、handoff 等最小在线因果事件。其定位是**无需先验完整 DAG、在线发现动态 workflow**，
 而不是从完全不透明请求中推断 workflow。
+
+2026-07-30 增加独立的 agent runtime context lifecycle。parent 和 Deep Agents child 均以动态消息
+历史 32,768 token 为压缩触发点，压缩后保留最近约 8,192 token，并用独立的 2,048-token 摘要调用
+保留任务目标、计划、文件修改、测试、错误以及 child RETURN/JOIN 状态。32K 不包含静态 system
+prompt 和工具 schema，也不是 SGLang 的硬 context length；服务端保留更大的窗口，为静态 schema、
+摘要请求和故障回退预留空间。
+
+摘要 LLM 使用 `runtime_internal` 的临时 FRESH context，不计入业务 subagent 和 LLM 强度。摘要成功
+应用到下一次 parent/child 请求前，runtime 发出 `CONTEXT_COMPACT(old_epoch, new_epoch)`；控制面原子
+解除旧 context 到 Radix page 的 ownership、清除旧 terminal-node 绑定并推进 epoch。旧 GPU KV 由
+正常 residency 策略按压力回收，旧 Host-only 副本进入 cleanup；共享页只有在没有其他 owner 时才会
+失去保护。摘要调用显式传播 runtime callback；摘要模型失败或返回空 checkpoint 时 fail-closed，不会
+发布 compaction。单个不可切分工具轮次超过摘要预算时，摘要输入有界保留最早目标和最新状态。摘要
+游标在单次 graph invocation 内作为 `ContextLifecycleState` 私有状态传递，并标记为 LangGraph
+`PrivateStateAttr`；跨 peer activation 的续接由该 parent 独占的 lifecycle middleware 保存和恢复，
+不经过公开 graph input/output。本地 subagent middleware 同时在 child 输入和 child `Command.update`
+输出边界剥离该游标，避免并发 child 在 JOIN 时把各自 compaction 状态合并回 parent；该字段不能使用
+reducer 合并，因为 child 的压缩位置对 parent 没有语义。没有启用通用 LangGraph
+checkpointer，避免 loop guard、旧 structured response 和多代完整 checkpoint 污染下一次 activation。
+摘要内容和触发策略仍属于 runtime，BeliefKV 仅处理 KV 生命周期事件。未增加新的语义 progress
+detector，既有工具错误 circuit breaker 与 loop guard 保持不变。
 
 ## 2. 当前端到端架构
 
@@ -450,18 +613,19 @@ run 又发现 native demand-load 未进入 BeliefKV telemetry，因此当前不�
 | Admission | `policy/admission.py` | 在线完成 |
 | Lease/Bundle | `policy/leases.py`、`runtime/bundles.py` | P2 在线完成 |
 | Transfer policy | `transfer_planner.py`、`shadow_controller.py`、`transfer_guard.py` | Reactive 在线；预测收益待证 |
-| Predictor | `predictor/` | 机制完成；跨 workload 泛化待证 |
+| Predictor | `predictor/frontier_belief.py`、legacy `predictor/` | P6 closure-complete scope、belief schema 和 finite horizon 已实现；模型未训练 |
+| Predictive risk | `policy/predictive_joint.py` | A0/PREPARE/PREFETCH 离线 Benefit/CVaR 选择已实现；未接在线数据面 |
 | Common policy contract | `policy/reference/`、`policy/resource_snapshot.py` | P2.5 完成，Shadow/Replay |
 | What-if/Oracle | `scenario_physicalizer.py`、`whatif_packer.py`、`joint_oracle.py` | P3 离线机制完成 |
-| Joint runtime shadow | `policy/joint_scheduler.py`、`runtime/joint_shadow.py`、`runtime/sglang_v052rc1.py` | P4 immutable delta + worker mirror 已接入；只校验和审计，不执行 |
+| Joint runtime | `policy/joint_scheduler.py`、`policy/online_joint.py`、`runtime/joint_shadow.py`、`runtime/sglang_v052rc1.py` | P4 worker mirror 与 P5 validated online compiler 已接入；默认关闭，GPU gate 待完成 |
 | Physical mirror/arbitration | `runtime/page_index.py`、`runtime/radix_arbiter.py` | 在线完成 |
-| SGLang backend | `runtime/sglang_adapter.py`、`runtime/sglang_v052rc1.py`、`patches/` | 显式 command 与 native demand-load/write-back telemetry 已接入；真实 GPU 覆盖待复验 |
-| Agent event adapters | `runtime/event_channel.py`、`deepagents_adapter.py`、`codex_adapter.py` | Deep Agents/跨进程路径已验证；更多 framework 待接 |
-| Action/prefix observation | `runtime/action_frontier.py`、`prefix_affinity.py` | P3 观测机制完成 |
+| SGLang backend | `runtime/sglang_adapter.py`、`runtime/sglang_v052rc1.py`、`patches/` | 显式 command 与 native demand-load/write-back telemetry 已接入；autonomous w4 统一覆盖 1,535 条物理 telemetry，shutdown ACK 与 command integrity 通过 |
+| Agent event adapters | `runtime/agent_safety.py`、`langchain_tool_safety.py`、`event_channel.py`、`deepagents_adapter.py`、`codex_adapter.py` | Deep Agents 工具错误、断路、结构化终态和 workflow 级取消已通过 CPU 测试；GPU clean gate 与更多 framework 待接 |
+| Action/prefix observation | `runtime/action_frontier.py`、`prefix_affinity.py` | P6.0 revision 与训练前 coverage 已实现；固定 w4 trace 的 runtime-only action/reentry coverage 已采集，exact boundary 仍为 0% |
 | Trace | `traces/normalizer.py`、`runtime_validation.py`、`characterization.py` | 标准化/验证完成；P3 characterization 新增 |
 | Simulator | `simulator/queue_service.py`、`token_radix.py`、`rolling_physical.py`、`rolling_queue_service.py` | rolling token/allocator 机制完成；真实 extent/PCIe/fairness gate 待闭合 |
 | Experiments | `experiments/deepagents_swebench.py`、`langgraph_peer_workflow.py`、`policy_replay.py` | 12-workflow mixed characterization 已跑；配对 A/B 待跑 |
-| Metrics | `metrics/transfer_timeline.py`、`transfer_validation.py` | 显式/native DMA 统一时间线，物理 lock/closure/migratable/dual-resident 及 100/500 ms locked-but-not-served 下界曲线已接入；真实 GPU coverage 待复验 |
+| Metrics | `metrics/transfer_timeline.py`、`transfer_validation.py` | 显式/native DMA 统一时间线，物理 lock/closure/migratable/dual-resident 及 100/500 ms locked-but-not-served 下界曲线已接入；autonomous w4 验证 0 个 Host/page-index mismatch |
 
 ## 11. P0-P8 实施状态
 
@@ -474,16 +638,28 @@ run 又发现 native demand-load 未进入 BeliefKV telemetry，因此当前不�
 | P2.5 Common policy contract | 完成 | immutable PolicyInput/Output、metadata 隔离、B0 replay | P8 按需增加有效 baseline |
 | P3A Dynamic instrumentation | 部分完成 | consumer/action/prefix/topology、required-range fan-out、固定时长 GPU-ready probe | 稳定 ready 并发、配对 A/B、fanout 多样性、boundary-token coverage |
 | P3B Jointness analysis | 部分完成 | B0、what-if、bounded search、rolling Radix/allocator、HTML timeline | 从真实 pressure snapshot 做局部 Jointness Audit；完整动态 O0-O3 后置 |
-| P4 JointPlan shadow | CPU 修复完成，GPU 复验待执行 | visible ticket、无 reservation restore、增量 Page/RCCG journal、lossless-coalescing worker mirror、root-workflow 公平快照、per-action current-state validation、anytime best-prefix、分阶段 planner budget、增量 bundle/lease/closure rebuild、bounded snapshot/audit、native DMA telemetry、locked-but-not-served observer、activation wall-clock guard；Host pool 默认扩到 96 GB，Host 生命周期含 terminal cleanup、Host-copy eviction 与容量饱和淘汰 | 真实 GPU safe-point/stale/coverage/终止性、Host 字节一致性和 lock-service 归因覆盖率复验；run-to-yield 留到 P5 |
-| P5 Online observed JointPlan | P5A--P5C CPU/接口完成，默认关闭 | observed active-set ordering、active-KV high-watermark、lock-provenance blocker-set retraction，以及 `RETRACT -> physical OFFLOAD/DROP -> ACK -> replacement ticket` 跨 epoch 事务 | 真实 GPU correctness/performance gate；更广泛的 ExecutionIntent 与 cyclic-peer hysteresis |
+| P4 JointPlan shadow | CPU 修复完成，GPU 复验待执行 | visible ticket、无 reservation restore、增量 Page/RCCG journal、lossless-coalescing worker mirror、root-workflow 公平快照、per-action current-state validation、anytime best-prefix、分阶段 planner budget、增量 bundle/lease/closure rebuild、bounded snapshot/audit、native DMA telemetry、locked-but-not-served observer、workflow absolute deadline；Host pool 默认扩到 96 GB，Host 生命周期含 terminal cleanup、Host-copy eviction 与容量饱和淘汰 | 真实 GPU safe-point/stale/coverage/终止性、Host 字节一致性和 lock-service 归因覆盖率复验；run-to-yield 留到 P5 |
+| P5 Online observed JointPlan | P5G system correctness gate 通过，接口可冻结 | semantic/physical 两阶段 planner、统一 anytime modes、显式 RetractionIntent、持久 restore debt；`APPLY_EVENTS -> CAPTURE_AND_PLAN -> TRANSACTIONAL_COMMIT`、epoch 内惰性单快照、commit read-set 复验、typed enqueue/canonical ACK 多订阅、ExternalProgressToken、prepare/rollback 和 exclusive restore authority；确定性 micro-gate 完成 4.40 GiB D2H/H2D；autonomous w4 完成 4/4 system JCT、一次生产 retraction/restore/service 闭环与 ACK/shutdown 守恒；无效 overlap barrier 从 493 request/drain 降为 1/1 有效事务 | P6 物理动作开放前补短时 w8 smoke；agent-native clean JCT 0/4 和工具恢复质量单独处理，不回滚 P5 架构 |
 | P5.5 Action-unlock gate | 未执行 | observer 基础存在 | 相对 B0/O1/O2 的真实 coverage/gap |
-| P6 Predictive JointPlan | 未实现 | 旧 remaining-time predictor 可复用 | Unlock/Reentry hazard、scenario calibration、在线 gate |
+| P6 Predictive JointPlan | P5G system gate 后可恢复训练前开发，预测性物理动作仍关闭 | closure-complete scope、global scenario/OTHER、finite horizon、P5E revision、ActionGroup、离线 A0/PREPARE/PREFETCH risk selector、第一轮固定 trace coverage | 补 service/external model、rollout cache、predict-plan shadow；短时 w8 correctness smoke 后再开放在线物理动作 |
 | P7 New HiCache portability | 未实现 | 固定旧版本 contract | 新版 adapter 与能力协商 |
 | P8 Deferred competitors | 未执行 | related-work 与通用 trace contract 已建立 | 按稳定接口实现 metadata 分层、same-data-plane 与原生系统公平对比 |
 
 ## 12. 已有真实证据
 
 ### 12.1 当前代码测试
+
+2026-07-31 P5G transactional restore 修复后执行完整 CPU 回归：
+
+```text
+conda run -n beliefkv pytest -q
+493 passed, 10 skipped, 3 subtests passed
+```
+
+该结果覆盖 P6 训练前契约，并新增 P5G 惰性 physical snapshot、epoch 阶段转换、commit read-set
+复验、request ID 重用、native/explicit operation 变化、typed enqueue/canonical ACK 多订阅、
+ExternalProgressToken、RestoreTransaction 和 exclusive authority 故障注入；不代表 P5G GPU
+clean-completion、预测模型或性能已验证。
 
 2026-07-22 对当前工作区执行：
 
@@ -640,7 +816,8 @@ SGLang `PrefillAdder` 的原生 token、slot 和 allocator 校验。若 running 
 frontier round、等待时间和增量 KV；不预测 tool duration、下一 agent 或剩余 workflow。公平是
 软排序，同一 workflow 可在一个 epoch 获得多个 ticket。无 metadata request 完全绕过该 gate；
 `WAIT_RESTORE`、terminal 和 transition-open 继续由 side state fail closed。active-set 计算异常时
-审计 `observed_admission_fallback` 并回退原 reactive compiler，显式 blocker 不被解除。
+审计 `observed_admission_fallback`。在独立 P5A 模式可回退原 reactive compiler；启用统一 P5
+JointPlan 时只能回退同一 planner 的 bounded/emergency epoch，显式 blocker 不被解除。
 
 配置项为 `observed_admission_scheduling_enabled`、
 `observed_admission_active_kv_high_watermark_ratio` 和
@@ -706,7 +883,161 @@ unconstrained upper bound，安全点选出 plan 后记录 selected-set preview�
 admission 或迁移事务；汇总记录 reason/exactness 和计算开销 P50/P95/P99。全量 CPU 回归为
 `403 passed, 7 skipped`，GPU 外部有效性尚未验证。
 
-## 13. 必须维持的系统不变量
+## 13. P6 训练前实现状态
+
+截至 2026-08-04，P6 已完成 development-only 模型管线和正式数据采集契约，但尚未产生可用于
+论文评价的跨项目 train/calibration 模型，也没有预测动作进入在线 safe point。已经实现的部分为：
+
+```text
+ActionFrontierObserver
+  -> revision + boundary/reentry/demand coverage report
+
+RCCG + P5 active-window seeds + physical blocker sets
+  -> BeliefScopeBuilder
+  -> closure-complete CausalAtom
+  -> included atoms / whole-atom OTHER
+
+RestoreObligation / RestoreLease / RestoreServiceGrace
+  -> PersistentLivenessRevisionTracker
+  -> obligation_revision / lease_revision / grace_revision
+
+FrontierBeliefSnapshot contract
+  -> global joint demand scenarios + OTHER + finite horizon + evidence read set
+
+candidate JointPlan + safe-point physical snapshot
+  -> Radix physicalization + complete batch composition
+  -> conditional service distribution + TimedScenario
+  -> child completion then RCCG JOIN/message resolution
+
+frontier_decision_points + explicit project split
+  -> local conditional Structured Frontier model
+  -> RCCG particle composer
+  -> held-out temperature/conformal calibration
+
+A0/PREPARE_HOST/PREFETCH_GPU offline evaluation
+  -> ScenarioRiskPlanner
+  -> expected benefit + CVaR regret + deterministic/chance/liveness gates
+```
+
+`BeliefScopeBuilder` 的预算限制原子组数量和估计建模成本，不限制 invocation 数组长度。JOIN 的全部
+未完成成员与 waiter、blocking-child chain、完整 physical blocker set 和已观测 message producer-
+consumer 会先求闭包；超预算时整组进入 OTHER，不能截断后错误声称 parent 即将 unlock。
+
+`policy/online_joint.py` 已定义 `ActionGroup`、dependency DAG、resource certificate、compensation 和
+`ALL_OR_NOTHING/PREFIX_COMMITTABLE`。当前 P5 `ActionSlice` 会生成 dependency-connected group 供审计，
+但 P5 在线执行语义未改变；P6 第一版只允许 `ALL_OR_NOTHING`，且必须在当前 topology/allocator、
+HBM/Host、physical generation 和 P5E revision 上重验整组。
+
+`ScenarioRiskPlanner` 当前是离线纯函数，不模拟完整 RCCG，也不发送命令。候选动作仅包括
+`PREPARE_HOST/PREFETCH_GPU`；predictive retraction、run quantum、COMMIT_CPU、DROP/RECOMPUTE 均未
+实现。
+
+2026-08-01 使用通过 P5 system gate 的固定 autonomous w4 完成第二轮 P6.0：575/575 request 通过
+native request/workflow/invocation 严格关联，ordinal fallback 已删除；575/575 request 同时具有
+prefill/decode service，45,201 个 batch sample 展开为 108,344 个 request interval；600 个 external
+wait、5 个完整 JOIN 和 1,535 个条件字段完整的 transfer operation 已导出。exact incremental action
+boundary 仍为 0/575，故只允许训练 remaining-decode-demand fallback；reentry 为 539/559，20 个缺失 action
+没有逐 call suppression/censor event；direct DMA timestamp 为 0/1,535，只能建模 submit-to-complete。
+全部数据来自 SymPy，当前只可用于 schema/训练代码开发。完整报告见
+`docs/experiments/beliefkv_p6_0_autonomous_w4_training_evidence_2026-08-01_zh.md`。
+
+2026-08-03 已补 `CALL_CENSORED` 逐调用事件，duplicate suppression、LLM timeout/abort 等携带
+request/tool-call 和 invocation identity，不再从 aggregate count 反推。decision schema v2、数据导出
+schema v3 新增事件
+采样的 `frontier_decision_points.jsonl` 与 `censor_events.jsonl`；采样只发生在 LLM/tool/runtime
+transition、每 32 decode token、HBM threshold crossing 和有 owner 的 transfer completion。
+
+显式 split manifest 已按 project 冻结：SymPy 整体为 development-only，其余 SWE-bench Verified
+项目按 train/calibration/test-ID 隔离，同一 repository/task/base commit/重复 rollout 不跨 split。
+`configs/p6/collection_v3/collection_plan.json` 固定 65 个唯一任务、91 个 workflow、11 个 repository，
+predictor 和 predictive action 均关闭；calibration/test batch 默认由 runner 封存，必须显式授权。
+
+`Structured Conditional Particle Model` 已实现 variable-order boundary context tree、tool competing-risk、
+log-binned decode/output/prompt demand distribution。RCCG composer 只保留 closure-complete JOIN/member、
+producer 和 blocking-chain 依赖，不再对 raw demand 计算 JOIN max/min。W4 的 decision point
+仅生成 development model，用于序列化 sanity check；它不参与最终模型选择或结果报告。正式 fit 先在
+local episode 内归一化，再在同一 workflow rollout 的 episode 间归一化，避免长 workflow 以采样次数
+获得更大权重。calibration 只学习 boundary/tool temperature 和按 local
+episode 最大 nonconformity 的 split-conformal interval，不重拟合 train counts；离线评价输出 NLL、
+Brier、ECE、区间覆盖/宽度和 OOD fallback。下一项工作是完成分批跨项目 train 数据采集、独立硬件
+service curve 和一种 non-coding OOD workload，再执行 calibration/test。
+
+首个 `p6-009-train-mixed-r0` 采集尝试已被标记为 development diagnostic，不能进入正式 fit。该轮
+8/8 workflow 虽完成并产生 820 次 LLM、1,108 次工具调用和 12,796 个 decision point，但默认的两次
+correctness repair 在模型已经提交有效 `WorkflowCompletion` 后继续启动独立 LLM repair agent，使
+采集时长和状态分布不再代表原始 agent workflow；另有两条 runtime event 因 1 秒 ACK 窗口未及时
+确认。修复后的正式 collector 使用 model-terminal semantics、关闭 harness LLM repair、将 event ACK
+窗口设为 10 秒，并在 batch 前后校验 runtime source fingerprint。无效 run 的 manifest 被强制标记
+`formal_training_eligible=false`，全部样本降为 `development`；fit/calibration/test loader 同时拒绝
+无效 run、重复 run 和重复 decision，防止静默数据泄漏或重复计权。
+
+第二次完整采集尝试进一步发现 autonomous `create_deep_agent()` 路径没有安装 BeliefKV 的
+`ContextLifecycleMiddleware`：7/8 workflow 已完成，但最后一个 child 在持续获得 GPU service 的同时
+增长到约 66.8K sequence token，超过预定的 32K dynamic-history 生命周期，因此整轮以
+`COLLECTION_INVALID.json` 作废。修复后 autonomous runtime 不再叠加 Deep Agents 默认 170K summarizer，
+而是显式构造等价的 filesystem/execute/task/todo/patch-call 栈；parent 和四类 child 各持有独立的
+32K/retain-8K lifecycle，child 返回时剥离 `_summarization_event`，正式 collector 的普通与终态输出
+预算均为 4096，summary 为 2048。CPU/graph 回归通过；后续 startup failure 的原因分别包括外部 GPU
+占用、GPU1 上异常大的权重 footprint 导致无 KV pool，以及旧 frontend 残留占用 18000 端口，均未
+提交 workload、不构成正式数据。旧 frontend/scheduler 的受控关闭路径已经补充 PID start-time 校验和
+显式 scheduler 退出等待。导出器现统一拒绝
+`PILOT_INVALID.json`、`COLLECTION_INVALID.json` 和 `STARTUP_FAILED.json`。
+
+使用旧的 development-only diagnostic 数据重新执行了训练/序列化 sanity：12,796 个 event-sampled
+decision point、828 个 request/runtime episode、959 个 local episode 均可拟合并写入
+`training_summary`，模型 metadata 明确为 `development_only=true`。这不是正式训练；只有完成至少
+两个 train project（当前顺序为 `p6-009` 后接 `p6-010`）后才允许执行 project-macro LOPO。
+
+2026-08-04 的 image-identity 复核发现旧 `p6-009-train-mixed-r0/20260803T100537Z` 可能按
+repository/version 复用错误的 SWE-bench task image。raw run 与历史报告保留供审计，但两个 processed
+dataset manifest 均已强制为 `formal_training_eligible=false`，正式 loader 会拒绝它。
+
+当前可接受的 local-label evidence 包括 `p6-010` GPU0 的四个 workflow、`p6-012` GPU1 的八个
+workflow，以及对 `p6-010`/`p6-011` 失败任务的两次独立定向复跑，共 11,491 个 fit-eligible decision
+point、5 个项目、14 个不同任务、14 个 rollout 来源。其中 requests recovery 仅保留首次 runtime 干预前
+且 horizon 不跨界的局部标签，不能用于 JCT、终态或完整轨迹。原始 `p6-011` shard 中一个 workflow 将输入
+膨胀到约 812K token，超过 262K 服务端窗口，仍只按 `development_diagnostic` 导出；修复后复跑是
+source fingerprint 稳定的独立正式数据源。正式 fit 的 provenance gate 排除所有固定 P5 w4 和无效
+collection；diversity gate 另要求至少 5 个项目、40 个不同任务和 40 个 workflow。当前训练命令按预期以
+`task_count=14<40, workflow_count=14<40` 拒绝执行，因此尚无正式 Frontier 模型。40/40 只是最小防误
+训练门槛，论文级 fit 目标仍为全部 7 个 train project 上 80--120 个 workflow，并使用封存的
+calibration/test project 评价泛化。完整收尾见
+`docs/experiments/beliefkv_p6_multproject_collection_2026-08-04_zh.md`。
+
+失败任务修复新增三条数据边界：每轮工具 observation 总量受版本化预算约束，避免并行工具结果把单次
+prompt 推到服务端窗口之外；当前 LangGraph 以 384-step 记录 telemetry，512-step 为硬保险丝；
+repository/image-specific preflight 在 agent 启动前验证测试依赖、pytest plugin 与 fixture。
+runtime 首次注入
+loop-guard、graph-budget 或 terminal-repair prompt 之后及跨越该时刻的 decision point 会保留供审计，
+但标记为 `training_eligible=false`，防止 Frontier 模型学习 runtime 干预后的特殊行为。定向复跑分别
+保留 65 和 402 条自然 decision point。
+
+train-project 内的超参数选择已实现为 leave-one-project-out（LOPO）：每个 project 等权，目标由可用的
+boundary/tool NLL、按 held-out project 中位目标尺度归一化的连续值 MAE 和 OOD fallback 惩罚组成。
+selection manifest 必须与最终 fit 的 project 集合完全一致；它只选择同一结构化模型的 context order、
+minimum support 和 smoothing，不新增 predictor 或动作决策源。
+
+硬件服务模型已与 agent 语义模型分离。`run_queue_service_calibration.py` 覆盖 prompt 1K/4K/16K/约
+32K、cache hit 0/0.5/0.9 和 batch 1/2/4/8/16；导出器按唯一 `sample_id` 将 tagged case 还原为完整 batch，
+记录每个 request 的 token delta、sequence length、cache hit，以及 chunk/mixing/PCIe/HiCache 条件。
+`GPUServiceCurveModel` 只接受 `controlled_microbenchmark` batch 行并输出 P50/P90/P95；agent runtime
+overlap interval 标记为 `runtime_validation`，只能评估，不能进入 fit。client elapsed 和逐 request 复制的
+batch elapsed 均不能作为 GPU service 标签。PCIe 继续使用 direction、bytes、extent/page count、Host
+pinned/copy 状态、command kind、native HiCache contention、allocator 和 callback 分段字段。
+
+Frontier 正式 loader 对顶层 `batch_size/elapsed_gpu_service_ms/observed_gpu_service_ms` 和旧
+`remaining_gpu_service_ms/next_gpu_service_ms` fail-closed；共享 batch elapsed 只能放在 `diagnostics`。
+runtime 的 `LLM_SUBMIT` 记录消息、工具 schema、模型采样配置的 `prompt_semantic_sha256` 与独立
+`sampling_seed`。`audit_p6_load_invariance.py` 可在 w1/w4/w8 间按相同语义 prompt、seed 和重复 occurrence
+配对；没有显式 seed 的结果只作 diagnostic，不能声称 demand 已与负载解耦。该审计只检验标签污染，
+不会把 message race、JOIN_ANY winner 或 timeout 导致的真实调度因果差异强行消除。
+
+`TimedScenario` 将 dependency release 与 invocation completion 分开：child 的 candidate-specific GPU
+completion 先解析 JOIN reentry，parent 后续 prefill/decode 还必须等待候选 H2D completion 和 batch
+service。这样 JOIN 只对完成时刻取 max/min，不会对 raw token demand 取 max/min，也不会把 parent
+恢复时刻误写成 parent 最终完成时刻。
+
+## 14. 必须维持的系统不变量
 
 1. RCCG 只保存已观测因果事实，不拥有或释放物理 KV。
 2. causal edge、consumer edge 和 physical prefix owner 必须分开维护。
@@ -719,44 +1050,75 @@ admission 或迁移事务；汇总记录 reason/exactness 和计算开销 P50/P9
 9. ACK 前不提交 residency；telemetry 不能替代 correctness ACK。
 10. online policy 不能读取 hindsight metadata；B0 replay 保持 shadow-only。
 11. 未创建的预测 agent/request 不能被实际调度或获得物理资源。
-12. predictor/OOD 失败必须退化到 observed reactive 路径，而不是破坏 liveness。
+12. predictor/OOD 失败必须退化到 observed-state JointPlan，而不是切换到第二策略源或破坏 liveness。
 13. 无 `beliefkv_metadata` 的请求必须保持上游 SGLang 行为。
 14. cache reset 和 abort 必须先清理 in-flight bookkeeping，再失效 page handle。
 15. BeliefKV command telemetry 与 native HiCache operation telemetry 必须分源记录并统一计费；
     command integrity 通过不能替代全系统 DMA coverage。
+16. 每笔 committed running retraction 必须对应持久 restore obligation；普通 waiting request 的
+    matched Radix path 一旦出现 CPU-only extent，也必须创建 obligation 或记录明确的 obligation
+    capacity blocker。任何非终态 obligation 必须具有 in-flight H2D、已提交的 D2H funding、带状态
+    stamp 的具名 blocker 或可发放 ticket，禁止无 durable debt/blocker 的 `WAIT_RESTORE`。
+17. `_active_request_ids` 不得作为物理 ownership；`ENGINE_BUSY` 必须来自 safe-point physical
+    snapshot 中的 req-pool/lock/native-load/explicit-transfer 事实。
+18. guard 与 command ownership preflight 必须早于 allocator reservation；一次 canonical command
+    的 terminal ACK 必须通知所有 restore subscribers。
+19. `RESTORE_DRAIN_ACTIVE` 期间 coordinator 是唯一 admission/residency authority，普通 JointPlan
+    不得提交在线动作。
 
-## 14. 当前关键缺口与优先级
+## 15. 当前关键缺口与优先级
 
 建议下一阶段按以下顺序推进：
 
-当前主路径是尽快闭合 P5A--P5C 的端到端 GPU correctness、控制开销和基本性能采样，先得到一套
-可完整运行的 BeliefKV。运行时同步采集 GPU-ready concurrency、locked-but-not-served HBM-time、
-admission wait、blocker-set、preview/realized reclaim 和 recompute 成本；不把复杂 O0-O3 动态模拟
-或外部 baseline 适配作为完整系统搭建的前置条件。P5A 只是 active-set baseline/minor mechanism，
-P5B/P5C 的 causal replacement + physical blocker-set 事务能否成为核心贡献由后续证据决定。
+P5G full CPU gate 已完成。旧固定 w4 的失败被拆成两个独立问题：人工 peer orchestration 的
+self-handoff/终态语义，以及没有覆盖 restore 事务的 workload 偶然性。当前主 gate 已改为原生
+Deep Agents autonomous root 与 runtime 动态 FRESH subagent；`system_jct_eligible`、
+`native_agent_jct_eligible` 和 SWE-bench task correctness 分开报告。可选 peer self-continuation 不再
+伪造 HANDOFF。scheduler shutdown 现在使用 PID start-time 校验、事务 drain、最终 summary 和显式
+ACK；abort/finish checkpoint 通过 tombstone 保留物理起点。ownership snapshot 仍只在需要物理状态的
+safe-point epoch 内惰性构建一次，不按 scheduler tick 无条件构建。确定性 restore micro-gate 已在
+代码中完成：专用 victim 必须先获得真实 GPU service，测试 retraction 与 replacement admission 位于
+同一原子 ActionGroup，后续完全复用生产 D2H/obligation/H2D/admission/service-grace 状态机。修复后的
+test-only pair barrier 已在 `2 running / 1 waiting` 下通过 GPU gate：一次事务完成 4.40 GiB D2H 与
+等量 H2D，obligation 在 shutdown 前 SATISFIED，restore 后真实 decode service 可观测，physical
+snapshot/read-set 与 command/ACK 守恒均通过。随后修复将 restore authority、overdue restore debt 和
+test-only private-KV readiness 检查前移到 barrier request 之前。2026-08-01 单次 autonomous w4
+`experiments/raw/p5g_autonomous_w4/20260801T115617Z` 完成 4/4 `system_jct_eligible`，只发生 1 次
+barrier request/drain，且该次创建有效 retraction；68 次 active restore debt 候选在 drain 前被抑制。
+一次 6,396,641,280-byte restore obligation 在 4.81 秒后因真实 GPU service 进入 SATISFIED；shutdown
+前 command/ACK、lease、funding、pin、transaction、allocator 与 Host page index 全部守恒。因此 P5
+system correctness gate 已关闭，接口可以冻结，P6 预测性物理动作仍保持关闭直到短时 w8 smoke。
+本轮 0/4 `native_agent_jct_eligible` 与 2/4 task measurement valid 单独归因于工具错误和 runtime guard，
+不用于性能/JCT 结论。完整报告见
+`docs/experiments/beliefkv_p5g_autonomous_w4_system_gate_2026-08-01_zh.md`。
 
-1. **闭合 P4/P5 在线 gate**：继续优化 snapshot/planner/validation budget 和 workload 终止性，
-   完成 P5A--P5C 的真实 GPU correctness、控制开销和基本性能运行。完整 JointPlan 若最终无法满足
-   critical-path overhead、freshness 和 actionable coverage，再收敛为 Local Frontier JointPlan，
-   不通过持续放宽 TTL 掩盖失败。
-2. **验证 native HiCache telemetry**：request-admission demand-load 和 native write-back 的回调、
-   与 BeliefKV command DMA 去重及完整 HBM/Host/PCIe timeline 已实现并通过定向 CPU 测试；下一次
-   固定 GPU gate 验证真实 callback coverage。资源图已将误导性的 `Protected` 改为
+1. **冻结 P5 接口并推进 P6 标签**：P5G system correctness gate 已通过；后续只修 correctness bug，
+   不再改变 P5 架构。继续区分 incremental action boundary、runtime transition boundary
+   和 reentry boundary。当前 remaining-decode-demand 标签可用，但 exact incremental action boundary 为 0%；
+   它需要在线增量 parser 或原始 token 的可靠离线 parser replay，不能由 SPAWN/RETURN/JOIN runtime
+   事件代替。
+2. **执行短时 w8 correctness smoke**：只验证超过 12 个可见 request 时的 ownership transition、
+   request ID 重用和并发 native operation；不做性能比较。通过前预测模块只输出 offline/shadow
+   `would_prepare/would_prefetch`，不得发送预测性物理动作。
+3. **继续验证 native HiCache telemetry**：request-admission demand-load、native write-back 与 BeliefKV
+   command DMA 去重已在 autonomous w4 覆盖 1,535 条物理 telemetry。资源图已将误导性的 `Protected` 改为
    `Untracked allocator delta`，并增加 engine-locked、closure-blocked、migratable 和
    dual-resident physical KV。
-3. **修复复合事件可见性**：同一 runtime step 的 join/target-create/handoff 原子交付；无法
+4. **修复复合事件可见性**：同一 runtime step 的 join/target-create/handoff 原子交付；无法
    原子交付时标记 transition-open，禁止 transient READY 触发不可撤销 prefetch。
-4. **闭合可终止的动态 workload**：保留 blocking、cyclic peer 和 mixed 结构，为单次 activation
+5. **闭合可终止的动态 workload**：保留 blocking、cyclic peer 和 mixed 结构，为单次 activation
    加入语义完成与墙钟/调用预算，使正式 GPU run 能产生可解释的 RETURN/JOIN 和 JCT。
-5. **闭合 P2 性能 gate**：使用同 manifest 重跑 P1.5/P2，补 controller timing 和更保守的
+6. **闭合 P2 性能 gate**：使用同 manifest 重跑 P1.5/P2，补 controller timing 和更保守的
    transfer service curve。
-6. **采集局部 Jointness Audit**：只在真实 trace 中出现多个 READY agent、HBM/PCIe pressure 和
+7. **采集局部 Jointness Audit**：只在真实 trace 中出现多个 READY agent、HBM/PCIe pressure 和
    可选 physical action 的决策点保存短窗口快照；统计 execution/KV 双向决策反转和 local synergy。
    语义分支不可识别的样本明确排除，不要求现在运行完整动态 O0-O3 模拟。
-7. **后置 rolling replay 深化**：系统路径稳定后再按 overlap episode 重建 GPU service model，
+8. **后置 rolling replay 深化**：系统路径稳定后再按 overlap episode 重建 GPU service model，
    对齐真实 page/node extent、PCIe、request-private allocation 和 fairness；它不阻塞 P5 完整实现。
-8. **只在 P5.5 成立后扩展 P6 predictor**：否则保留 observed JointPlan，不强行增加预测故事。
-9. **最后做新版 HiCache 和 P8 竞品对比**：系统和 workload 冻结后，再按真实 metadata
+9. **先做 P6.3 offline risk gate**：只比较 A0、PREPARE_HOST、PREFETCH_GPU，满足发布年龄、CVaR、
+   stale 和开销门槛后才进入 runtime shadow；shadow 只记录 `would_prepare/would_prefetch`，不发送
+   真实传输。开放预测性物理动作前运行一次短时 w8 correctness smoke；w24/w32 留到功能冻结后。
+10. **最后做新版 HiCache 和 P8 竞品对比**：系统和 workload 冻结后，再按真实 metadata
    条件实现有效 adaptation、oracle 与可运行原生系统。
 
 当前最重要的研究问题已经不是“是否能迁移 KV”，而是：
@@ -768,7 +1130,7 @@ P5B/P5C 的 causal replacement + physical blocker-set 事务能否成为核心�
 sliding-window、长度限制和物理 KV eviction，不提供 agent-aware 自动压缩；BeliefKV serving 层
 只负责 context-growth admission 与到 yield/terminal 边界的调度。
 
-## 15. 文档权威顺序
+## 16. 文档权威顺序
 
 建议按以下顺序理解当前版本：
 

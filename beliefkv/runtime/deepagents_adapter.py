@@ -5,8 +5,10 @@ import json
 import threading
 import time
 import urllib.request
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 from uuid import UUID
 
 from langchain_core.callbacks import BaseCallbackHandler
@@ -22,9 +24,11 @@ from beliefkv.core.events import (
     RuntimeEvent,
     RuntimeEventKind,
 )
+from beliefkv.runtime.agent_safety import classify_tool_outcome
 from beliefkv.predictor.taxonomy import ToolTaxonomy
 from beliefkv.runtime.agent_runtime_adapter import RuntimeEventSink
 from beliefkv.runtime.action_frontier import StructuredActionKind
+from beliefkv.runtime.context_lifecycle import ContextCompactionRecord
 from beliefkv.runtime.sglang_adapter import BeliefKVRequestMetadata
 
 
@@ -40,8 +44,75 @@ def _json_stats(value: Any) -> tuple[int, str]:
     return len(encoded), hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _prompt_semantic_digest(
+    messages: Sequence[BaseMessage],
+    invocation_params: Mapping[str, Any] | None = None,
+) -> str:
+    message_payload = []
+    for message in messages:
+        tool_calls = []
+        for call in getattr(message, "tool_calls", ()):
+            if isinstance(call, Mapping):
+                tool_calls.append(
+                    {
+                        "name": call.get("name"),
+                        "args": call.get("args"),
+                    }
+                )
+        message_payload.append(
+            {
+                "type": getattr(message, "type", type(message).__name__),
+                "name": getattr(message, "name", None),
+                "content": getattr(message, "content", None),
+                "tool_calls": tool_calls,
+                "status": getattr(message, "status", None),
+            }
+        )
+    invocation_params = invocation_params or {}
+    payload = {
+        "messages": message_payload,
+        "model_contract": {
+            key: invocation_params.get(key)
+            for key in (
+                "model",
+                "model_name",
+                "tools",
+                "functions",
+                "tool_choice",
+                "response_format",
+                "temperature",
+                "top_p",
+                "stop",
+                "max_tokens",
+                "max_completion_tokens",
+            )
+            if invocation_params.get(key) is not None
+        },
+    }
+    _, digest = _json_stats(payload)
+    return digest
+
+
 def _run_key(run_id: UUID | str | None) -> str | None:
     return str(run_id) if run_id is not None else None
+
+
+def _native_request_id(run_id: UUID | str) -> str:
+    """Return the request identity carried through the OpenAI-compatible API."""
+
+    return f"beliefkv:{run_id}"
+
+
+def _error_censor_reason(error: BaseException) -> str:
+    name = type(error).__name__.lower()
+    message = str(error).lower()
+    if "recursion" in name or "recursion" in message:
+        return "recursion_limit"
+    if "timeout" in name or "timed out" in message or "deadline" in message:
+        return "timeout"
+    if "cancel" in name or "cancel" in message or "abort" in message:
+        return "cancelled"
+    return "backend_error"
 
 
 @dataclass(frozen=True)
@@ -83,8 +154,27 @@ class RuntimeControlDeliveryFailure:
     error: str
 
 
+@dataclass(frozen=True)
+class _OrdinaryToolRun:
+    invocation_id: str
+    tool_name: str
+    start_ts_ms: float
+    tool_call_id: str
+    payload: Mapping[str, Any]
+    workspace_digest_before: str | None
+
+
+@dataclass(frozen=True)
+class _InternalSummaryRun:
+    parent_invocation_id: str
+    invocation_id: str
+    context_id: str
+
+
 class RequestDeadline(Protocol):
     def request_timeout_s(self, cap_s: float) -> float: ...
+
+    def remaining_s(self) -> float | None: ...
 
 
 class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
@@ -111,6 +201,9 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
             {"ChildCompletion", "WorkflowCompletion", "DelegationPlan"}
         ),
         allowed_subagent_types: frozenset[str] | None = None,
+        workspace_digest_provider: (
+            Callable[[str, Mapping[str, Any]], str | None] | None
+        ) = None,
     ) -> None:
         super().__init__()
         if root_metadata.relation_type != RelationType.ROOT.value:
@@ -124,6 +217,7 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
         self.event_namespace = event_namespace
         self.completion_tool_names = completion_tool_names
         self.allowed_subagent_types = allowed_subagent_types
+        self.workspace_digest_provider = workspace_digest_provider
         self._lock = threading.RLock()
         self._sequence = 0
         self._last_ts_ms = 0.0
@@ -142,8 +236,16 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
         self._join_members: dict[str, set[str]] = {}
         self._join_completed: dict[str, set[str]] = {}
         self._join_cancelled: dict[str, set[str]] = {}
-        self._ordinary_tools: dict[str, tuple[str, str, float, str]] = {}
+        self._ordinary_tools: dict[str, _OrdinaryToolRun] = {}
         self._ignored_tool_runs: set[str] = set()
+        self._internal_summary_runs: dict[str, _InternalSummaryRun] = {}
+        self._summary_sequence = 0
+        self._pending_context_compaction: ContextVar[
+            ContextCompactionRecord | None
+        ] = ContextVar(
+            f"beliefkv_context_compaction_{id(self)}",
+            default=None,
+        )
         self._taxonomy = ToolTaxonomy()
         self._control_delivery_failure_count = 0
         self._first_control_delivery_failure: RuntimeControlDeliveryFailure | None = None
@@ -273,6 +375,56 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
             error=error,
         )
 
+    def cancel_pending_tasks(self, *, reason: str) -> int:
+        """Terminate every declared child that has not produced a RETURN."""
+
+        with self._lock:
+            pending_ids = [
+                tool_call_id
+                for tool_call_id, pending in self._pending_tasks.items()
+                if not pending.terminal
+            ]
+        for tool_call_id in pending_ids:
+            self._complete_task(
+                tool_call_id,
+                cancelled=True,
+                error=TimeoutError(reason),
+            )
+        return len(pending_ids)
+
+    def record_call_censor(self, fields: Mapping[str, Any]) -> None:
+        """Publish an identity-bearing censor label for non-executed runtime work."""
+
+        invocation_id = str(
+            fields.get("invocation_id") or self.root_metadata.invocation_id
+        )
+        with self._lock:
+            identity = self._identities.get(invocation_id)
+            if identity is None:
+                invocation_id = self.root_metadata.invocation_id
+                identity = self._identities[invocation_id]
+            context_id = identity.metadata.context_id
+            context_epoch = self._model_epochs.get(
+                invocation_id, identity.metadata.context_epoch
+            )
+        attributes = dict(fields)
+        attributes["invocation_identity_fallback"] = (
+            str(fields.get("invocation_id") or "") != invocation_id
+        )
+        self._publish(
+            (
+                self._event(
+                    RuntimeEventKind.CALL_CENSORED,
+                    invocation_id=invocation_id,
+                    context_id=context_id,
+                    context_epoch=context_epoch,
+                    confidence=EventConfidence.OBSERVED_EXACT,
+                    attributes=attributes,
+                ),
+            ),
+            control=False,
+        )
+
     def metadata_for_model_run(self, run_id: UUID | str) -> BeliefKVRequestMetadata:
         key = _run_key(run_id)
         assert key is not None
@@ -293,6 +445,120 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
             if identity is None:
                 raise ValueError(f"unknown invocation: {target}")
             return self._model_epochs.get(target, identity.metadata.context_epoch)
+
+    @contextmanager
+    def stage_context_compaction(
+        self, record: ContextCompactionRecord
+    ) -> Iterator[None]:
+        """Bind one compaction to the next non-summary model submission."""
+
+        if self._pending_context_compaction.get() is not None:
+            raise RuntimeError("nested context compaction is not supported")
+        token = self._pending_context_compaction.set(record)
+        try:
+            yield
+        finally:
+            self._pending_context_compaction.reset(token)
+
+    def _begin_internal_summary(self, model_run_key: str) -> BeliefKVRequestMetadata:
+        parent_invocation_id = self._resolve_invocation(model_run_key)
+        with self._lock:
+            parent = self._identities[parent_invocation_id].metadata
+            self._summary_sequence += 1
+            suffix = f"{self._summary_sequence:06d}"
+            invocation_id = f"{parent_invocation_id}:context-summary:{suffix}"
+            context_id = f"{parent.context_id}:context-summary:{suffix}"
+            metadata = BeliefKVRequestMetadata(
+                root_workflow_id=parent.root_workflow_id,
+                invocation_id=invocation_id,
+                context_id=context_id,
+                context_epoch=0,
+                agent_definition_id="context-summarizer",
+                agent_instance_id=invocation_id,
+                parent_invocation_id=parent_invocation_id,
+                parent_context_id=parent.context_id,
+                relation_type=RelationType.CALL.value,
+                context_mode=ContextMode.FRESH.value,
+                execution_mode=ExecutionMode.FOREGROUND.value,
+                return_target_id=parent_invocation_id,
+            )
+            self._identities[invocation_id] = _InvocationIdentity(metadata)
+            self._run_invocation[model_run_key] = invocation_id
+            self._model_metadata[model_run_key] = metadata
+            self._model_epochs[invocation_id] = 0
+            self._internal_summary_runs[model_run_key] = _InternalSummaryRun(
+                parent_invocation_id=parent_invocation_id,
+                invocation_id=invocation_id,
+                context_id=context_id,
+            )
+        ts_ms = self._timestamp()
+        self._publish(
+            (
+                self._event(
+                    RuntimeEventKind.INVOCATION_CREATE,
+                    ts_ms=ts_ms,
+                    invocation_id=invocation_id,
+                    context_id=context_id,
+                    context_epoch=0,
+                    agent_definition_id="context-summarizer",
+                    agent_instance_id=invocation_id,
+                    parent_invocation_id=parent_invocation_id,
+                    parent_context_id=parent.context_id,
+                    relation_type=RelationType.CALL,
+                    context_mode=ContextMode.FRESH,
+                    execution_mode=ExecutionMode.FOREGROUND,
+                    return_target_id=parent_invocation_id,
+                    attributes={
+                        "persistent": False,
+                        "runtime_internal": True,
+                        "source": "deepagents_summarization",
+                    },
+                ),
+                self._event(
+                    RuntimeEventKind.CALL,
+                    ts_ms=ts_ms,
+                    invocation_id=parent_invocation_id,
+                    target_invocation_id=invocation_id,
+                    execution_mode=ExecutionMode.FOREGROUND,
+                    return_target_id=parent_invocation_id,
+                    attributes={
+                        "runtime_internal": True,
+                        "source": "deepagents_summarization",
+                    },
+                ),
+            ),
+            control=True,
+        )
+        return metadata
+
+    def _finish_internal_summary(
+        self, model_run_key: str, *, error: BaseException | None
+    ) -> bool:
+        with self._lock:
+            active = self._internal_summary_runs.pop(model_run_key, None)
+        if active is None:
+            return False
+        self._publish(
+            (
+                self._event(
+                    (
+                        RuntimeEventKind.INVOCATION_CANCEL
+                        if error is not None
+                        else RuntimeEventKind.RETURN
+                    ),
+                    invocation_id=active.invocation_id,
+                    context_id=active.context_id,
+                    attributes={
+                        "runtime_internal": True,
+                        "source": "deepagents_summarization",
+                        "outcome": "error" if error is not None else "completed",
+                        "exception_type": type(error).__name__ if error else None,
+                    },
+                ),
+            ),
+            control=True,
+        )
+        return True
 
     def on_chain_start(
         self,
@@ -330,18 +596,65 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
         parent_run_id: UUID | None = None,
         **kwargs: Any,
     ) -> None:
-        del serialized, kwargs
+        del serialized
         key = self._remember_run(run_id, parent_run_id)
-        invocation_id = self._resolve_invocation(key)
-        with self._lock:
-            base = self._identities[invocation_id].metadata
-            epoch = self._model_epochs.get(invocation_id, -1) + 1
-            self._model_epochs[invocation_id] = epoch
-            metadata = replace(base, context_epoch=epoch)
-            self._model_metadata[key] = metadata
-            self._run_invocation[key] = invocation_id
+        callback_metadata = kwargs.get("metadata")
+        is_summary = (
+            isinstance(callback_metadata, Mapping)
+            and callback_metadata.get("lc_source") == "summarization"
+        )
+        if is_summary:
+            metadata = self._begin_internal_summary(key)
+            invocation_id = metadata.invocation_id
+            epoch = metadata.context_epoch
+        else:
+            invocation_id = self._resolve_invocation(key)
+            with self._lock:
+                base = self._identities[invocation_id].metadata
+                previous_epoch = self._model_epochs.get(invocation_id, -1)
+                epoch = previous_epoch + 1
+                self._model_epochs[invocation_id] = epoch
+                metadata = replace(base, context_epoch=epoch)
+                self._model_metadata[key] = metadata
+                self._run_invocation[key] = invocation_id
+            compaction = self._pending_context_compaction.get()
+            if compaction is not None:
+                self._publish(
+                    (
+                        self._event(
+                            RuntimeEventKind.CONTEXT_COMPACT,
+                            invocation_id=invocation_id,
+                            context_id=metadata.context_id,
+                            context_epoch=epoch,
+                            confidence=EventConfidence.OBSERVED_EXACT,
+                            attributes={
+                                "source": "deepagents_summarization",
+                                "previous_context_epoch": previous_epoch,
+                                "source_message_count": (
+                                    compaction.source_message_count
+                                ),
+                                "retained_message_count": (
+                                    compaction.retained_message_count
+                                ),
+                                "summary_chars": compaction.summary_chars,
+                                "summary_sha256": compaction.summary_sha256,
+                                "trigger_tokens": compaction.trigger_tokens,
+                                "keep_tokens": compaction.keep_tokens,
+                                "old_kv_disposition": "release_ownership",
+                            },
+                        ),
+                    ),
+                    control=True,
+                )
+                self._pending_context_compaction.set(None)
         prompt_messages = messages[0] if messages else []
         prompt_chars = sum(len(message.text or "") for message in prompt_messages)
+        invocation_params = kwargs.get("invocation_params")
+        sampling_seed = (
+            invocation_params.get("seed")
+            if isinstance(invocation_params, Mapping)
+            else None
+        )
         event = self._event(
             RuntimeEventKind.LLM_SUBMIT,
             invocation_id=invocation_id,
@@ -350,8 +663,17 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
             confidence=EventConfidence.OBSERVED_EXACT,
             attributes={
                 "source": "deepagents_callback",
+                "runtime_internal": is_summary,
+                "request_id": _native_request_id(run_id),
                 "message_count": len(prompt_messages),
                 "prompt_chars": prompt_chars,
+                "prompt_semantic_sha256": _prompt_semantic_digest(
+                    prompt_messages,
+                    invocation_params
+                    if isinstance(invocation_params, Mapping)
+                    else None,
+                ),
+                "sampling_seed": sampling_seed,
             },
         )
         self._publish((event,), control=False)
@@ -368,10 +690,14 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
         key = self._remember_run(run_id, parent_run_id)
         invocation_id = self._resolve_invocation(key)
         with self._lock:
+            runtime_internal = key in self._internal_summary_runs
             metadata = self._model_metadata.get(key)
             if metadata is None:
                 base = self._identities[invocation_id].metadata
-                metadata = replace(base, context_epoch=self._model_epochs.get(invocation_id, 0))
+                metadata = replace(
+                    base,
+                    context_epoch=self._model_epochs.get(invocation_id, 0),
+                )
         messages = self._response_messages(response)
         output_chars = sum(len(message.text or "") for message in messages)
         tool_calls = [
@@ -421,6 +747,8 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
             confidence=EventConfidence.OBSERVED_EXACT,
             attributes={
                 "source": "deepagents_callback",
+                "runtime_internal": runtime_internal,
+                "request_id": _native_request_id(run_id),
                 "output_chars": output_chars,
                 "output_tokens": output_tokens or None,
                 "tool_call_count": len(tool_calls),
@@ -438,6 +766,8 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
             },
         )
         self._publish((result,), control=False)
+        if self._finish_internal_summary(key, error=None):
+            return
         if executable_task_calls:
             self._declare_task_group(invocation_id, key, executable_task_calls)
 
@@ -453,6 +783,7 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
         key = self._remember_run(run_id, parent_run_id)
         invocation_id = self._resolve_invocation(key)
         with self._lock:
+            runtime_internal = key in self._internal_summary_runs
             metadata = self._model_metadata.get(key)
             context_id = (
                 metadata.context_id
@@ -468,10 +799,24 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
             confidence=EventConfidence.OBSERVED_EXACT,
             attributes={
                 "source": "deepagents_callback",
+                "runtime_internal": runtime_internal,
+                "request_id": _native_request_id(run_id),
                 "exception_type": type(error).__name__,
+                "censored": True,
+                "censor_reason": _error_censor_reason(error),
             },
         )
         self._publish((event,), control=False)
+        self.record_call_censor(
+            {
+                "call_kind": "llm",
+                "censor_reason": _error_censor_reason(error),
+                "request_id": _native_request_id(run_id),
+                "invocation_id": invocation_id,
+                "exception_type": type(error).__name__,
+            }
+        )
+        self._finish_internal_summary(key, error=error)
 
     def on_tool_start(
         self,
@@ -515,12 +860,15 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
         normalized = self._taxonomy.normalize(tool_name)
         input_chars, input_sha256 = _json_stats(payload)
         tool_call_id = str(kwargs.get("tool_call_id") or key)
+        workspace_digest_before = self._workspace_digest(tool_name, payload)
         with self._lock:
-            self._ordinary_tools[key] = (
-                parent_invocation_id,
-                tool_name,
-                ts_ms,
-                tool_call_id,
+            self._ordinary_tools[key] = _OrdinaryToolRun(
+                invocation_id=parent_invocation_id,
+                tool_name=tool_name,
+                start_ts_ms=ts_ms,
+                tool_call_id=tool_call_id,
+                payload=dict(payload),
+                workspace_digest_before=workspace_digest_before,
             )
         event = self._event(
             RuntimeEventKind.TOOL_START,
@@ -535,6 +883,8 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
                 "backend_class": normalized.backend_class,
                 "input_chars": input_chars,
                 "input_sha256": input_sha256,
+                "parameter_signature": input_sha256,
+                "workspace_digest_before": workspace_digest_before,
             },
         )
         self._publish((event,), control=True)
@@ -806,6 +1156,21 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
                     attributes={"source": "deepagents_task"},
                 )
             )
+        elif join_complete and cancelled_members:
+            events.append(
+                self._event(
+                    RuntimeEventKind.JOIN_TIMEOUT,
+                    ts_ms=ts_ms,
+                    join_id=pending.join_id,
+                    member_invocation_ids=tuple(
+                        sorted(self._join_members[pending.join_id])
+                    ),
+                    attributes={
+                        "source": "deepagents_task",
+                        "cancelled_member_count": len(cancelled_members),
+                    },
+                )
+            )
         self._publish(tuple(events), control=True)
 
     def _finish_ordinary_tool(
@@ -819,25 +1184,57 @@ class DeepAgentsRuntimeAdapter(BaseCallbackHandler):
             active = self._ordinary_tools.pop(tool_run_id, None)
         if active is None:
             return
-        invocation_id, tool_name, start_ts_ms, tool_call_id = active
         ts_ms = self._timestamp()
         output_chars, output_sha256 = _json_stats(output)
+        outcome = classify_tool_outcome(
+            output,
+            tool_name=active.tool_name,
+            error=error,
+        )
+        workspace_digest_after = self._workspace_digest(
+            active.tool_name,
+            active.payload,
+        )
         event = self._event(
             RuntimeEventKind.TOOL_END,
             ts_ms=ts_ms,
-            invocation_id=invocation_id,
+            invocation_id=active.invocation_id,
             confidence=EventConfidence.OBSERVED_EXACT,
             attributes={
                 "source": "deepagents_callback",
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "duration_ms": max(0.0, ts_ms - start_ts_ms),
+                "tool_call_id": active.tool_call_id,
+                "tool_name": active.tool_name,
+                "duration_ms": max(0.0, ts_ms - active.start_ts_ms),
                 "output_chars": output_chars,
                 "output_sha256": output_sha256,
                 "exception_type": type(error).__name__ if error else None,
+                "status": outcome.status,
+                "tool_error_class": outcome.error_class,
+                "workspace_digest_before": active.workspace_digest_before,
+                "workspace_digest_after": workspace_digest_after,
+                "workspace_changed": (
+                    active.workspace_digest_before != workspace_digest_after
+                    if active.workspace_digest_before is not None
+                    and workspace_digest_after is not None
+                    else None
+                ),
             },
         )
         self._publish((event,), control=True)
+
+    def _workspace_digest(
+        self,
+        tool_name: str,
+        payload: Mapping[str, Any],
+    ) -> str | None:
+        provider = self.workspace_digest_provider
+        if provider is None:
+            return None
+        try:
+            return provider(tool_name, payload)
+        except Exception:
+            # Observability must never alter the tool result seen by the model.
+            return None
 
     def _remember_run(
         self,
@@ -974,6 +1371,8 @@ class BeliefKVChatOpenAI(ChatOpenAI):
     _activation_deadline: RequestDeadline | None = PrivateAttr(default=None)
     _request_timeout_cap_s: float | None = PrivateAttr(default=None)
     _abort_url: str | None = PrivateAttr(default=None)
+    _active_rids: set[str] = PrivateAttr(default_factory=set)
+    _active_rids_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
 
     def __init__(
         self,
@@ -1002,11 +1401,15 @@ class BeliefKVChatOpenAI(ChatOpenAI):
         rid: str | None = None
         try:
             kwargs, rid = self._with_beliefkv_runtime(run_manager, kwargs)
+            self._track_request(rid)
             return super()._generate(messages, stop, run_manager, **kwargs)
         except BaseException:
             if rid is not None:
                 self._abort_request(rid)
             raise
+        finally:
+            if rid is not None:
+                self._untrack_request(rid)
 
     async def _agenerate(
         self,
@@ -1018,11 +1421,15 @@ class BeliefKVChatOpenAI(ChatOpenAI):
         rid: str | None = None
         try:
             kwargs, rid = self._with_beliefkv_runtime(run_manager, kwargs)
+            self._track_request(rid)
             return await super()._agenerate(messages, stop, run_manager, **kwargs)
         except BaseException:
             if rid is not None:
                 self._abort_request(rid)
             raise
+        finally:
+            if rid is not None:
+                self._untrack_request(rid)
 
     def _with_beliefkv_runtime(
         self,
@@ -1032,7 +1439,12 @@ class BeliefKVChatOpenAI(ChatOpenAI):
         if run_manager is None:
             raise RuntimeError("BeliefKV ChatOpenAI requires a callback run manager")
         metadata = self._beliefkv_adapter.metadata_for_model_run(run_manager.run_id)
-        rid = f"beliefkv:{run_manager.run_id}"
+        if self._request_timeout_cap_s is not None:
+            metadata = replace(
+                metadata,
+                execution_timeout_s=self._request_timeout_cap_s,
+            )
+        rid = _native_request_id(run_manager.run_id)
         extra_body = dict(kwargs.get("extra_body") or {})
         existing = extra_body.get("beliefkv_metadata")
         if existing is not None and existing != metadata.to_wire():
@@ -1043,12 +1455,34 @@ class BeliefKVChatOpenAI(ChatOpenAI):
         extra_body["beliefkv_metadata"] = metadata.to_wire()
         extra_body["rid"] = rid
         request_kwargs = {**kwargs, "extra_body": extra_body}
-        if self._request_timeout_cap_s is not None:
-            timeout_s = self._request_timeout_cap_s
-            if self._activation_deadline is not None:
-                timeout_s = self._activation_deadline.request_timeout_s(timeout_s)
-            request_kwargs["timeout"] = timeout_s
+        if self._activation_deadline is not None:
+            remaining_s = self._activation_deadline.remaining_s()
+            if remaining_s is None:
+                remaining_s = self._request_timeout_cap_s
+            if remaining_s is not None and remaining_s <= 0:
+                self._activation_deadline.request_timeout_s(
+                    self._request_timeout_cap_s or 1.0
+                )
+            if remaining_s is not None:
+                request_kwargs["timeout"] = remaining_s
+        elif self._request_timeout_cap_s is not None:
+            request_kwargs["timeout"] = self._request_timeout_cap_s
         return request_kwargs, rid
+
+    def cancel_active_requests(self) -> int:
+        with self._active_rids_lock:
+            active = tuple(self._active_rids)
+        for rid in active:
+            self._abort_request(rid)
+        return len(active)
+
+    def _track_request(self, rid: str) -> None:
+        with self._active_rids_lock:
+            self._active_rids.add(rid)
+
+    def _untrack_request(self, rid: str) -> None:
+        with self._active_rids_lock:
+            self._active_rids.discard(rid)
 
     def _abort_request(self, rid: str) -> None:
         if self._abort_url is None:

@@ -28,9 +28,40 @@ def main() -> int:
     parser.add_argument("--queue-service-observer", action="store_true")
     parser.add_argument("--request-token-trace", action="store_true")
     parser.add_argument(
+        "--disable-reactive-transfer",
+        action="store_true",
+        help=(
+            "Disable BeliefKV reactive D2H/H2D planning while retaining runtime "
+            "identity and telemetry observers. Intended for hardware calibration."
+        ),
+    )
+    parser.add_argument(
+        "--request-queue-timeout-seconds",
+        type=float,
+        default=1800.0,
+        help="Server-side queue/admission timeout, separate from execution timeout.",
+    )
+    parser.add_argument(
         "--enable-observed-admission",
         action="store_true",
         help="Enable current-state active-KV admission windows.",
+    )
+    parser.add_argument(
+        "--enable-online-joint",
+        action="store_true",
+        help=(
+            "Apply validated observed JointPlan execution, admission, residency, "
+            "and transfer dependencies online."
+        ),
+    )
+    parser.add_argument(
+        "--enable-joint-predictive",
+        action="store_true",
+        help=(
+            "Make the validated JointPlan consume FrontierBelief predictions "
+            "for within-workflow ordering and residency victim selection. "
+            "Requires --enable-online-joint and --predictor-model."
+        ),
     )
     parser.add_argument(
         "--enable-running-retraction",
@@ -43,6 +74,31 @@ def main() -> int:
         help="Allow P5 residency transactions to drop GPU-only KV for recompute.",
     )
     parser.add_argument(
+        "--enable-restore-micro-gate",
+        action="store_true",
+        help=(
+            "Enable the one-shot P5 restore correctness probe. This is a "
+            "test hook, not a performance policy."
+        ),
+    )
+    parser.add_argument(
+        "--restore-micro-gate-id",
+        default="p5g-restore-v1",
+    )
+    parser.add_argument(
+        "--restore-micro-gate-victim-workflow-id",
+        default="restore-micro-gate:victim",
+    )
+    parser.add_argument(
+        "--restore-micro-gate-replacement-workflow-id",
+        default="restore-micro-gate:replacement",
+    )
+    parser.add_argument(
+        "--restore-micro-gate-min-private-mib",
+        type=int,
+        default=64,
+    )
+    parser.add_argument(
         "--observed-admission-active-kv-high-watermark-ratio",
         type=float,
         default=0.8,
@@ -51,6 +107,12 @@ def main() -> int:
         "--observed-admission-min-active-requests",
         type=int,
         default=1,
+    )
+    parser.add_argument(
+        "--joint-workflow-active-window",
+        type=int,
+        default=12,
+        help="Maximum number of fair workflows eligible for tickets per epoch.",
     )
     parser.add_argument(
         "--disable-policy-shadow",
@@ -62,11 +124,44 @@ def main() -> int:
         action="store_true",
         help="Run P4 JointPlan shadow without writing full PolicyInput snapshots.",
     )
+    parser.add_argument(
+        "--predictor-model",
+        type=Path,
+        default=None,
+        help=(
+            "Load a P6 FrontierBeliefModel artifact into the controller as an "
+            "online shadow predictor. Predictions are recorded but never used "
+            "for admission, residency, or transfer decisions."
+        ),
+    )
     args = parser.parse_args()
     if args.enable_running_retraction and not args.enable_observed_admission:
         parser.error(
             "--enable-running-retraction requires --enable-observed-admission"
         )
+    if args.enable_online_joint and args.disable_policy_shadow:
+        parser.error("--enable-online-joint cannot be combined with --disable-policy-shadow")
+    if args.enable_joint_predictive and not args.enable_online_joint:
+        parser.error("--enable-joint-predictive requires --enable-online-joint")
+    if args.enable_joint_predictive and args.predictor_model is None:
+        parser.error("--enable-joint-predictive requires --predictor-model")
+    if args.enable_restore_micro_gate and not (
+        args.enable_online_joint
+        and args.enable_observed_admission
+        and args.enable_running_retraction
+        and args.queue_service_observer
+    ):
+        parser.error(
+            "--enable-restore-micro-gate requires --enable-online-joint, "
+            "--enable-observed-admission, --enable-running-retraction, and "
+            "--queue-service-observer"
+        )
+    if args.restore_micro_gate_min_private_mib <= 0:
+        parser.error("--restore-micro-gate-min-private-mib must be positive")
+    if args.joint_workflow_active_window <= 0:
+        parser.error("--joint-workflow-active-window must be positive")
+    if args.request_queue_timeout_seconds <= 0:
+        parser.error("--request-queue-timeout-seconds must be positive")
 
     server_dir = args.server_dir.expanduser().resolve()
     config_path = server_dir / "beliefkv_config.json"
@@ -88,12 +183,27 @@ def main() -> int:
         "planning_interval_ms": 5.0,
         "admission_liveness_timeout_ms": 1000.0,
         "admission_force_progress_timeout_ms": 5000.0,
+        "request_queue_timeout_ms": args.request_queue_timeout_seconds * 1000.0,
         "kv_bytes_per_token": args.kv_bytes_per_token,
-        "predictor_enabled": False,
-        "predictor_model_path": None,
+        "predictor_enabled": args.predictor_model is not None,
+        "predictor_model_path": (
+            str(args.predictor_model.expanduser().resolve())
+            if args.predictor_model is not None
+            else None
+        ),
         "shadow_enabled": False,
         "prefetch_enabled": True,
+        "reactive_transfer_enabled": not args.disable_reactive_transfer,
         "runtime_audit_path": str(server_dir / "runtime_audit.jsonl"),
+        "runtime_audit_queue_capacity": 8192,
+        "runtime_audit_debug_sample_rate": 0.05,
+        "runtime_audit_max_debug_event_bytes": 16_384,
+        "runtime_audit_flush_interval_s": 1.0,
+        "runtime_summary_path": str(server_dir / "latest_runtime_summary.json"),
+        "runtime_summary_interval_ms": 5_000.0,
+        "shutdown_drain_timeout_ms": 5_000.0,
+        "runtime_scheduler_pid_path": str(server_dir / "scheduler.pid.json"),
+        "runtime_shutdown_ack_path": str(server_dir / "shutdown_ack.json"),
         "transfer_telemetry_path": str(server_dir / "transfer_telemetry.jsonl"),
         "runtime_event_socket_path": str(socket_path),
         "runtime_event_log_path": str(server_dir / "runtime_events.sglang.jsonl"),
@@ -117,6 +227,7 @@ def main() -> int:
         "transfer_retry_unknown_base_ms": 10.0,
         "transfer_retry_unknown_max_ms": 1000.0,
         "transfer_retry_unknown_circuit_breaker_failures": 8,
+        "bundle_preview_audit_max_detailed_per_cycle": 8,
         "reference_policy_shadow_enabled": not (
             args.disable_policy_shadow or args.disable_snapshot_persistence
         ),
@@ -130,9 +241,10 @@ def main() -> int:
         "reference_policy_snapshot_max_pending": 8,
         "reference_policy_hbm_bucket_bytes": 67_108_864,
         "reference_policy_trace_sensitivity": "timing_sensitive",
-        "joint_policy_enabled": False,
+        "joint_policy_enabled": args.enable_online_joint,
         "joint_policy_shadow_mode": not args.disable_policy_shadow,
         "joint_observed_mode_enabled": not args.disable_policy_shadow,
+        "joint_predictive_enabled": args.enable_joint_predictive,
         "observed_admission_scheduling_enabled": (
             args.enable_observed_admission
         ),
@@ -152,14 +264,37 @@ def main() -> int:
         "running_batch_retraction_allow_recompute_drop": (
             args.allow_running_retraction_recompute_drop
         ),
+        "restore_obligation_max_active": 8,
+        "restore_obligation_escalation_ms": 2000.0,
+        "restore_obligation_max_blocked_ms": 30_000.0,
+        "restore_lease_enabled": True,
+        "restore_lease_max_active": 1,
+        "restore_lease_max_bypass_admissions": 1,
+        "restore_service_grace_decode_tokens": 32,
+        "restore_micro_gate_enabled": args.enable_restore_micro_gate,
+        "restore_micro_gate_id": args.restore_micro_gate_id,
+        "restore_micro_gate_victim_workflow_id": (
+            args.restore_micro_gate_victim_workflow_id
+        ),
+        "restore_micro_gate_replacement_workflow_id": (
+            args.restore_micro_gate_replacement_workflow_id
+        ),
+        "restore_micro_gate_min_private_bytes": (
+            args.restore_micro_gate_min_private_mib * 1024 * 1024
+        ),
         "fairness_lag_budget_ms": 50.0,
         "residency_hysteresis_ms": 100.0,
+        "joint_emergency_hbm_ratio": 0.98,
+        "joint_workflow_active_window": args.joint_workflow_active_window,
         "max_joint_workflow_candidates": 8,
         "max_frontier_candidates_per_workflow": 4,
         "max_total_frontier_candidates": 16,
         "max_joint_package_evaluations": 8,
-        "max_joint_plan_budget_ms": 1.0,
-        "max_joint_plan_age_ms": 750.0,
+        "max_joint_plan_budget_ms": 20.0,
+        "min_joint_plan_budget_ms": 0.25,
+        "joint_trigger_budget_fraction": 0.5,
+        "joint_physical_commit_budget_ms": 1.0,
+        "max_joint_plan_age_ms": 100.0,
         "joint_transition_settling_timeout_ms": 250.0,
         "joint_shadow_detailed_audit_interval_ms": 1000.0,
     }

@@ -538,52 +538,143 @@ def _render_html(timeline: TransferTimeline, *, title: str) -> str:
             "miss short-lived changes"
         )
     resource_note = "; ".join(resource_notes) or "No occupancy source"
-    legend_items = []
+    legend_groups: list[tuple[str, list[str]]] = []
+    occupancy_toggles: list[str] = []
     if "runtime_resource_snapshot" in resource_sources:
-        legend_items.append(
-            '<span class="key" style="--key:var(--hbm)">Allocator HBM occupancy</span>'
+        occupancy_toggles.append(
+            _series_toggle(
+                "allocator-hbm-series",
+                "var(--hbm)",
+                "Allocator HBM occupancy",
+            )
         )
+    if summary["host_telemetry_available"]:
+        occupancy_toggles.append(
+            _series_toggle(
+                "host-series",
+                "var(--host)",
+                "Host KV occupancy",
+            )
+        )
+    if occupancy_toggles:
+        legend_groups.append(("Tier occupancy", occupancy_toggles))
     diagnostic_legends = (
         (
             "untracked_allocator_delta_bytes",
+            "untracked-allocator-series",
             "untracked",
             "Untracked allocator delta",
+            False,
         ),
-        ("engine_locked_gpu_bytes", "locked", "Engine-locked KV"),
+        (
+            "engine_locked_gpu_bytes",
+            "engine-locked-series",
+            "locked",
+            "Engine-locked KV",
+            True,
+        ),
+        (
+            "closure_blocked_gpu_bytes",
+            "closure-blocked-series",
+            "closure",
+            "Closure-blocked KV",
+            False,
+        ),
+        (
+            "migratable_gpu_bytes",
+            "migratable-series",
+            "migratable",
+            "Migratable KV",
+            True,
+        ),
+        (
+            "dual_resident_gpu_bytes",
+            "dual-resident-series",
+            "dual",
+            "Dual-resident KV",
+            False,
+        ),
+    )
+    state_toggles = []
+    for field_name, class_name, color_name, label, checked in diagnostic_legends:
+        if not any(
+            getattr(item, field_name) is not None for item in timeline.resources
+        ):
+            continue
+        state_toggles.append(
+            _series_toggle(
+                class_name,
+                f"var(--{color_name})",
+                label,
+                dashed=True,
+                checked=checked,
+            )
+        )
+    if state_toggles:
+        legend_groups.append(("HBM physical state", state_toggles))
+    pressure_legends = (
         (
             "locked_but_not_served_gpu_bytes_100ms",
+            "locked-not-served-100ms-series",
             "stale100",
             "Locked, no completed service >100 ms",
         ),
         (
             "locked_but_not_served_gpu_bytes_500ms",
+            "locked-not-served-500ms-series",
             "stale500",
             "Locked, no completed service >500 ms",
         ),
-        ("closure_blocked_gpu_bytes", "closure", "Closure-blocked KV"),
-        ("migratable_gpu_bytes", "migratable", "Migratable KV"),
-        ("dual_resident_gpu_bytes", "dual", "Dual-resident KV"),
     )
-    for field_name, color_name, label in diagnostic_legends:
+    pressure_toggles = []
+    for field_name, class_name, color_name, label in pressure_legends:
         if not any(
             getattr(item, field_name) is not None for item in timeline.resources
         ):
             continue
-        legend_items.append(
-            f'<span class="key key-dashed" style="--key:var(--{color_name})">{label}</span>'
+        pressure_toggles.append(
+            _series_toggle(
+                class_name,
+                f"var(--{color_name})",
+                label,
+                dashed=True,
+            )
         )
-    if summary["host_telemetry_available"]:
-        legend_items.append(
-            '<span class="key" style="--key:var(--host)">Host KV occupancy</span>'
+    if pressure_toggles:
+        legend_groups.append(("Service pressure", pressure_toggles))
+    transfer_toggles = []
+    transfer_colors = {
+        "d2h": "var(--d2h)",
+        "h2d": "var(--h2d)",
+        "mixed": "var(--mixed)",
+        "reclaim": "var(--reclaim)",
+    }
+    for direction in sorted(summary["directions"]):
+        if summary["directions"][direction]["physical_count"] <= 0:
+            continue
+        transfer_toggles.append(
+            _series_toggle(
+                f"transfer-{direction}-series",
+                transfer_colors.get(direction, "var(--mixed)"),
+                f"{direction.upper()} physical DMA",
+            )
         )
-    legend_items.extend(
-        [
-            '<span class="key" style="--key:var(--d2h)">D2H physical DMA</span>',
-            '<span class="key" style="--key:var(--h2d)">H2D physical DMA</span>',
-            '<span class="key" style="--key:var(--bad)">No-DMA reject</span>',
-        ]
+    if summary["no_dma_record_count"]:
+        transfer_toggles.append(
+            _series_toggle(
+                "no-dma-series", "var(--bad)", "No-DMA observation"
+            )
+        )
+    if transfer_toggles:
+        legend_groups.append(("Transfers", transfer_toggles))
+    legend = "".join(
+        '<fieldset class="legend-group"><legend>'
+        + escape(group_name)
+        + "</legend>"
+        + "".join(items)
+        + "</fieldset>"
+        for group_name, items in legend_groups
     )
-    legend = "".join(legend_items)
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -591,7 +682,7 @@ def _render_html(timeline: TransferTimeline, *, title: str) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{escape(title)}</title>
 <style>
-:root {{ color-scheme: light; --ink:#18212a; --muted:#66717d; --line:#d8dee5; --panel:#f6f8fa; --hbm:#147d73; --untracked:#7656a3; --locked:#a23d45; --stale100:#d15f4b; --stale500:#6f1d2a; --closure:#c97718; --migratable:#2d6f3e; --dual:#3968a8; --host:#59636e; --d2h:#16877d; --h2d:#c97718; --bad:#a23d45; }}
+:root {{ color-scheme: light; --ink:#18212a; --muted:#66717d; --line:#d8dee5; --panel:#f6f8fa; --hbm:#147d73; --untracked:#7656a3; --locked:#a23d45; --stale100:#d15f4b; --stale500:#6f1d2a; --closure:#c97718; --migratable:#2d6f3e; --dual:#3968a8; --host:#59636e; --d2h:#16877d; --h2d:#c97718; --mixed:#7a5aa6; --reclaim:#7b858f; --bad:#a23d45; }}
 * {{ box-sizing:border-box; }}
 body {{ margin:0; color:var(--ink); background:#fff; font:14px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; letter-spacing:0; }}
 header {{ padding:24px 28px 18px; border-bottom:1px solid var(--line); }}
@@ -604,11 +695,20 @@ main {{ padding:22px 28px 36px; }}
 .stat:last-child {{ border-right:0; }}
 .label {{ color:var(--muted); font-size:12px; text-transform:uppercase; }}
 .value {{ margin-top:5px; font-size:18px; font-variant-numeric:tabular-nums; }}
-.chart-wrap {{ margin-top:22px; overflow-x:auto; border-bottom:1px solid var(--line); }}
-svg {{ display:block; width:100%; min-width:980px; height:auto; background:#fff; }}
-.legend {{ display:flex; flex-wrap:wrap; gap:18px; padding:10px 0 18px; color:var(--muted); }}
-.key::before {{ content:""; display:inline-block; width:16px; height:3px; margin:0 7px 3px 0; background:var(--key); }}
-.key-dashed::before {{ height:0; background:transparent; border-top:2px dashed var(--key); }}
+.chart-tools {{ display:flex; align-items:center; gap:12px; margin-top:22px; padding:10px 0; border-top:1px solid var(--line); color:var(--muted); }}
+.chart-tools label {{ font-size:12px; font-weight:600; }}
+.chart-tools input[type="range"] {{ width:min(320px,45vw); accent-color:var(--hbm); }}
+.chart-tools output {{ min-width:42px; color:var(--ink); font-variant-numeric:tabular-nums; }}
+.chart-wrap {{ overflow-x:auto; border-top:1px solid var(--line); border-bottom:1px solid var(--line); }}
+svg {{ display:block; width:200%; min-width:1600px; height:auto; background:#fff; }}
+.legend {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; padding:14px 0 18px; color:var(--muted); }}
+.legend-group {{ min-width:0; margin:0; padding:8px 10px 10px; border:1px solid var(--line); }}
+.legend-group legend {{ padding:0 5px; color:var(--ink); font-size:12px; font-weight:650; }}
+.series-toggle {{ display:flex; align-items:center; gap:7px; min-height:28px; cursor:pointer; }}
+.series-toggle input {{ margin:0; accent-color:var(--key); }}
+.series-swatch {{ width:18px; height:3px; flex:0 0 auto; background:var(--key); }}
+.series-swatch.dashed {{ height:0; background:transparent; border-top:2px dashed var(--key); }}
+.series-hidden {{ display:none; }}
 h2 {{ margin:26px 0 10px; font-size:17px; letter-spacing:0; }}
 .table-wrap {{ overflow:auto; max-height:520px; border-top:1px solid var(--line); border-bottom:1px solid var(--line); }}
 table {{ width:100%; border-collapse:collapse; font-size:12px; font-variant-numeric:tabular-nums; }}
@@ -633,23 +733,47 @@ td.context {{ max-width:320px; overflow:hidden; text-overflow:ellipsis; }}
 <div class="stat"><div class="label">P90 callback</div><div class="value">{summary['callback_duration_p90_ms']:.2f} ms</div></div>
 </section>
 <div class="notice">{escape(measurement_note)}<br>{escape(resource_note)}</div>
+<div class="chart-tools"><label for="timeline-zoom">Horizontal zoom</label><input id="timeline-zoom" type="range" min="1" max="6" step="0.5" value="2"><output id="timeline-zoom-value" for="timeline-zoom">2.0x</output></div>
 <div class="chart-wrap">{svg}</div>
 <div class="legend">{legend}</div>
 <div class="meta">{direction_summary}</div>
 <h2>All backend observations</h2>
-<div class="table-wrap"><table><thead><tr><th>Start</th><th>Duration</th><th>Direction</th><th>Actual</th><th>Closure</th><th>Status</th><th>Measurement</th><th>Kind</th><th>Context</th><th>Command</th></tr></thead><tbody>{rows}</tbody></table></div>
+<details><summary>{summary['telemetry_record_count']} transfer observations</summary><div class="table-wrap"><table><thead><tr><th>Start</th><th>Duration</th><th>Direction</th><th>Actual</th><th>Closure</th><th>Status</th><th>Measurement</th><th>Kind</th><th>Context</th><th>Command</th></tr></thead><tbody>{rows}</tbody></table></div></details>
 </main>
+<script>
+const chart = document.querySelector('.chart-wrap svg');
+const zoom = document.getElementById('timeline-zoom');
+const zoomValue = document.getElementById('timeline-zoom-value');
+function applyZoom() {{
+  const factor = Number(zoom.value);
+  chart.style.width = `${{factor * 100}}%`;
+  zoomValue.value = `${{factor.toFixed(1)}}x`;
+}}
+zoom.addEventListener('input', applyZoom);
+applyZoom();
+for (const toggle of document.querySelectorAll('[data-series-toggle]')) {{
+  const applyVisibility = () => {{
+    for (const element of chart.querySelectorAll(`.${{toggle.dataset.seriesToggle}}`)) {{
+      element.classList.toggle('series-hidden', !toggle.checked);
+    }}
+  }};
+  toggle.addEventListener('change', applyVisibility);
+  applyVisibility();
+}}
+</script>
 </body>
 </html>
 """
 
 
 def _render_svg(timeline: TransferTimeline) -> str:
-    width, height = 1500, 610
-    left, right = 82, 24
-    plot_top, plot_bottom = 42, 312
-    lane_y = {"d2h": 372, "h2d": 416, "mixed": 460, "reclaim": 504}
-    no_dma_y = 548
+    width, height = 1700, 990
+    left, right = 108, 28
+    occupancy_panel = (48, 218)
+    state_panel = (286, 456)
+    pressure_panel = (524, 694)
+    lane_y = {"d2h": 774, "h2d": 818, "mixed": 862, "reclaim": 906}
+    no_dma_y = 946
     plot_width = width - left - right
     duration = max(1.0, timeline.end_ts_ms - timeline.start_ts_ms)
 
@@ -671,36 +795,50 @@ def _render_svg(timeline: TransferTimeline) -> str:
             (point.host_used_bytes or 0 for point in timeline.resources), default=1
         )
 
-    def y(value: int, capacity: int) -> float:
+    def panel_y(value: int, capacity: int, panel: tuple[int, int]) -> float:
         ratio = min(1.0, max(0.0, value / max(1, capacity)))
-        return plot_bottom - ratio * (plot_bottom - plot_top)
+        top, bottom = panel
+        return bottom - ratio * (bottom - top)
 
     parts = [
         f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="HBM and Host KV transfer timeline">',
-        '<rect x="0" y="0" width="1500" height="610" fill="#ffffff"/>',
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff"/>',
     ]
-    for index in range(6):
-        ratio = index / 5
-        y_pos = plot_bottom - ratio * (plot_bottom - plot_top)
+
+    def add_panel_grid(panel: tuple[int, int], title_text: str) -> None:
+        top, bottom = panel
         parts.append(
-            f'<line x1="{left}" y1="{y_pos:.2f}" x2="{width-right}" y2="{y_pos:.2f}" stroke="#e5e9ed" stroke-width="1"/>'
+            f'<rect x="{left}" y="{top}" width="{plot_width}" height="{bottom-top}" fill="#fbfcfd"/>'
         )
         parts.append(
-            f'<text x="{left-12}" y="{y_pos+4:.2f}" text-anchor="end" fill="#66717d" font-size="11">{ratio*100:.0f}%</text>'
+            f'<text x="{left}" y="{top-15}" fill="#18212a" font-size="13" font-weight="600">{escape(title_text)}</text>'
         )
+        for index in range(5):
+            ratio = index / 4
+            y_pos = bottom - ratio * (bottom - top)
+            parts.append(
+                f'<line x1="{left}" y1="{y_pos:.2f}" x2="{width-right}" y2="{y_pos:.2f}" stroke="#e5e9ed" stroke-width="1"/>'
+            )
+            parts.append(
+                f'<text x="{left-12}" y="{y_pos+4:.2f}" text-anchor="end" fill="#66717d" font-size="11">{ratio*100:.0f}%</text>'
+            )
+
+    add_panel_grid(occupancy_panel, "Tier occupancy (% of each tier capacity)")
+    add_panel_grid(state_panel, "HBM physical state (% of HBM capacity)")
+    add_panel_grid(
+        pressure_panel,
+        "Engine-locked KV without completed token service (% of HBM capacity)",
+    )
     for index in range(9):
         ratio = index / 8
         x_pos = left + ratio * plot_width
         ts_ms = ratio * duration
         parts.append(
-            f'<line x1="{x_pos:.2f}" y1="{plot_top}" x2="{x_pos:.2f}" y2="566" stroke="#eef1f4" stroke-width="1"/>'
+            f'<line x1="{x_pos:.2f}" y1="{occupancy_panel[0]}" x2="{x_pos:.2f}" y2="958" stroke="#eef1f4" stroke-width="1"/>'
         )
         parts.append(
-            f'<text x="{x_pos:.2f}" y="594" text-anchor="middle" fill="#66717d" font-size="11">{escape(_format_duration(ts_ms))}</text>'
+            f'<text x="{x_pos:.2f}" y="982" text-anchor="middle" fill="#66717d" font-size="11">{escape(_format_duration(ts_ms))}</text>'
         )
-    parts.append(
-        f'<text x="{left}" y="24" fill="#18212a" font-size="13" font-weight="600">KV tier occupancy (% of each tier capacity)</text>'
-    )
     runtime_hbm_points = [
         (point.ts_ms, point.hbm_used_bytes)
         for point in timeline.resources
@@ -721,9 +859,9 @@ def _render_svg(timeline: TransferTimeline) -> str:
     ]
     if hbm_points:
         parts.append(
-            f'<path class="allocator-hbm-series" d="{_step_path(hbm_points, x, lambda value: y(value, hbm_capacity))}" fill="none" stroke="#147d73" stroke-width="2.5"/>'
+            f'<path class="allocator-hbm-series" d="{_step_path(_downsample_step_points(hbm_points), x, lambda value: panel_y(value, hbm_capacity, occupancy_panel))}" fill="none" stroke="#147d73" stroke-width="2.5" vector-effect="non-scaling-stroke"/>'
         )
-    diagnostic_series = (
+    state_series = (
         (
             "untracked-allocator-series",
             "untracked_allocator_delta_bytes",
@@ -731,6 +869,16 @@ def _render_svg(timeline: TransferTimeline) -> str:
             "7 5",
         ),
         ("engine-locked-series", "engine_locked_gpu_bytes", "#a23d45", "3 4"),
+        (
+            "closure-blocked-series",
+            "closure_blocked_gpu_bytes",
+            "#c97718",
+            "8 4",
+        ),
+        ("migratable-series", "migratable_gpu_bytes", "#2d6f3e", "12 4"),
+        ("dual-resident-series", "dual_resident_gpu_bytes", "#3968a8", "2 4"),
+    )
+    pressure_series = (
         (
             "locked-not-served-100ms-series",
             "locked_but_not_served_gpu_bytes_100ms",
@@ -743,35 +891,38 @@ def _render_svg(timeline: TransferTimeline) -> str:
             "#6f1d2a",
             "10 3",
         ),
-        (
-            "closure-blocked-series",
-            "closure_blocked_gpu_bytes",
-            "#c97718",
-            "8 4",
-        ),
-        ("migratable-series", "migratable_gpu_bytes", "#2d6f3e", "12 4"),
-        ("dual-resident-series", "dual_resident_gpu_bytes", "#3968a8", "2 4"),
     )
-    for class_name, field_name, color, dash in diagnostic_series:
-        points = [
-            (point.ts_ms, getattr(point, field_name))
-            for point in timeline.resources
-            if getattr(point, field_name) is not None
-        ]
-        if points:
-            parts.append(
-                f'<path class="{class_name}" d="{_step_path(points, x, lambda value: y(value, hbm_capacity))}" fill="none" stroke="{color}" stroke-width="2" stroke-dasharray="{dash}"/>'
-            )
+
+    def add_diagnostic_series(
+        series: tuple[tuple[str, str, str, str], ...],
+        panel: tuple[int, int],
+    ) -> None:
+        for class_name, field_name, color, dash in series:
+            points = [
+                (point.ts_ms, getattr(point, field_name))
+                for point in timeline.resources
+                if getattr(point, field_name) is not None
+            ]
+            if points:
+                parts.append(
+                    f'<path class="{class_name}" d="{_step_path(_downsample_step_points(points), x, lambda value: panel_y(value, hbm_capacity, panel))}" fill="none" stroke="{color}" stroke-width="2" stroke-dasharray="{dash}" vector-effect="non-scaling-stroke"/>'
+                )
+
+    add_diagnostic_series(state_series, state_panel)
+    add_diagnostic_series(pressure_series, pressure_panel)
     if host_points:
         parts.append(
-            f'<path d="{_step_path(host_points, x, lambda value: y(value, host_capacity))}" fill="none" stroke="#3968a8" stroke-width="2.5"/>'
+            f'<path class="host-series" d="{_step_path(_downsample_step_points(host_points), x, lambda value: panel_y(value, host_capacity, occupancy_panel))}" fill="none" stroke="#59636e" stroke-width="2.5" vector-effect="non-scaling-stroke"/>'
         )
     else:
         parts.append(
-            f'<text x="{left+12}" y="{plot_top+24}" fill="#66717d" font-size="12">Host occupancy unavailable in this source trace</text>'
+            f'<text x="{left+12}" y="{occupancy_panel[0]+24}" fill="#66717d" font-size="12">Host occupancy unavailable in this source trace</text>'
         )
     parts.append(
-        f'<line x1="{left}" y1="348" x2="{width-right}" y2="348" stroke="#cfd6dd" stroke-width="1"/>'
+        f'<line x1="{left}" y1="738" x2="{width-right}" y2="738" stroke="#cfd6dd" stroke-width="1"/>'
+    )
+    parts.append(
+        f'<text x="{left}" y="724" fill="#18212a" font-size="13" font-weight="600">Physical DMA observations</text>'
     )
     labels = {"d2h": "D2H", "h2d": "H2D", "mixed": "Mixed", "reclaim": "Reclaim"}
     colors = {"d2h": "#16877d", "h2d": "#c97718", "mixed": "#7a5aa6", "reclaim": "#7b858f"}
@@ -788,31 +939,35 @@ def _render_svg(timeline: TransferTimeline) -> str:
         parts.append(
             f'<text x="{left-12}" y="{y_pos+5}" text-anchor="end" fill="#66717d" font-size="11">{labels[direction]}</text>'
         )
-    for transfer in physical_transfers:
-        y_pos = lane_y.get(transfer.direction, lane_y["mixed"])
-        x_start = x(
-            transfer.start_ts_ms
-            if transfer.start_ts_ms is not None
-            else transfer.submit_ts_ms
-        )
-        x_end = x(transfer.complete_ts_ms)
-        bar_width = max(1.5, x_end - x_start)
-        color = colors.get(transfer.direction, colors["mixed"])
-        opacity = "0.86" if transfer.status == "completed" else "0.42"
-        tooltip = escape(
-            f"{transfer.command_id} | {transfer.direction.upper()} | "
-            f"{_format_bytes(transfer.actual_bytes)} actual / "
-            f"{_format_bytes(transfer.closure_bytes)} closure | "
-            f"{transfer.complete_ts_ms-transfer.submit_ts_ms:.3f} ms | "
-            f"{transfer.status} | {transfer.context_id or 'unscoped'}"
-        )
-        parts.append(
-            f'<rect class="physical-transfer" x="{x_start:.2f}" y="{y_pos-8}" width="{bar_width:.2f}" height="16" fill="{color}" opacity="{opacity}" rx="2"><title>{tooltip}</title></rect>'
-        )
+        parts.append(f'<g class="transfer-{direction}-series">')
+        for transfer in (
+            item for item in physical_transfers if item.direction == direction
+        ):
+            x_start = x(
+                transfer.start_ts_ms
+                if transfer.start_ts_ms is not None
+                else transfer.submit_ts_ms
+            )
+            x_end = x(transfer.complete_ts_ms)
+            bar_width = max(1.5, x_end - x_start)
+            color = colors.get(transfer.direction, colors["mixed"])
+            opacity = "0.86" if transfer.status == "completed" else "0.42"
+            tooltip = escape(
+                f"{transfer.command_id} | {transfer.direction.upper()} | "
+                f"{_format_bytes(transfer.actual_bytes)} actual / "
+                f"{_format_bytes(transfer.closure_bytes)} closure | "
+                f"{transfer.complete_ts_ms-transfer.submit_ts_ms:.3f} ms | "
+                f"{transfer.status} | {transfer.context_id or 'unscoped'}"
+            )
+            parts.append(
+                f'<rect class="physical-transfer" x="{x_start:.2f}" y="{y_pos-8}" width="{bar_width:.2f}" height="16" fill="{color}" opacity="{opacity}"><title>{tooltip}</title></rect>'
+            )
+        parts.append("</g>")
     if no_dma_records:
         parts.append(
             f'<text x="{left-12}" y="{no_dma_y+5}" text-anchor="end" fill="#66717d" font-size="11">No DMA</text>'
         )
+        parts.append('<g class="no-dma-series">')
         for transfer in no_dma_records:
             x_pos = x(transfer.submit_ts_ms)
             tooltip = escape(
@@ -821,10 +976,58 @@ def _render_svg(timeline: TransferTimeline) -> str:
                 f"{transfer.reason or 'no reason'}"
             )
             parts.append(
-                f'<line class="no-dma-attempt" x1="{x_pos:.2f}" y1="{no_dma_y-7}" x2="{x_pos:.2f}" y2="{no_dma_y+7}" stroke="#a23d45" stroke-width="1" opacity="0.28"><title>{tooltip}</title></line>'
+                f'<line class="no-dma-attempt" x1="{x_pos:.2f}" y1="{no_dma_y-7}" x2="{x_pos:.2f}" y2="{no_dma_y+7}" stroke="#a23d45" stroke-width="1" opacity="0.35"><title>{tooltip}</title></line>'
             )
+        parts.append("</g>")
     parts.append("</svg>")
     return "".join(parts)
+
+
+def _series_toggle(
+    class_name: str,
+    color: str,
+    label: str,
+    *,
+    dashed: bool = False,
+    checked: bool = True,
+) -> str:
+    checked_attribute = " checked" if checked else ""
+    dashed_class = " dashed" if dashed else ""
+    return (
+        f'<label class="series-toggle" style="--key:{color}">'
+        f'<input type="checkbox" data-series-toggle="{escape(class_name)}"'
+        f"{checked_attribute}>"
+        f'<span class="series-swatch{dashed_class}"></span>'
+        f"{escape(label)}</label>"
+    )
+
+
+def _downsample_step_points(
+    points: list[tuple[float, int | None]],
+    *,
+    max_points: int = 1600,
+) -> list[tuple[float, int | None]]:
+    clean = [(ts, value) for ts, value in points if value is not None]
+    if len(clean) <= max_points or max_points < 2:
+        return clean
+    start_ts = clean[0][0]
+    duration = max(1.0, clean[-1][0] - start_ts)
+    bucket_width = duration / (max_points - 1)
+    sampled = [clean[0]]
+    current_bucket = 0
+    pending = clean[0]
+    for point in clean[1:-1]:
+        bucket = min(max_points - 2, int((point[0] - start_ts) / bucket_width))
+        if bucket != current_bucket:
+            if pending != sampled[-1]:
+                sampled.append(pending)
+            current_bucket = bucket
+        pending = point
+    if pending != sampled[-1]:
+        sampled.append(pending)
+    if clean[-1] != sampled[-1]:
+        sampled.append(clean[-1])
+    return sampled
 
 
 def _step_path(

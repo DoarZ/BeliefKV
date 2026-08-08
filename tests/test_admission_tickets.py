@@ -247,6 +247,36 @@ def test_one_workflow_can_receive_multiple_tickets_without_reservation() -> None
     assert index.reserved_bytes == 0
 
 
+def test_allocator_backed_restore_credit_is_only_spendable_by_owner() -> None:
+    index = VisibleAdmissionIndex()
+    index.register(_request("restore", prompt_tokens=4, output_tokens=2))
+    index.register(_request("ordinary", prompt_tokens=2, output_tokens=1))
+
+    result = AdmissionTicketCompiler().compile(
+        epoch=1,
+        now_ms=10,
+        ordered_request_ids=("restore", "ordinary"),
+        entries={entry.request.request_id: entry for entry in index.entries()},
+        budget=AdmissionCompileBudget(
+            max_prefill_tokens=100,
+            max_requests=2,
+            max_candidates=2,
+            # The allocator already removed restore's 60-byte reservation.
+            available_hbm_bytes=30,
+        ),
+        source="restore_liveness",
+        reason="allocator_backed_lease",
+        reservation_credits={"restore": 60},
+    )
+
+    assert [ticket.request_id for ticket in result.tickets] == [
+        "restore",
+        "ordinary",
+    ]
+    assert result.tickets[0].reservation_credit_bytes == 60
+    assert result.tickets[1].reservation_credit_bytes == 0
+
+
 def test_wait_restore_skips_only_the_dependent_request() -> None:
     index = VisibleAdmissionIndex()
     index.register(_request("restore"), bundle_generations={"bundle": "g1"})

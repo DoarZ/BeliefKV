@@ -39,13 +39,20 @@ from beliefkv.policy.service_curve import TransferServiceCurve
 from beliefkv.policy.transfer_planner import ReactiveTransferPlanner, TransferPlannerConfig
 from beliefkv.policy.workflow_fairness import WorkflowFairScheduler
 from beliefkv.predictor.composer import RemainingTimePredictor
+from beliefkv.predictor.online_shadow import (
+    FrontierShadowRecord,
+    build_frontier_shadow_records,
+)
 from beliefkv.predictor.types import RemainingTimePrediction
 from beliefkv.runtime.command_queue import TransferCommandQueue
+from beliefkv.runtime.action_frontier import ActionFrontierObserver
 from beliefkv.runtime.bundles import BundlePreviewEvent, PhysicalBundleBuilder
 from beliefkv.runtime.page_index import PageIndexError, PageOwnershipIndex
 from beliefkv.runtime.protocol import (
     CommandAck,
     CommandKind,
+    EnqueueOutcome,
+    EnqueueStatus,
     CommandQueueClass,
     CommandStatus,
     ControlCommand,
@@ -60,6 +67,9 @@ from beliefkv.runtime.protocol import (
 from beliefkv.runtime.radix_arbiter import ArbitrationConfig, RadixArbiter
 
 
+_FRONTIER_SHADOW_INTERVAL_MS = 500.0
+
+
 @dataclass(frozen=True)
 class ControllerTickResult:
     now_ms: float
@@ -71,6 +81,7 @@ class ControllerTickResult:
     predictions: dict[str, RemainingTimePrediction] = field(default_factory=dict)
     transfer_guard_events: tuple[TransferGuardEvent, ...] = ()
     bundle_preview_events: tuple[BundlePreviewEvent, ...] = ()
+    frontier_shadow_events: tuple[FrontierShadowRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -98,6 +109,8 @@ class BeliefKVController:
     ) -> None:
         self.config = config or BeliefKVConfig()
         self.graph = RuntimeCausalContextGraph()
+        self.action_frontier_observer = ActionFrontierObserver()
+        self._action_frontier_observer_errors = 0
         self.data_consumers = ObservedDataConsumerIndex(self.graph)
         self.page_index = PageOwnershipIndex()
         self.frontier = CausalFrontierScheduler(self.graph)
@@ -160,6 +173,9 @@ class BeliefKVController:
                 urgent_chunk_bytes=self.config.urgent_chunk_bytes,
                 prefetch_chunk_bytes=self.config.urgent_chunk_bytes,
                 prefetch_enabled=self.config.prefetch_enabled,
+                bundle_preview_audit_max_detailed_per_cycle=(
+                    self.config.bundle_preview_audit_max_detailed_per_cycle
+                ),
             ),
             retry_guard=self.transfer_guard,
             bundle_builder=self.bundle_builder,
@@ -217,6 +233,9 @@ class BeliefKVController:
         self._running_request_count: int | None = None
         self._external_workflow_charges: dict[str, float] = {}
         self._last_predictions: dict[str, RemainingTimePrediction] = {}
+        self._frontier_shadow_signatures: dict[str, tuple[str, float]] = {}
+        self._frontier_shadow_last_ms = float("-inf")
+        self._frontier_shadow_interval_ms = _FRONTIER_SHADOW_INTERVAL_MS
         self._drop_unowned_blocked = False
         self._native_admission_request_id: str | None = None
         self._native_admission_capacity_bytes = 0
@@ -232,10 +251,17 @@ class BeliefKVController:
 
     def process_runtime_event(self, event: RuntimeEvent) -> GraphDelta:
         self.now_ms = max(self.now_ms, event.ts_ms)
+        frontier_before = tuple(
+            sorted(item.invocation_id for item in self.graph.ready_invocations())
+        )
         delta = self.graph.apply(event)
         self.data_consumers.apply(event)
         self._observe_transition_batch((event,))
         self._after_runtime_event(event, delta)
+        self._observe_action_frontier_event(
+            event,
+            frontier_before=frontier_before,
+        )
         self._append_runtime_events((event,))
         return delta
 
@@ -244,14 +270,43 @@ class BeliefKVController:
     ) -> list[GraphDelta]:
         if not events:
             return []
+        frontier_before = tuple(
+            sorted(item.invocation_id for item in self.graph.ready_invocations())
+        )
         deltas = self.graph.apply_batch(events, atomic=True)
         self.data_consumers.apply_batch(events, atomic=True)
         self._observe_transition_batch(tuple(events))
         for event, delta in zip(events, deltas):
             self.now_ms = max(self.now_ms, event.ts_ms)
             self._after_runtime_event(event, delta)
+            self._observe_action_frontier_event(
+                event,
+                frontier_before=frontier_before,
+            )
         self._append_runtime_events(tuple(events))
         return deltas
+
+    def _observe_action_frontier_event(
+        self,
+        event: RuntimeEvent,
+        *,
+        frontier_before: tuple[str, ...],
+    ) -> None:
+        """Keep P6.0 instrumentation outside the RCCG correctness boundary."""
+
+        try:
+            self.action_frontier_observer.observe_runtime_event(
+                event,
+                runnable_frontier_before=frontier_before,
+                runnable_frontier_after=tuple(
+                    sorted(
+                        item.invocation_id
+                        for item in self.graph.ready_invocations()
+                    )
+                ),
+            )
+        except (KeyError, ValueError):
+            self._action_frontier_observer_errors += 1
 
     @property
     def runtime_event_sequence(self) -> int:
@@ -293,6 +348,16 @@ class BeliefKVController:
             self.fairness.register(event.workflow_id)
         for context_id in delta.changed_contexts:
             context = self.graph.contexts[context_id]
+            compacted_handles: frozenset[PageHandle] = frozenset()
+            if (
+                event.kind == RuntimeEventKind.CONTEXT_COMPACT
+                and event.context_id == context_id
+                and self.page_index.has_context(context_id)
+            ):
+                compacted_handles = frozenset(
+                    page.handle for page in self.page_index.context_pages(context_id)
+                )
+                self.page_index.unbind_context(context_id)
             if not self.page_index.has_context(context_id):
                 self.page_index.register_context(
                     context_id, context.workflow_id, context.epoch
@@ -302,6 +367,11 @@ class BeliefKVController:
             self.transfer_guard.invalidate_context(
                 context_id, now_ms=self.now_ms, keep_epoch=context.epoch
             )
+            if compacted_handles:
+                self._record_terminal_cleanup_handles(
+                    context_id,
+                    compacted_handles,
+                )
         for invocation_id in delta.awakened_invocations:
             context_id = self.graph.invocations[invocation_id].context_id
             prediction = self._last_predictions.pop(context_id, None)
@@ -594,7 +664,12 @@ class BeliefKVController:
                     h2d += action.size_bytes
         return d2h, h2d
 
-    def tick(self, now_ms: float | None = None) -> ControllerTickResult:
+    def tick(
+        self,
+        now_ms: float | None = None,
+        *,
+        allow_reactive_transfer: bool = True,
+    ) -> ControllerTickResult:
         if now_ms is not None:
             if now_ms < self.now_ms:
                 raise ValueError("controller time cannot move backwards")
@@ -605,6 +680,22 @@ class BeliefKVController:
         self._prune_terminal_cleanup_handles()
         self.update_signals()
         predictions = self._predictions()
+        frontier_shadow_events: tuple[FrontierShadowRecord, ...] = ()
+        if (
+            self.config.predictor_enabled
+            and now_ms - self._frontier_shadow_last_ms
+            >= self._frontier_shadow_interval_ms
+        ):
+            frontier_shadow_events, self._frontier_shadow_signatures = (
+                build_frontier_shadow_records(
+                    self.graph,
+                    self.predictor,
+                    now_ms=now_ms,
+                    signals=self.signals,
+                    last_signatures=self._frontier_shadow_signatures,
+                )
+            )
+            self._frontier_shadow_last_ms = now_ms
 
         pending_requests = self.admission.pending_requests()
         liveness_target = None
@@ -742,7 +833,7 @@ class BeliefKVController:
         )
         if not self._inflight and not delegated_native_reclaim:
             planned = self._plan_terminal_cleanup()
-            if planned is None:
+            if planned is None and allow_reactive_transfer:
                 planned = self.transfer_planner.plan_next(
                     now_ms=self.now_ms,
                     hbm_capacity_bytes=self.config.hbm_capacity_bytes,
@@ -775,6 +866,7 @@ class BeliefKVController:
             predictions=predictions,
             transfer_guard_events=self.transfer_guard.drain_events(),
             bundle_preview_events=self.transfer_planner.drain_bundle_events(),
+            frontier_shadow_events=frontier_shadow_events,
         )
 
     def _stalled_command_ids(self) -> tuple[str, ...]:
@@ -983,6 +1075,25 @@ class BeliefKVController:
                 break
             if command.context_id is not None:
                 self._queued_by_context.pop(command.context_id, None)
+            blockers = self.transfer_guard.suppression_blockers(command)
+            if not blockers:
+                blockers = (
+                    TransferBlocker(
+                        TransferBlockerCode.UNKNOWN_BACKEND,
+                        required_bytes=command.target_bytes,
+                        detail="retry guard suppressed an accepted command",
+                    ),
+                )
+            ack = CommandAck(
+                command_id=command.command_id,
+                status=CommandStatus.REJECTED,
+                completed_ts_ms=self.now_ms,
+                actual_bytes=0,
+                reason="transfer_retry_guard_suppressed",
+                blockers=blockers,
+            )
+            self.ack_history.append(ack)
+            return None, ack
         closure_fingerprint = self.transfer_guard.begin_attempt(
             command, now_ms=self.now_ms
         )
@@ -1024,7 +1135,104 @@ class BeliefKVController:
         self.transfer_guard.reset(now_ms=self.now_ms)
         self._bump_transfer_epoch()
 
-    def enqueue_control_command(self, command: ControlCommand) -> bool:
+    @staticmethod
+    def _command_equivalence_key(command: ControlCommand) -> tuple[object, ...]:
+        bundle = command.physical_bundle
+        target_residency = {
+            CommandKind.PREFETCH_CONTEXT: "gpu",
+            CommandKind.OFFLOAD_CONTEXT: "cpu",
+            CommandKind.SHADOW_CONTEXT: "dual",
+            CommandKind.DROP_CONTEXT: "dead",
+            CommandKind.DROP_TERMINAL_PRIVATE: "host_released",
+        }.get(command.kind, command.kind.value)
+        return (
+            command.context_id,
+            command.context_epoch,
+            command.kind.value,
+            bundle.bundle_id if bundle is not None else None,
+            bundle.generation_fingerprint if bundle is not None else None,
+            tuple(command.target_handles) if bundle is None else None,
+            command.target_bytes if bundle is None else None,
+            target_residency,
+        )
+
+    def _canonical_context_command(
+        self, context_id: str
+    ) -> ControlCommand | None:
+        queued_id = self._queued_by_context.get(context_id)
+        if queued_id is not None:
+            queued = self.command_queue.get(queued_id)
+            if queued is not None:
+                return queued
+        for inflight in self._inflight.values():
+            command = inflight.resolved.command
+            if command.context_id == context_id:
+                return command
+        if queued_id is not None:
+            self._queued_by_context.pop(context_id, None)
+        return None
+
+    def command_ownership_epoch(self, context_id: str) -> tuple[object, ...]:
+        """Return canonical ownership identity, not a global transfer revision."""
+
+        command = self._canonical_context_command(context_id)
+        if command is None:
+            return (context_id, "none")
+        return (*self._command_equivalence_key(command), command.command_id)
+
+    def preflight_control_command(self, command: ControlCommand) -> EnqueueOutcome:
+        """Inspect guard and canonical ownership without mutating allocator state."""
+
+        attempt_key = self._command_equivalence_key(command)
+        if not self.transfer_guard.command_is_eligible(
+            command, now_ms=self.now_ms
+        ):
+            blockers = self.transfer_guard.suppression_blockers(command)
+            codes = tuple(item.code.value for item in blockers) or (
+                "retry_guard_blocked",
+            )
+            return EnqueueOutcome(
+                status=EnqueueStatus.RETRY_GUARD_BLOCKED,
+                canonical_command_id=None,
+                attempt_key=attempt_key,
+                blocker_codes=codes,
+                wake_conditions=tuple(
+                    f"guard:{item}" for item in codes
+                ),
+            )
+        if command.context_id is not None:
+            existing = self._canonical_context_command(command.context_id)
+            if existing is not None:
+                if self._command_equivalence_key(existing) == attempt_key:
+                    return EnqueueOutcome(
+                        status=EnqueueStatus.ADOPT_EXISTING,
+                        canonical_command_id=existing.command_id,
+                        attempt_key=attempt_key,
+                        wake_conditions=(
+                            f"command_terminal:{existing.command_id}",
+                        ),
+                    )
+                return EnqueueOutcome(
+                    status=EnqueueStatus.CONTEXT_CONFLICT,
+                    canonical_command_id=existing.command_id,
+                    attempt_key=attempt_key,
+                    blocker_codes=("context_command_owned",),
+                    wake_conditions=(
+                        f"command_terminal:{existing.command_id}",
+                    ),
+                )
+        return EnqueueOutcome(
+            status=EnqueueStatus.ENQUEUED,
+            canonical_command_id=command.command_id,
+            attempt_key=attempt_key,
+        )
+
+    def enqueue_control_command(
+        self,
+        command: ControlCommand,
+        *,
+        preflight: EnqueueOutcome | None = None,
+    ) -> EnqueueOutcome:
         """Queue one externally compiled, versioned physical command.
 
         Runtime policies may use this entry point only from the scheduler safe
@@ -1032,7 +1240,25 @@ class BeliefKVController:
         remain authoritative.
         """
 
-        return self._enqueue_if_new(command)
+        outcome = preflight or self.preflight_control_command(command)
+        if outcome.status == EnqueueStatus.ADOPT_EXISTING:
+            return outcome
+        if outcome.status != EnqueueStatus.ENQUEUED:
+            return outcome
+        if outcome.attempt_key != self._command_equivalence_key(command):
+            return EnqueueOutcome(
+                status=EnqueueStatus.STALE_CERTIFICATE,
+                canonical_command_id=None,
+                attempt_key=self._command_equivalence_key(command),
+                blocker_codes=("command_certificate_changed",),
+                wake_conditions=("physical_bundle_changed",),
+            )
+        if not self._enqueue_if_new(command):
+            return self.preflight_control_command(command)
+        return outcome
+
+    def has_pending_transfer_work(self) -> bool:
+        return bool(self._inflight or len(self.command_queue))
 
     def _enqueue_if_new(self, command: ControlCommand) -> bool:
         if command.context_id is not None:

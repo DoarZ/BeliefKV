@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from deepagents.middleware.subagents import SubAgentMiddleware
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelRequest, ModelResponse
@@ -17,7 +16,6 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from pydantic import BaseModel, Field, model_validator
 
 from beliefkv.experiments.agent_protocol import (
-    ActivationDeadline,
     AgentLoopGuardMiddleware,
     ChildCompletion,
     LoopGuardPolicy,
@@ -40,10 +38,22 @@ from beliefkv.experiments.langgraph_peer_workflow import (
     PeerTurnResult,
 )
 from beliefkv.runtime.agent_runtime_adapter import RuntimeEventSink
+from beliefkv.runtime.agent_safety import ActivationDeadline
+from beliefkv.runtime.context_lifecycle import (
+    CONTEXT_LIFECYCLE_PRIVATE_STATE_KEYS,
+    CompletionBudgetMiddleware,
+    ContextLifecycleMiddleware,
+    ContextLifecyclePolicy,
+)
 from beliefkv.runtime.deepagents_adapter import (
     BeliefKVChatOpenAI,
     DeepAgentsRuntimeAdapter,
 )
+from beliefkv.runtime.langchain_tool_safety import (
+    ToolCircuitBreakerMiddleware,
+    ToolOutcomeStatusMiddleware,
+)
+from beliefkv.runtime.subagent_state import PrivateStateIsolatingSubAgentMiddleware
 
 
 def summarize_agentic_runtime_trace(path: Path) -> dict[str, Any]:
@@ -68,18 +78,28 @@ def summarize_agentic_runtime_trace(path: Path) -> dict[str, Any]:
         for item in records
         if item.get("kind") == "invocation_create"
         and item.get("parent_invocation_id") is not None
+        and not bool((item.get("attributes") or {}).get("runtime_internal"))
     }
     llm_by_invocation: Counter[str] = Counter()
     tools_by_invocation: Counter[str] = Counter()
     max_epoch_by_invocation: dict[str, int] = {}
     tool_names: Counter[str] = Counter()
+    tool_statuses: Counter[str] = Counter()
+    tool_error_classes: Counter[str] = Counter()
     tool_durations_ms: list[float] = []
+    workspace_digest_observations = 0
+    workspace_change_count = 0
+    mutating_tool_end_count = 0
     rejected_task_calls = 0
     for item in records:
         invocation_id = item.get("invocation_id")
         kind = item.get("kind")
         attributes = item.get("attributes") or {}
-        if kind == "llm_submit" and invocation_id is not None:
+        if (
+            kind == "llm_submit"
+            and invocation_id is not None
+            and not bool(attributes.get("runtime_internal"))
+        ):
             key = str(invocation_id)
             llm_by_invocation[key] += 1
             epoch = item.get("context_epoch")
@@ -94,7 +114,27 @@ def summarize_agentic_runtime_trace(path: Path) -> dict[str, Any]:
             duration = attributes.get("duration_ms")
             if duration is not None:
                 tool_durations_ms.append(float(duration))
-        if kind == "llm_result":
+            status = attributes.get("status")
+            if status is not None:
+                tool_statuses[str(status)] += 1
+            error_class = attributes.get("tool_error_class")
+            if error_class is not None:
+                tool_error_classes[str(error_class)] += 1
+            if attributes.get("tool_name") in {
+                "apply_patch",
+                "edit_file",
+                "write_file",
+            }:
+                mutating_tool_end_count += 1
+            if (
+                attributes.get("workspace_digest_before") is not None
+                and attributes.get("workspace_digest_after") is not None
+            ):
+                workspace_digest_observations += 1
+                workspace_change_count += int(
+                    bool(attributes.get("workspace_changed"))
+                )
+        if kind == "llm_result" and not bool(attributes.get("runtime_internal")):
             rejected_task_calls += int(
                 attributes.get("rejected_task_call_count", 0) or 0
             )
@@ -127,9 +167,30 @@ def summarize_agentic_runtime_trace(path: Path) -> dict[str, Any]:
         "last_event_ts_ms": max(event_timestamps_ms, default=None),
         "spawn_timestamps_ms": spawn_timestamps_ms,
         "dynamic_subagent_count": event_counts["spawn"],
-        "llm_request_count": event_counts["llm_submit"],
+        "llm_request_count": sum(llm_by_invocation.values()),
+        "context_compaction_count": event_counts["context_compact"],
+        "internal_summary_request_count": sum(
+            item.get("kind") == "llm_submit"
+            and bool((item.get("attributes") or {}).get("runtime_internal"))
+            for item in records
+        ),
         "tool_call_count": event_counts["tool_start"],
         "tool_name_counts": dict(sorted(tool_names.items())),
+        "tool_status_counts": dict(sorted(tool_statuses.items())),
+        "tool_error_class_counts": dict(sorted(tool_error_classes.items())),
+        "tool_status_coverage": (
+            sum(tool_statuses.values()) / event_counts["tool_end"]
+            if event_counts["tool_end"]
+            else 1.0
+        ),
+        "workspace_digest_observation_count": workspace_digest_observations,
+        "mutating_tool_end_count": mutating_tool_end_count,
+        "workspace_digest_coverage": (
+            workspace_digest_observations / mutating_tool_end_count
+            if mutating_tool_end_count
+            else 1.0
+        ),
+        "workspace_change_count": workspace_change_count,
         "tool_duration_ms": {
             "count": len(durations),
             "p50": percentile(durations, 0.50),
@@ -190,7 +251,9 @@ class AgenticPeerDecision(BaseModel):
 
 PEER_COMPLETION_INSTRUCTION = (
     "Return an AgenticPeerDecision. Set complete=true and next_role=null only when "
-    "the workflow is terminal. Otherwise choose exactly one different peer role."
+    "the workflow is terminal. Otherwise choose the role that should run next. The "
+    "current role may continue when it has unfinished local work; that is a continuation, "
+    "not a peer handoff."
 )
 
 
@@ -297,6 +360,18 @@ def count_accepted_task_calls(messages: list[BaseMessage]) -> int:
     return count
 
 
+def count_initial_accepted_task_calls(messages: list[BaseMessage]) -> int:
+    """Count only the first runtime delegation batch, not later dynamic spawns."""
+
+    for message in messages:
+        if not isinstance(message, AIMessage):
+            continue
+        accepted = count_accepted_task_calls([message])
+        if accepted:
+            return accepted
+    return 0
+
+
 @dataclass(frozen=True)
 class AgenticPeerBackendConfig:
     model: str
@@ -308,6 +383,9 @@ class AgenticPeerBackendConfig:
     enable_subagents: bool = True
     required_initial_subagent_min: int = 0
     required_initial_subagent_max: int = 0
+    context_lifecycle: ContextLifecyclePolicy = field(
+        default_factory=ContextLifecyclePolicy
+    )
     loop_guard: LoopGuardPolicy = field(
         default_factory=lambda: LoopGuardPolicy(
             repeated_call_limit=6,
@@ -327,6 +405,13 @@ class AgenticPeerBackendConfig:
             self.max_decision_repairs,
         ) <= 0:
             raise ValueError("agentic backend limits must be positive")
+        if (
+            self.context_lifecycle.intermediate_output_tokens
+            > self.max_completion_tokens
+        ):
+            raise ValueError(
+                "intermediate completion budget cannot exceed max_completion_tokens"
+            )
         if not (
             0
             <= self.required_initial_subagent_min
@@ -342,10 +427,14 @@ class AgenticPeerBackendConfig:
 class _PersistentPeerThread:
     role: str
     agent: Any
+    model: BeliefKVChatOpenAI
     adapter: DeepAgentsRuntimeAdapter
+    context_lifecycle: ContextLifecycleMiddleware
     activation_policy: "_ActivationPolicy"
     activation_deadline: ActivationDeadline
+    owns_activation_deadline: bool
     messages: list[BaseMessage] = field(default_factory=list)
+    summarization_event: dict[str, Any] | None = None
     activations: int = 0
     initial_subagent_count: int | None = None
     decision_repairs: int = 0
@@ -466,6 +555,11 @@ class ToolEnabledPeerBackend(PeerAgentBackend):
             if existing is not None:
                 if existing.role != request.role:
                     raise RuntimeError("one context cannot change peer role")
+                if (
+                    request.workflow_deadline is not None
+                    and existing.activation_deadline is not request.workflow_deadline
+                ):
+                    raise RuntimeError("persistent peer cannot change workflow deadline")
                 return existing
             thread = self._build_thread(request)
             self._threads[context_id] = thread
@@ -484,8 +578,10 @@ class ToolEnabledPeerBackend(PeerAgentBackend):
                 {"AgenticPeerDecision", "ChildCompletion"}
             ),
             allowed_subagent_types=SUBAGENT_TYPES,
+            workspace_digest_provider=self.workspace_backend.tool_state_digest,
         )
-        activation_deadline = ActivationDeadline()
+        owns_activation_deadline = request.workflow_deadline is None
+        activation_deadline = request.workflow_deadline or ActivationDeadline()
         server_root = self.config.base_url.rstrip("/")
         if server_root.endswith("/v1"):
             server_root = server_root[:-3]
@@ -504,12 +600,21 @@ class ToolEnabledPeerBackend(PeerAgentBackend):
             streaming=False,
             disable_streaming="tool_calling",
         )
+        summary_model = model.model_copy(
+            update={"max_tokens": self.config.context_lifecycle.summary_output_tokens}
+        )
         required_range = self.config.required_initial_subagent_min > 0
         activation_policy = _ActivationPolicy(
             delegation_allowed=self.config.enable_subagents
             and (not required_range or request.role == PeerRole.CODER.value)
         )
         middleware: list[Any] = [
+            ToolCircuitBreakerMiddleware(
+                state_epoch=self.workspace_backend.workspace_epoch,
+                audit=self.audit,
+                scope=f"agentic-peer:{request.role}",
+            ),
+            ToolOutcomeStatusMiddleware(),
             _filesystem_middleware(
                 self.workspace_backend,
                 allow_direct_edits=request.role == PeerRole.CODER.value,
@@ -519,8 +624,9 @@ class ToolEnabledPeerBackend(PeerAgentBackend):
             not required_range or request.role == PeerRole.CODER.value
         ):
             middleware.append(
-                SubAgentMiddleware(
+                PrivateStateIsolatingSubAgentMiddleware(
                     backend=self.workspace_backend,
+                    private_state_keys=CONTEXT_LIFECYCLE_PRIVATE_STATE_KEYS,
                     subagents=[
                         {
                             "name": name,
@@ -529,9 +635,32 @@ class ToolEnabledPeerBackend(PeerAgentBackend):
                             "model": model,
                             "tools": [],
                             "middleware": [
+                                ToolCircuitBreakerMiddleware(
+                                    state_epoch=(
+                                        self.workspace_backend.workspace_epoch
+                                    ),
+                                    audit=self.audit,
+                                    scope=(
+                                        f"agentic-child:{request.role}:{name}"
+                                    ),
+                                ),
+                                ToolOutcomeStatusMiddleware(),
                                 _filesystem_middleware(
                                     self.workspace_backend,
                                     allow_direct_edits=False,
+                                ),
+                                ContextLifecycleMiddleware(
+                                    summary_model,
+                                    backend=self.workspace_backend,
+                                    policy=self.config.context_lifecycle,
+                                    compaction_sink=adapter,
+                                    summary_callbacks=(adapter,),
+                                ),
+                                CompletionBudgetMiddleware(
+                                    intermediate_tokens=(
+                                        self.config.context_lifecycle.intermediate_output_tokens
+                                    ),
+                                    final_tokens=self.config.max_completion_tokens,
                                 ),
                                 AgentLoopGuardMiddleware(
                                     policy=self.config.loop_guard,
@@ -549,6 +678,24 @@ class ToolEnabledPeerBackend(PeerAgentBackend):
                     system_prompt=TASK_MIDDLEWARE_PROMPT,
                 )
             )
+        context_lifecycle = ContextLifecycleMiddleware(
+            summary_model,
+            backend=self.workspace_backend,
+            policy=self.config.context_lifecycle,
+            compaction_sink=adapter,
+            summary_callbacks=(adapter,),
+            persist_cursor_across_invocations=True,
+        )
+        middleware.append(context_lifecycle)
+        middleware.append(
+            CompletionBudgetMiddleware(
+                intermediate_tokens=(
+                    self.config.context_lifecycle.intermediate_output_tokens
+                ),
+                final_tokens=self.config.max_completion_tokens,
+                final_mode=lambda: activation_policy.must_complete,
+            )
+        )
         middleware.append(_FinalActivationMiddleware(activation_policy))
         middleware.append(
             AgentLoopGuardMiddleware(
@@ -581,9 +728,12 @@ class ToolEnabledPeerBackend(PeerAgentBackend):
         return _PersistentPeerThread(
             role=request.role,
             agent=agent,
+            model=model,
             adapter=adapter,
+            context_lifecycle=context_lifecycle,
             activation_policy=activation_policy,
             activation_deadline=activation_deadline,
+            owns_activation_deadline=owns_activation_deadline,
         )
 
     def _invoke_thread(
@@ -591,9 +741,10 @@ class ToolEnabledPeerBackend(PeerAgentBackend):
         thread: _PersistentPeerThread,
         request: PeerTurnRequest,
     ) -> PeerTurnResult:
-        thread.activation_deadline.start(
-            self.config.loop_guard.activation_wall_clock_s
-        )
+        if thread.owns_activation_deadline:
+            thread.activation_deadline.start(
+                self.config.loop_guard.activation_wall_clock_s
+            )
         thread.activation_policy.must_complete = request.must_complete
         try:
             required_initial_delegation = self._requires_initial_delegation(
@@ -605,7 +756,8 @@ class ToolEnabledPeerBackend(PeerAgentBackend):
             return result
         finally:
             thread.activation_policy.must_complete = False
-            thread.activation_deadline.clear()
+            if thread.owns_activation_deadline:
+                thread.activation_deadline.clear()
 
     def _requires_initial_delegation(
         self,
@@ -667,10 +819,18 @@ class ToolEnabledPeerBackend(PeerAgentBackend):
                     self._model_error_count += 1
                 raise
             thread.messages = _result_messages(result)
+            thread.summarization_event = (
+                thread.context_lifecycle.latest_summarization_event()
+            )
             messages = list(thread.messages)
             decision = require_structured_completion(result, AgenticPeerDecision)
             assert isinstance(decision, AgenticPeerDecision)
-            initial_subagent_count = count_accepted_task_calls(
+            guard_intervened = bool(
+                result.get("guard_ever_intervened", False)
+                or result.get("guard_forcing_completion", False)
+            )
+            guard_reason = str(result.get("guard_reason") or "runtime_guard")
+            initial_subagent_count = count_initial_accepted_task_calls(
                 thread.messages[previous_count:]
             )
             last_error = self._decision_error(
@@ -707,6 +867,8 @@ class ToolEnabledPeerBackend(PeerAgentBackend):
             summary += " Tests: " + "; ".join(decision.tests)
         if decision.unresolved:
             summary += " Unresolved: " + "; ".join(decision.unresolved)
+        if guard_intervened:
+            summary += f" Runtime guard: {guard_reason}."
         return PeerTurnResult(
             summary=summary,
             next_role=(
@@ -717,7 +879,16 @@ class ToolEnabledPeerBackend(PeerAgentBackend):
             complete=decision.complete,
             output_tokens=output_tokens,
             final_context_epoch=thread.adapter.latest_context_epoch(),
+            terminal_outcome=None,
         )
+
+    def cancel(self, *, reason: str) -> None:
+        with self._threads_lock:
+            threads = tuple(self._threads.values())
+        for thread in threads:
+            thread.model.cancel_active_requests()
+            thread.adapter.cancel_pending_tasks(reason=reason)
+        self.workspace_backend.cancel_active_commands(reason=reason)
 
     def _decision_error(
         self,
@@ -744,8 +915,6 @@ class ToolEnabledPeerBackend(PeerAgentBackend):
                 return "initial coder activation must hand off after delegated work"
         if request.must_complete and not decision.complete:
             return "the final allowed workflow turn must terminate"
-        if decision.next_role == request.role:
-            return "a handoff must target a different peer role"
         return None
 
     def _activation_prompt(
@@ -808,6 +977,10 @@ class ToolEnabledPeerBackend(PeerAgentBackend):
                 },
                 "thread_message_counts": {
                     thread.role: len(thread.messages) for thread in threads
+                },
+                "thread_context_compacted": {
+                    thread.role: thread.summarization_event is not None
+                    for thread in threads
                 },
                 "thread_history_sha256": {
                     thread.role: hashlib.sha256(

@@ -1,0 +1,39 @@
+{
+  "dataset": "princeton-nlp/SWE-bench_Verified",
+  "dataset_revision": "91aa3ed51b709be6457e12d00300a6a596d4c6a3",
+  "rollout_index": 0,
+  "schema_version": 2,
+  "selection_policy": "repository/version-isolated P6 collection; deterministic difficulty and version stratification",
+  "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/sphinx-doc__sphinx",
+  "split": "calibration",
+  "split_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/swebench_verified_split_v1.json",
+  "workloads": [
+    {
+      "base_commit": "f30284ef926ebaf04b176f21b421e2dffc679792",
+      "difficulty": "15 min - 1 hour",
+      "instance_id": "sphinx-doc__sphinx-7985",
+      "problem_statement": "linkcheck could also check local (internal) links\nSubject: linkcheck currently doesn't check local (internal) links, but this would be useful.\r\n\r\n<!--\r\n  Important: This is a list of issues for Sphinx, not a forum.\r\n  If you'd like to post a question, please move to sphinx-users group.\r\n  https://groups.google.com/forum/#!forum/sphinx-users\r\n\r\n  Thanks,\r\n-->\r\n\r\n### Problem\r\nSee above.\r\n\r\n#### Procedure to reproduce the problem\r\nCreate a template project with sphinx-quickstart, put the following in index.rst\r\n```\r\nbroken external-link_\r\nbroken local-link_\r\n\r\n.. _external-link: https://lkfqhlkghflkhs\r\n.. _local-link: doesntexist\r\n```\r\n\r\nRun `make linkcheck`\r\n\r\n#### Error logs / results\r\n```\r\nRunning Sphinx v1.7.6\r\nmaking output directory...\r\nloading pickled environment... done\r\nbuilding [mo]: targets for 0 po files that are out of date\r\nbuilding [linkcheck]: targets for 1 source files that are out of date\r\nupdating environment: 0 added, 0 changed, 0 removed\r\nlooking for now-outdated files... none found\r\npreparing documents... done\r\nwriting output... [100%] index                                                                   \r\n(line   14) -local-   doesntexist\r\n(line   14) broken    https://lkfqhlkghflkhs - HTTPSConnectionPool(host='lkfqhlkghflkhs', port=443): Max retries exceeded with url: / (Caused by NewConnectionError('<urllib3.connection.VerifiedHTTPSConnection object at 0x7faed7ddfc88>: Failed to establish a new connection: [Errno -2] Name or service not known',))\r\n\r\nbuild finished with problems.\r\nmake: *** [Makefile:20: linkcheck] Error 1\r\n```\r\n\r\n#### Expected results\r\nAlso a check for the local link.\r\n\r\n### Reproducible project / your project\r\nN/A\r\n\r\n### Environment info\r\n- OS: Arch Linux\r\n- Python version: 3.6\r\n- Sphinx version: 1.7.6\r\n\n",
+      "repo": "sphinx-doc/sphinx",
+      "rollout_index": 0,
+      "version": "3.2"
+    },
+    {
+      "base_commit": "5e6da19f0e44a0ae83944fb6ce18f18f781e1a6e",
+      "difficulty": "15 min - 1 hour",
+      "instance_id": "sphinx-doc__sphinx-8035",
+      "problem_statement": "Support defining specific `:private-members:` for autodoc\n**Is your feature request related to a problem? Please describe.**\r\nCurrently, if I'm using autodoc, the `:private-members:` option does not allow specification of which private members to document. The current behavior is to document all private members, but what if I would only like to document 1 or 2?\r\n\r\n**Describe the solution you'd like**\r\nFor `:private-members:` to take arguments, similarly to how `:members:` currently works\r\n\r\n**Describe alternatives you've considered**\r\nThe current best way to do this is to explicitly list each class in a module and use `:autoattribute:`\r\n\r\n- Some prior discussion: https://github.com/sphinx-doc/sphinx/issues/8009\r\n\r\n\n",
+      "repo": "sphinx-doc/sphinx",
+      "rollout_index": 0,
+      "version": "3.2"
+    },
+    {
+      "base_commit": "e188d56ed1248dead58f3f8018c0e9a3f99193f7",
+      "difficulty": "15 min - 1 hour",
+      "instance_id": "sphinx-doc__sphinx-8056",
+      "problem_statement": "Render error when combining multiple input parameters in docstring\n**Describe the bug & Reproduce**\r\n\r\nMy team is writing a function in Python, which contains 3 inputs that are similar, so we want to put them in the same line in the docstring. \r\n\r\nAs described in 4. Parameters in [numpydoc docstring guide](https://numpydoc.readthedocs.io/en/latest/format.html#sections), this is possible if you write something like this:\r\n\r\n```\r\nx1, x2 : array_like\r\n    Input arrays, description of `x1`, `x2`.\r\n```\r\n\r\nHowever, this produces:\r\n\r\n<img width=\"406\" alt=\"\u56fe\u7247\" src=\"https://user-images.githubusercontent.com/20618587/83668496-566d3680-a5d0-11ea-8a15-5596f77b6c20.png\">\r\n\r\nEven worse, when added \"optional\", the rendered HTML stays the same as the screenshot above, so there is no way to tell whether it is optional:\r\n\r\n```\r\nx1, x2 : array_like, optional\r\n    Input arrays, description of `x1`, `x2`.\r\n```\r\n\r\n**Expected behavior**\r\nSomething like \r\n\r\n- x1, x2 (_array_like, optional_)  -  Input arrays, description of x1, x2.\r\n\r\n**Environment info**\r\n- OS: macOS 10.15.5 (19F101)\r\n- Python version: 3.7.7\r\n- Sphinx version: 3.0.3.\r\n- Extra tools: browser: Firefox 79.0a1 or Safari 13.1.1\r\n- Sphinx extensions:  \r\n\r\n```\r\nextensions = [\r\n    \"sphinx.ext.autodoc\",\r\n    \"sphinx.ext.todo\",\r\n    \"sphinx.ext.coverage\",\r\n    \"sphinx.ext.extlinks\",\r\n    \"sphinx.ext.intersphinx\",\r\n    \"sphinx.ext.mathjax\",\r\n    \"sphinx.ext.viewcode\",\r\n    \"sphinx.ext.napoleon\",\r\n    \"nbsphinx\",\r\n    \"sphinx.ext.mathjax\",\r\n    \"sphinxcontrib.bibtex\",\r\n    \"sphinx.ext.doctest\",\r\n]\r\n```\r\n\r\n\n",
+      "repo": "sphinx-doc/sphinx",
+      "rollout_index": 0,
+      "version": "3.2"
+    }
+  ]
+}

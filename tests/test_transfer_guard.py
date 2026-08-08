@@ -9,6 +9,7 @@ from beliefkv.runtime.protocol import (
     CommandAck,
     CommandKind,
     CommandStatus,
+    ControlCommand,
     PageHandle,
     PhysicalResidency,
     TransferBlocker,
@@ -126,6 +127,68 @@ def test_frozen_p1_retry_storm_submits_one_command_per_physical_snapshot() -> No
     assert sum(
         event.kind == "transfer_retry_suppressed" for event in guard_events
     ) == 1
+
+
+def test_external_command_fails_fast_when_retry_guard_blocks_snapshot() -> None:
+    controller = _controller()
+    first = controller.tick(10)
+    assert first.transfer is not None
+    command = first.transfer.command
+    _ack_rejection(
+        controller,
+        command_id=command.command_id,
+        now_ms=10.1,
+        blocker_codes=(TransferBlockerCode.ENGINE_BUSY,),
+    )
+
+    accepted = controller.enqueue_control_command(
+        replace(command, command_id="restore-retry")
+    )
+
+    assert not accepted
+    assert len(controller.command_queue) == 0
+    assert controller.transfer_guard.summary()["suppressed_retry_count"] == 1
+
+
+def test_accepted_command_gets_local_ack_if_guard_blocks_before_dispatch() -> None:
+    controller = _controller()
+    command = ControlCommand(
+        command_id="accepted-restore",
+        kind=CommandKind.PREFETCH_CONTEXT,
+        created_ts_ms=10,
+        context_id="ctx",
+        context_epoch=0,
+        target_bytes=400,
+    )
+    assert controller.enqueue_control_command(command)
+
+    competing = replace(command, command_id="competing-restore")
+    controller.transfer_guard.begin_attempt(competing, now_ms=10.1)
+    controller.transfer_guard.record_failure(
+        competing.command_id,
+        blockers=(
+            TransferBlocker(
+                TransferBlockerCode.ENGINE_BUSY,
+                PageHandle(1, 0),
+                400,
+            ),
+        ),
+        required_bytes=400,
+        now_ms=10.2,
+    )
+
+    tick = controller.tick(11)
+
+    assert tick.transfer is None
+    assert len(tick.local_acks) == 1
+    ack = tick.local_acks[0]
+    assert ack.command_id == command.command_id
+    assert ack.status == CommandStatus.REJECTED
+    assert ack.reason == "transfer_retry_guard_suppressed"
+    assert tuple(item.code for item in ack.blockers) == (
+        TransferBlockerCode.ENGINE_BUSY,
+    )
+    assert len(controller.command_queue) == 0
 
 
 def test_prefetch_materializes_cpu_ancestor_as_one_physical_bundle() -> None:

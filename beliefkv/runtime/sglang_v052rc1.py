@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import atexit
 import copy
+import gc
+import inspect
+import json
+import os
+import signal
+import threading
+import time
 from collections import Counter, deque
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
-import json
-import time
 from pathlib import Path
 from typing import Any
 
@@ -32,15 +37,26 @@ from beliefkv.policy.admission import (
     ObservedAdmissionWindow,
 )
 from beliefkv.policy.joint_scheduler import (
+    AsyncSemanticJointPlanner,
     JointPlanComponentValidation,
     JointPlanCurrentState,
     JointPlanValidation,
     JointPlannerConfig,
-    ObservedJointPlanner,
+    JointPlannerMode,
+    SemanticResidencyTarget,
     validate_joint_plan,
     validate_joint_plan_components,
 )
+from beliefkv.policy.online_joint import (
+    ActionSlice,
+    OnlineJointPlanDecision,
+    OnlineJointPlanView,
+    append_committed_action_slice,
+    compile_bounded_seed_epoch,
+    compile_online_joint_view,
+)
 from beliefkv.policy.reference import (
+    AdmissionAction,
     CapabilityReport,
     PolicyInput,
     ResidencyAction,
@@ -58,6 +74,9 @@ from beliefkv.policy.retraction import (
     RunningRetractionPlan,
 )
 from beliefkv.policy.resource_snapshot import RuntimeResourceObservation
+from beliefkv.predictor.online_shadow import (
+    build_invocation_frontier_predictions,
+)
 from beliefkv.runtime.audit import (
     PolicySnapshotLog,
     RequestTokenTraceLog,
@@ -83,12 +102,58 @@ from beliefkv.runtime.lock_service import (
     TentativeUnlockPreview,
     TentativeUnlockPreviewer,
 )
+
+
+def close_runtime_with_signal_shield(runtime: "EmbeddedSGLangRuntime") -> None:
+    """Let the scheduler persist its bounded shutdown transaction before exit."""
+
+    previous_handlers: dict[signal.Signals, Any] = {}
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGQUIT):
+            try:
+                previous_handlers[signum] = signal.signal(signum, signal.SIG_IGN)
+            except (OSError, ValueError):
+                continue
+    try:
+        runtime.close()
+    finally:
+        for signum, handler in previous_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (OSError, ValueError):
+                pass
+
+
+def install_scheduler_shutdown_handler() -> Any:
+    """Convert scheduler SIGTERM into a Python unwind so ``finally`` can ACK."""
+
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("scheduler shutdown handler requires the main thread")
+
+    def handle_sigterm(_signum: int, _frame: Any) -> None:
+        raise SystemExit(0)
+
+    return signal.signal(signal.SIGTERM, handle_sigterm)
+
+
+def _linux_process_start_time_ticks(pid: int) -> int | None:
+    """Return /proc start time so a controller can reject a reused PID."""
+
+    try:
+        tail = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1]
+        return int(tail.split()[19])
+    except (IndexError, OSError, ValueError):
+        return None
+
+
 from beliefkv.runtime.protocol import (
     CommandAck,
     CommandKind,
     CommandQueueClass,
     CommandStatus,
     ControlCommand,
+    EnqueueOutcome,
+    EnqueueStatus,
     PageHandle,
     PhysicalPageAction,
     PhysicalResidency,
@@ -98,6 +163,28 @@ from beliefkv.runtime.protocol import (
     TransferBlockerCode,
     TransferDirection,
     TransferTelemetry,
+)
+from beliefkv.runtime.restore_obligation import (
+    ExternalProgressToken,
+    NativeQueueLocation,
+    NativeRequestPhysicalSnapshot,
+    SafePointPhysicalPhase,
+    SafePointPhysicalSnapshot,
+    SafePointSnapshotBuildTiming,
+    RestoreAuthorityMode,
+    RestoreFeasibilityCertificate,
+    RestoreLease,
+    RestoreLeaseIndex,
+    RestoreLeaseState,
+    RestoreObligation,
+    RestoreObligationCause,
+    RestoreObligationIndex,
+    RestoreObligationState,
+    PersistentLivenessRevisionTracker,
+    RestoreServiceGrace,
+    RestorePhysicalOperation,
+    RestoreTransaction,
+    RestoreTransactionStage,
 )
 from beliefkv.runtime.sglang_adapter import (
     BASE_SGLANG_VERSION,
@@ -223,6 +310,12 @@ class _PendingNodeCommand:
     h2d_expected_tokens: int = 0
     h2d_allocator_available_before: int | None = None
     h2d_allocator_available_after_submit: int | None = None
+    transfer_host_copy_state: dict[TransferDirection, str] = field(
+        default_factory=dict
+    )
+    pinned_host: bool | None = None
+    native_concurrent_bytes: int = 0
+    allocator_submit_ms: float = 0.0
     cancel_requested: bool = False
 
 
@@ -249,6 +342,29 @@ class _RunningRetractionTransaction:
     explicit_reclaim_bytes: int = 0
     explicit_transfer_bytes: int = 0
     command_attempt_count: int = 0
+    failure_reason: str | None = None
+    source_joint_plan_id: str | None = None
+    restore_path_extent_ids: dict[str, tuple[str, ...]] = field(
+        default_factory=dict
+    )
+    restore_micro_gate_id: str | None = None
+
+
+@dataclass
+class _OnlineJointResidencyTransaction:
+    transaction_id: str
+    plan_id: str
+    intent_index: int
+    source_bundle_id: str
+    action: ResidencyAction
+    command_id: str
+    command_kind: CommandKind
+    context_id: str
+    physical_bundle_id: str
+    created_ts_ms: float
+    stage: str = "queued"
+    completed_ts_ms: float | None = None
+    actual_bytes: int = 0
     failure_reason: str | None = None
 
 
@@ -280,6 +396,7 @@ class HiCacheNodeCommandBackend:
         *,
         now_ms: Any | None = None,
         h2d_context_is_busy: Any | None = None,
+        kv_bytes_per_token: int = 0,
     ) -> None:
         required = (
             "write_backup",
@@ -298,6 +415,7 @@ class HiCacheNodeCommandBackend:
         self.registry = registry
         self._now_ms = now_ms or (lambda: time.monotonic() * 1000.0)
         self._h2d_context_is_busy = h2d_context_is_busy
+        self._kv_bytes_per_token = max(0, int(kv_bytes_per_token))
         self._pending: dict[str, _PendingNodeCommand] = {}
         self._acks: list[CommandAck] = []
         self._telemetry: list[TransferTelemetry] = []
@@ -323,6 +441,7 @@ class HiCacheNodeCommandBackend:
         if command_id in self._pending:
             raise SGLangBackendError(f"duplicate command: {command_id}")
         pending = _PendingNodeCommand(command, submit_ts_ms=float(self._now_ms()))
+        pending.pinned_host = self._pinned_host_state()
         self._pending[command_id] = pending
         atomic_bundle = command.command.physical_bundle is not None
         if (
@@ -517,11 +636,21 @@ class HiCacheNodeCommandBackend:
             )
         pending.h2d_expected_tokens = expected_tokens
         pending.h2d_allocator_available_before = available_before
-        loaded = self.tree_cache.load_back(
-            leaf_node,
-            force=True,
-            allow_eviction=False,
-            beliefkv_source="explicit",
+        pending.transfer_host_copy_state[TransferDirection.H2D] = "present"
+        allocator_submit_started_ns = time.perf_counter_ns()
+        try:
+            loaded = self.tree_cache.load_back(
+                leaf_node,
+                force=True,
+                allow_eviction=False,
+                beliefkv_source="explicit",
+            )
+        finally:
+            pending.allocator_submit_ms += (
+                time.perf_counter_ns() - allocator_submit_started_ns
+            ) / 1_000_000.0
+        pending.native_concurrent_bytes = max(
+            pending.native_concurrent_bytes, self._native_inflight_bytes()
         )
         if loaded is None:
             raise SGLangBackendError(
@@ -887,9 +1016,16 @@ class HiCacheNodeCommandBackend:
                 else:
                     pending.completed_handles.add(handle)
             else:
-                written = self.tree_cache.write_backup(
-                    node, beliefkv_source="explicit"
-                )
+                pending.transfer_host_copy_state[TransferDirection.D2H] = "missing"
+                allocator_submit_started_ns = time.perf_counter_ns()
+                try:
+                    written = self.tree_cache.write_backup(
+                        node, beliefkv_source="explicit"
+                    )
+                finally:
+                    pending.allocator_submit_ms += (
+                        time.perf_counter_ns() - allocator_submit_started_ns
+                    ) / 1_000_000.0
                 if written <= 0:
                     raise SGLangBackendError(
                         "HiCache host allocation failed",
@@ -897,6 +1033,14 @@ class HiCacheNodeCommandBackend:
                         required_bytes=size_bytes,
                     )
                 pending.transfer_handles.add(handle)
+                pending.native_concurrent_bytes = max(
+                    pending.native_concurrent_bytes,
+                    self._native_inflight_bytes(),
+                )
+            if getattr(node, "host_value", None) is not None:
+                pending.transfer_host_copy_state.setdefault(
+                    TransferDirection.D2H, "present"
+                )
             pending.accepted_handles.add(handle)
         elif action == PhysicalPageAction.COMMIT_CPU:
             if (
@@ -938,12 +1082,19 @@ class HiCacheNodeCommandBackend:
                         required_bytes=size_bytes,
                     )
                 ancestor = getattr(ancestor, "parent", None)
-            loaded = self.tree_cache.load_back(
-                node,
-                force=True,
-                allow_eviction=False,
-                beliefkv_source="explicit",
-            )
+            pending.transfer_host_copy_state[TransferDirection.H2D] = "present"
+            allocator_submit_started_ns = time.perf_counter_ns()
+            try:
+                loaded = self.tree_cache.load_back(
+                    node,
+                    force=True,
+                    allow_eviction=False,
+                    beliefkv_source="explicit",
+                )
+            finally:
+                pending.allocator_submit_ms += (
+                    time.perf_counter_ns() - allocator_submit_started_ns
+                ) / 1_000_000.0
             if loaded is None:
                 raise SGLangBackendError(
                     "HiCache device allocation failed",
@@ -952,6 +1103,9 @@ class HiCacheNodeCommandBackend:
                 )
             pending.accepted_handles.add(handle)
             pending.transfer_handles.add(handle)
+            pending.native_concurrent_bytes = max(
+                pending.native_concurrent_bytes, self._native_inflight_bytes()
+            )
         elif action == PhysicalPageAction.DROP:
             if getattr(node, "value", None) is None:
                 if getattr(node, "host_value", None) is None:
@@ -1125,6 +1279,23 @@ class HiCacheNodeCommandBackend:
         telemetry = self._telemetry
         self._telemetry = []
         return telemetry
+
+    def _pinned_host_state(self) -> bool | None:
+        value = getattr(
+            getattr(self.tree_cache, "token_to_kv_pool_host", None),
+            "pin_memory",
+            None,
+        )
+        return bool(value) if value is not None else None
+
+    def _native_inflight_bytes(self) -> int:
+        metadata = getattr(self.tree_cache, "beliefkv_transfer_metadata", {})
+        tokens = sum(
+            max(0, int(record.get("token_count", 0)))
+            for direction_records in metadata.values()
+            for record in direction_records.values()
+        )
+        return tokens * self._kv_bytes_per_token
 
     def _refresh(self, pending: _PendingNodeCommand) -> None:
         if pending.resolved.command.physical_bundle is not None:
@@ -1521,8 +1692,32 @@ class HiCacheNodeCommandBackend:
                     context_epoch=command.context_epoch,
                     command_kind=command.kind.value,
                     compute_phase=str(command.metadata.get("compute_phase", "unknown")),
+                    host_copy_state=pending.transfer_host_copy_state.get(
+                        direction, "unknown"
+                    ),
+                    pinned_host=pending.pinned_host,
+                    native_concurrent_bytes=pending.native_concurrent_bytes,
+                    allocator_submit_ms=(
+                        pending.allocator_submit_ms
+                        if selected & pending.transfer_handles
+                        else None
+                    ),
+                    callback_overhead_ms=max(
+                        0.0, float(self._now_ms()) - complete_ts_ms
+                    ),
+                    start_timestamp_semantics=(
+                        "hicache_api_submit_begin"
+                        if pending.start_ts_ms is not None
+                        else "unavailable"
+                    ),
                 )
             )
+
+
+_JOINT_DECISION_REUSE_INTERVAL_MS = 100.0
+_JOINT_SIGNATURE_CHECK_INTERVAL_MS = 10.0
+_ACK_POLL_INTERVAL_MS = 5.0
+_POLICY_CHECK_INTERVAL_MS = 5.0
 
 
 class EmbeddedSGLangRuntime:
@@ -1547,10 +1742,12 @@ class EmbeddedSGLangRuntime:
         self.tree_cache = scheduler.tree_cache
         self._now_ms = now_ms or (lambda: time.monotonic() * 1000.0)
         self.config = config or self._load_config(scheduler, config_path)
-        if self.config.joint_policy_enabled:
+        if self.config.joint_policy_enabled and not (
+            self.config.joint_policy_shadow_mode
+            and self.config.joint_observed_mode_enabled
+        ):
             raise SGLangBackendError(
-                "online JointPlan application is not implemented in P4; "
-                "set joint_policy_enabled=false and use shadow mode"
+                "online observed JointPlan requires its validated shadow worker"
             )
         self.controller = BeliefKVController(self.config)
         self.registry = SGLangNodeRegistry()
@@ -1559,6 +1756,7 @@ class EmbeddedSGLangRuntime:
             self.registry,
             now_ms=self._now_ms,
             h2d_context_is_busy=self._context_has_engine_request,
+            kv_bytes_per_token=self.config.kv_bytes_per_token,
         )
         self.bridge = SGLangSchedulerBridge(self.controller, self.backend)
         self._admission_epoch = 0
@@ -1583,7 +1781,7 @@ class EmbeddedSGLangRuntime:
         self._observed_admission_mode_counts: Counter[str] = Counter()
         self._observed_admission_peak_active_kv_bytes = 0
         self._observed_admission_peak_pressure = 0.0
-        self.running_retraction_planner = ObservedRetractionPlanner(
+        self._joint_retraction_solver = ObservedRetractionPlanner(
             ObservedRetractionConfig(
                 minimum_admission_stall_ms=(
                     self.config.running_batch_retraction_min_stall_ms
@@ -1602,6 +1800,10 @@ class EmbeddedSGLangRuntime:
         self._retraction_barrier_sequence = 0
         self._retraction_counts_by_request: Counter[str] = Counter()
         self._retraction_cooldown_until_by_request: dict[str, float] = {}
+        self._restore_service_grace_by_request: dict[
+            str, RestoreServiceGrace
+        ] = {}
+        self._persistent_liveness_revisions = PersistentLivenessRevisionTracker()
         self._pending_selective_retraction_ids: set[str] = set()
         self._retracted_engine_request_ids: set[str] = set()
         self._retraction_priority_request_ids: tuple[str, ...] = ()
@@ -1625,16 +1827,54 @@ class EmbeddedSGLangRuntime:
         )
         self._running_retraction_actual_reclaim_bytes = 0
         self._running_retraction_actual_lock_release_bytes = 0
+        self._restore_micro_gate_state: dict[str, Any] = {
+            "enabled": self.config.restore_micro_gate_enabled,
+            "gate_id": self.config.restore_micro_gate_id,
+            "stage": (
+                "armed" if self.config.restore_micro_gate_enabled else "disabled"
+            ),
+            "victim_workflow_id": (
+                self.config.restore_micro_gate_victim_workflow_id
+            ),
+            "replacement_workflow_id": (
+                self.config.restore_micro_gate_replacement_workflow_id
+            ),
+        }
+        self._restore_micro_gate_last_audit_signature: tuple[object, ...] | None = (
+            None
+        )
+        self._restore_obligations = RestoreObligationIndex(
+            max_active=self.config.restore_obligation_max_active
+        )
+        self._restore_leases = RestoreLeaseIndex(
+            max_active=self.config.restore_lease_max_active
+        )
+        self._restore_lease_allocations: dict[str, list[Any]] = {}
+        self._restore_funding_allocations: dict[str, list[Any]] = {}
+        self._restore_funding_target_by_command: dict[str, dict[str, int]] = {}
+        self._restore_lease_pins: dict[str, tuple[Any, Any, bool]] = {}
+        self._restore_obligation_counts: Counter[str] = Counter()
+        self._restore_command_to_request: dict[str, set[str]] = {}
+        self._restore_transactions: dict[str, RestoreTransaction] = {}
+        self._restore_authority_mode = RestoreAuthorityMode.NORMAL_JOINT
+        self._restore_authority_request_id: str | None = None
+        self._restore_certificate_sequence = 0
+        self._restore_command_sequence = 0
         self._h2d_context_by_command: dict[str, tuple[str, tuple[str, ...]]] = {}
         self._pending_h2d_contexts: set[str] = set()
         self._active_request_ids: set[str] = set()
         self._request_metadata_by_id: dict[str, BeliefKVRequestMetadata] = {}
         self._request_submitted_ts_by_id: dict[str, float] = {}
         self._request_physical_start_by_id: dict[str, dict[str, Any]] = {}
+        self._aborted_request_physical_start_by_id: dict[
+            str, dict[str, Any]
+        ] = {}
         self._pending_request_physical_finish_by_id: dict[
             str, dict[str, Any]
         ] = {}
         self._terminal_cancelled_request_ids: set[str] = set()
+        self._queue_timeout_request_ids: set[str] = set()
+        self._execution_timeout_request_ids: set[str] = set()
         self._terminal_node_by_context: dict[str, Any] = {}
         self._event_sequence = 0
         self._linked_invocations: set[str] = set()
@@ -1648,6 +1888,13 @@ class EmbeddedSGLangRuntime:
         self._scheduler_timing_samples: deque[tuple[float, float, int]] = deque(
             maxlen=65_536
         )
+        self._native_physical_snapshot_timing_samples: deque[
+            SafePointSnapshotBuildTiming
+        ] = deque(maxlen=65_536)
+        self._native_physical_snapshot_counts: Counter[str] = Counter()
+        self._safe_point_physical_epoch_sequence = 0
+        self._safe_point_physical_phase = SafePointPhysicalPhase.IDLE
+        self._safe_point_physical_snapshot: SafePointPhysicalSnapshot | None = None
         self._ticket_timing_samples: dict[str, deque[float]] = {
             "compile_ms": deque(maxlen=65_536),
             "validation_ms": deque(maxlen=65_536),
@@ -1655,8 +1902,12 @@ class EmbeddedSGLangRuntime:
         self._gpu_service_launches: deque[dict[str, Any] | None] = deque()
         self._gpu_service_sequence = 0
         self._gpu_service_sample_count = 0
+        self._gpu_service_sample_cap_count = 0
         self._gpu_service_previous_completion_ms: float | None = None
         self._gpu_service_prefill_chunks_by_episode: dict[str, int] = {}
+        self._gpu_service_observer_timing_samples: deque[tuple[float, float]] = (
+            deque(maxlen=65_536)
+        )
         self._lock_service_ledger = RequestServiceLedger()
         self._lock_service_observer_error_count = 0
         self._lock_service_snapshot_count = 0
@@ -1667,7 +1918,41 @@ class EmbeddedSGLangRuntime:
         self._removed_radix_nodes: dict[int, Any] = {}
         self._dirty_context_ids: set[str] = set()
         self._closed = False
-        self.audit = RuntimeAuditLog(self.config.runtime_audit_path)
+        self._shutdown_state = "running"
+        self._shutdown_prepare_ms: float | None = None
+        self._shutdown_prepare_transaction_snapshot: dict[str, Any] | None = None
+        self._last_runtime_summary_ms: float | None = None
+        self.audit = RuntimeAuditLog(
+            self.config.runtime_audit_path,
+            max_pending=self.config.runtime_audit_queue_capacity,
+            debug_sample_rate=self.config.runtime_audit_debug_sample_rate,
+            max_debug_event_bytes=(
+                self.config.runtime_audit_max_debug_event_bytes
+            ),
+            flush_interval_s=self.config.runtime_audit_flush_interval_s,
+        )
+        runtime_summary_path = self.config.runtime_summary_path
+        if runtime_summary_path is None and self.config.runtime_audit_path is not None:
+            runtime_summary_path = str(
+                Path(self.config.runtime_audit_path).with_name(
+                    "latest_runtime_summary.json"
+                )
+            )
+        self._runtime_summary_path = (
+            Path(runtime_summary_path).expanduser().resolve()
+            if runtime_summary_path is not None
+            else None
+        )
+        self._runtime_scheduler_pid_path = (
+            Path(self.config.runtime_scheduler_pid_path).expanduser().resolve()
+            if self.config.runtime_scheduler_pid_path is not None
+            else None
+        )
+        self._runtime_shutdown_ack_path = (
+            Path(self.config.runtime_shutdown_ack_path).expanduser().resolve()
+            if self.config.runtime_shutdown_ack_path is not None
+            else None
+        )
         policy_snapshot_path = self.config.reference_policy_snapshot_path
         if (
             policy_snapshot_path is None
@@ -1717,6 +2002,9 @@ class EmbeddedSGLangRuntime:
         ) = None
         self._last_policy_snapshot_hbm_bucket: int | None = None
         self._last_policy_snapshot_ms: float | None = None
+        self._last_policy_snapshot_cheap_signature: (
+            tuple[object, ...] | None
+        ) = None
         self._last_persisted_policy_snapshot_ms: float | None = None
         self._shadow_event_sequence = 0
         self._shadow_page_revision = 0
@@ -1724,8 +2012,40 @@ class EmbeddedSGLangRuntime:
         self.joint_shadow_worker: LatestWinsJointPlanWorker | None = None
         self._last_joint_shadow_result_sequence = 0
         self._joint_shadow_counts: Counter[str] = Counter()
+        self._joint_predictive_counts: Counter[str] = Counter()
+        self._last_frontier_predictions: dict[str, dict[str, object]] = {}
         self._joint_shadow_strict_stale_reasons: Counter[str] = Counter()
         self._joint_shadow_readset_stale_reasons: Counter[str] = Counter()
+        self._online_joint_result: JointShadowResult | None = None
+        self._online_joint_source: PolicyInput | None = None
+        self._online_joint_validation: JointPlanComponentValidation | None = None
+        self._online_joint_counts: Counter[str] = Counter()
+        self._last_joint_decision_plan_id: str | None = None
+        self._last_joint_decision_ms: float | None = None
+        self._last_joint_signature_check_ms: float | None = None
+        self._last_joint_decision_state_signature: (
+            tuple[object, ...] | None
+        ) = None
+        self._last_ack_poll_ms: float | None = None
+        self._last_policy_check_ms: float | None = None
+        self._online_joint_epoch_sequence = 0
+        self._current_joint_plan_epoch = None
+        self._current_online_joint_view: OnlineJointPlanView | None = None
+        self._current_online_joint_decision: OnlineJointPlanDecision | None = None
+        self._current_semantic_residency_commit: (
+            tuple[str, int, SemanticResidencyTarget, PhysicalBundlePreview] | None
+        ) = None
+        self._online_joint_residency_sequence = 0
+        self._pending_online_joint_residency: (
+            _OnlineJointResidencyTransaction | None
+        ) = None
+        self._online_joint_residency_history: deque[
+            _OnlineJointResidencyTransaction
+        ] = deque(maxlen=65_536)
+        self._online_joint_last_residency_action: dict[
+            str, tuple[ResidencyAction, float]
+        ] = {}
+        self._online_joint_hysteresis_audit: set[tuple[str, str]] = set()
         self._last_joint_detailed_audit_ms: float | None = None
         self._last_joint_detailed_signature: tuple[object, ...] | None = None
         self._joint_shadow_timing_samples: dict[str, deque[float]] = {
@@ -1741,6 +2061,7 @@ class EmbeddedSGLangRuntime:
                 "plan_compute_ms",
                 "plan_publish_to_safe_point_ms",
                 "validation_ms",
+                "physical_commit_ms",
                 "plan_age_ms",
             )
         }
@@ -1751,7 +2072,7 @@ class EmbeddedSGLangRuntime:
         self._joint_shadow_disabled_reason: str | None = None
         if not joint_shadow_requested:
             self._joint_shadow_disabled_reason = "disabled_by_config"
-        elif not self.audit.enabled:
+        elif not self.audit.enabled and not self.config.joint_policy_enabled:
             self._joint_shadow_disabled_reason = "runtime_audit_disabled"
         transfer_telemetry_path = self.config.transfer_telemetry_path
         if (
@@ -1787,7 +2108,7 @@ class EmbeddedSGLangRuntime:
         self.tree_cache.beliefkv_observer = self
         self.sync_tree()
         if self._joint_shadow_disabled_reason is None:
-            planner = ObservedJointPlanner(
+            planner = AsyncSemanticJointPlanner(
                 JointPlannerConfig(
                     fairness_lag_budget_ms=self.config.fairness_lag_budget_ms,
                     max_workflow_candidates=(
@@ -1803,6 +2124,10 @@ class EmbeddedSGLangRuntime:
                         self.config.max_joint_package_evaluations
                     ),
                     max_planning_budget_ms=self.config.max_joint_plan_budget_ms,
+                    min_planning_budget_ms=self.config.min_joint_plan_budget_ms,
+                    trigger_interval_budget_fraction=(
+                        self.config.joint_trigger_budget_fraction
+                    ),
                     max_plan_age_ms=self.config.max_joint_plan_age_ms,
                     residency_hysteresis_ms=self.config.residency_hysteresis_ms,
                 )
@@ -1821,10 +2146,11 @@ class EmbeddedSGLangRuntime:
             hicache_capabilities=asdict(self.backend.capabilities),
             transfer_time_semantics={
                 "submit": "scheduler_backend_submit",
-                "start": "hicache_operation_enqueue",
+                "start": "hicache_api_submit_begin_not_dma_start",
                 "complete": "scheduler_observed_hicache_ack",
                 "first_layer_ready": "unavailable",
                 "compute_wait": "unavailable",
+                "allocator_submit": "synchronous_allocator_and_copy_api_staging",
             },
             telemetry_availability={
                 "hbm_allocator": True,
@@ -1858,13 +2184,18 @@ class EmbeddedSGLangRuntime:
                 "requested": joint_shadow_requested,
                 "enabled": self.joint_shadow_worker is not None,
                 "disabled_reason": self._joint_shadow_disabled_reason,
-                "planner": "belief_joint_observed",
+                "planner": (
+                    "belief_joint_semantic_predictive"
+                    if self.config.joint_predictive_enabled
+                    else "belief_joint_observed"
+                ),
                 "worker_queue": "latest_wins_capacity_1_lossless_delta_merge",
                 "snapshot_builder": "worker_owned_incremental_mirror",
                 "validation": "dependency_scoped_optimistic",
                 "strict_global_comparator": True,
-                "application_connected": False,
+                "application_connected": self.config.joint_policy_enabled,
                 "joint_policy_enabled_requested": self.config.joint_policy_enabled,
+                "joint_predictive_enabled": self.config.joint_predictive_enabled,
                 "max_plan_age_ms": self.config.max_joint_plan_age_ms,
             },
             observed_admission_scheduling={
@@ -1881,7 +2212,19 @@ class EmbeddedSGLangRuntime:
                     self.config.running_batch_retraction_enabled
                 ),
                 "retraction_mode": "observed_selective_drop_or_recompute",
-                "residency_control": "reactive_unchanged",
+                "residency_control": (
+                    "validated_joint_plan_single_writer"
+                    if self.config.joint_policy_enabled
+                    else "reactive"
+                ),
+            },
+            restore_liveness={
+                "allocator_backed_lease": self.config.restore_lease_enabled,
+                "debt_owned_funding_reservation": True,
+                "service_grace_decode_tokens": (
+                    self.config.restore_service_grace_decode_tokens
+                ),
+                "normal_admission_barrier_persists_during_active_lease": True,
             },
             request_token_trace={
                 "enabled": self.request_token_trace_log.enabled,
@@ -1898,13 +2241,690 @@ class EmbeddedSGLangRuntime:
                 ),
             },
         )
+        self._write_scheduler_identity()
         atexit.register(self.close)
 
+    def _write_scheduler_identity(self) -> None:
+        path = getattr(self, "_runtime_scheduler_pid_path", None)
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "pid": os.getpid(),
+            "linux_start_time_ticks": _linux_process_start_time_ticks(os.getpid()),
+            "run_id": getattr(getattr(self, "audit", None), "run_id", None),
+        }
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(payload, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+
+    def _write_shutdown_ack(self) -> None:
+        path = getattr(self, "_runtime_shutdown_ack_path", None)
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "pid": os.getpid(),
+            "linux_start_time_ticks": _linux_process_start_time_ticks(os.getpid()),
+            "run_id": getattr(getattr(self, "audit", None), "run_id", None),
+            "shutdown_state": getattr(self, "_shutdown_state", None),
+            "final_runtime_summary": (
+                str(self._runtime_summary_path)
+                if getattr(self, "_runtime_summary_path", None) is not None
+                else None
+            ),
+        }
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(payload, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+
+    def _runtime_summary_payload(
+        self, *, now_ms: float, final: bool
+    ) -> dict[str, Any]:
+        scheduler = getattr(self, "scheduler", None)
+        running_batch = getattr(scheduler, "running_batch", None)
+        controller = getattr(self, "controller", None)
+        graph = getattr(controller, "graph", None)
+        online_residency = getattr(self, "_pending_online_joint_residency", None)
+        retraction = getattr(
+            self, "_pending_running_retraction_transaction", None
+        )
+        current_view = getattr(self, "_current_online_joint_view", None)
+        inflight_command_ids = sorted(
+            getattr(controller, "inflight_command_ids", ()) or ()
+        )
+        pending_transaction_ids = tuple(
+            item
+            for item in (
+                (
+                    online_residency.transaction_id
+                    if online_residency is not None
+                    else None
+                ),
+                retraction.transaction_id if retraction is not None else None,
+                *(
+                    item.obligation_id
+                    for item in (
+                        getattr(self, "_restore_obligations", None).active()
+                        if getattr(self, "_restore_obligations", None) is not None
+                        else ()
+                    )
+                ),
+            )
+            if item is not None
+        )
+        missing_source_count = int(
+            getattr(self, "_online_joint_counts", {}).get(
+                "online_action_missing_source_joint_plan_id", 0
+            )
+        )
+        physical_snapshot_samples = tuple(
+            getattr(self, "_native_physical_snapshot_timing_samples", ())
+        )
+        physical_snapshot_counts = getattr(
+            self, "_native_physical_snapshot_counts", Counter()
+        )
+        scheduler_step_count = int(
+            physical_snapshot_counts.get("scheduler_step_count", 0)
+        )
+        physical_snapshot_build_ms = tuple(
+            item.total_ms for item in physical_snapshot_samples
+        )
+        max_physical_snapshot = max(
+            physical_snapshot_samples,
+            key=lambda item: item.total_ms,
+            default=None,
+        )
+        obligation_index = getattr(self, "_restore_obligations", None)
+        all_obligations = (
+            obligation_index.all() if obligation_index is not None else ()
+        )
+        obligation_state_counts = Counter(
+            item.state.value for item in all_obligations
+        )
+        obligation_reason_counts = Counter(
+            item.terminal_reason or "nonterminal" for item in all_obligations
+        )
+        non_user_unsatisfied = tuple(
+            item.obligation_id
+            for item in all_obligations
+            if item.state != RestoreObligationState.SATISFIED
+            and not (
+                item.state == RestoreObligationState.CANCELLED
+                and item.terminal_reason == "request_aborted"
+            )
+        )
+        allowed_unrecoverable_reasons = {
+            "authoritative_cache_reset",
+            "backend_permanent_failure",
+            "context_exceeds_hbm_capacity",
+            "raw_input_unavailable",
+        }
+        failed_unrecoverable = tuple(
+            item
+            for item in all_obligations
+            if item.state == RestoreObligationState.FAILED
+        )
+        failed_unrecoverable_evidence = {
+            item.obligation_id: dict(
+                getattr(
+                    getattr(self, "_restore_transactions", {}).get(
+                        item.request_id
+                    ),
+                    "failure_evidence",
+                    {},
+                )
+            )
+            for item in failed_unrecoverable
+        }
+        failed_unrecoverable_evidence_complete = all(
+            item.terminal_reason in allowed_unrecoverable_reasons
+            and bool(failed_unrecoverable_evidence.get(item.obligation_id))
+            for item in failed_unrecoverable
+        )
+        shutdown_prepare_transactions = getattr(
+            self, "_shutdown_prepare_transaction_snapshot", None
+        )
+        shutdown_cleanup_masked_unresolved = bool(
+            shutdown_prepare_transactions
+            and any(bool(value) for value in shutdown_prepare_transactions.values())
+        )
+        return {
+            "schema_version": 1,
+            "run_id": getattr(getattr(self, "audit", None), "run_id", None),
+            "ts_ms": now_ms,
+            "final": final,
+            "shutdown_state": getattr(self, "_shutdown_state", "running"),
+            "queue": {
+                "waiting_request_count": len(
+                    tuple(getattr(scheduler, "waiting_queue", ()) or ())
+                ),
+                "running_request_count": len(
+                    tuple(getattr(running_batch, "reqs", ()) or ())
+                ),
+                "chunked_request_present": bool(
+                    getattr(scheduler, "chunked_req", None)
+                ),
+            },
+            "graph": {
+                "workflow_count": len(getattr(graph, "workflows", {}) or {}),
+                "invocation_count": len(getattr(graph, "invocations", {}) or {}),
+                "context_count": len(getattr(graph, "contexts", {}) or {}),
+            },
+            "transactions": {
+                "inflight_command_ids": inflight_command_ids,
+                "pending_online_residency_transaction_id": (
+                    online_residency.transaction_id
+                    if online_residency is not None
+                    else None
+                ),
+                "pending_retraction_transaction_id": (
+                    retraction.transaction_id if retraction is not None else None
+                ),
+                "active_restore_obligation_ids": [
+                    item.obligation_id
+                    for item in (
+                        getattr(self, "_restore_obligations", None).active()
+                        if getattr(self, "_restore_obligations", None) is not None
+                        else ()
+                    )
+                ],
+                "active_restore_lease_ids": [
+                    item.lease_id
+                    for item in (
+                        getattr(self, "_restore_leases", None).active()
+                        if getattr(self, "_restore_leases", None) is not None
+                        else ()
+                    )
+                ],
+                "restore_lease_reserved_bytes": (
+                    getattr(self, "_restore_leases", None).reserved_bytes
+                    if getattr(self, "_restore_leases", None) is not None
+                    else 0
+                ),
+                "restore_funding_reserved_bytes": sum(
+                    len(item) * self.config.kv_bytes_per_token
+                    for allocations in getattr(
+                        self, "_restore_funding_allocations", {}
+                    ).values()
+                    for item in allocations
+                ),
+                "active_restore_service_grace": {
+                    request_id: {
+                        "obligation_id": grace.obligation_id,
+                        "served_decode_tokens": grace.served_decode_tokens,
+                        "required_decode_tokens": grace.required_decode_tokens,
+                    }
+                    for request_id, grace in sorted(
+                        getattr(
+                            self, "_restore_service_grace_by_request", {}
+                        ).items()
+                    )
+                    if grace.active
+                },
+                "restore_obligation_outcomes": {
+                    "state_counts": dict(sorted(obligation_state_counts.items())),
+                    "terminal_reason_counts": dict(
+                        sorted(obligation_reason_counts.items())
+                    ),
+                    "non_user_unsatisfied_obligation_ids": list(
+                        non_user_unsatisfied
+                    ),
+                    "failed_unrecoverable_evidence": (
+                        failed_unrecoverable_evidence
+                    ),
+                },
+                "shutdown_prepare_snapshot": shutdown_prepare_transactions,
+            },
+            "joint_control": {
+                "current_plan_id": (
+                    current_view.plan_id if current_view is not None else None
+                ),
+                "online_counts": dict(
+                    sorted(getattr(self, "_online_joint_counts", {}).items())
+                ),
+                "retraction_counts": dict(
+                    sorted(
+                        getattr(self, "_running_retraction_counts", {}).items()
+                    )
+                ),
+                "restore_micro_gate": dict(
+                    getattr(self, "_restore_micro_gate_state", {})
+                ),
+            },
+            "physical_ownership_snapshot": {
+                "semantics": "native_queue_and_transfer_state_rebuild",
+                "call_count": int(physical_snapshot_counts.get("call_count", 0)),
+                "scheduler_step_count": scheduler_step_count,
+                "calls_per_scheduler_step": (
+                    physical_snapshot_counts.get("call_count", 0)
+                    / scheduler_step_count
+                    if scheduler_step_count
+                    else 0.0
+                ),
+                "retained_sample_count": len(physical_snapshot_samples),
+                "build_ms": {
+                    "total": sum(physical_snapshot_build_ms),
+                    "mean": (
+                        sum(physical_snapshot_build_ms)
+                        / len(physical_snapshot_build_ms)
+                        if physical_snapshot_build_ms
+                        else 0.0
+                    ),
+                    "p50": percentile(physical_snapshot_build_ms, 50),
+                    "p95": percentile(physical_snapshot_build_ms, 95),
+                    "p99": percentile(physical_snapshot_build_ms, 99),
+                    "max": max(physical_snapshot_build_ms, default=0.0),
+                },
+                "queue_records_scanned": {
+                    "total": int(
+                        physical_snapshot_counts.get(
+                            "queue_records_scanned_total", 0
+                        )
+                    ),
+                    "max_per_call": max(
+                        (
+                            item.queue_record_count
+                            for item in physical_snapshot_samples
+                        ),
+                        default=0,
+                    ),
+                },
+                "metadata_records_scanned": {
+                    "total": int(
+                        physical_snapshot_counts.get(
+                            "metadata_records_scanned_total", 0
+                        )
+                    ),
+                    "max_per_call": max(
+                        (
+                            item.metadata_record_count
+                            for item in physical_snapshot_samples
+                        ),
+                        default=0,
+                    ),
+                },
+                "matched_snapshot_count": {
+                    "total": int(
+                        physical_snapshot_counts.get(
+                            "matched_snapshot_count_total", 0
+                        )
+                    ),
+                    "max_per_call": max(
+                        (
+                            item.matched_record_count
+                            for item in physical_snapshot_samples
+                        ),
+                        default=0,
+                    ),
+                },
+                "cache_hit_count": int(
+                    physical_snapshot_counts.get("cache_hit_count", 0)
+                ),
+                "commit_readset": {
+                    "validation_count": int(
+                        physical_snapshot_counts.get(
+                            "commit_readset_validation_count", 0
+                        )
+                    ),
+                    "stale_count": int(
+                        physical_snapshot_counts.get(
+                            "commit_readset_stale", 0
+                        )
+                    ),
+                    "validation_ms_total": (
+                        physical_snapshot_counts.get(
+                            "commit_readset_validation_us_total", 0
+                        )
+                        / 1000.0
+                    ),
+                },
+                "phase_ms": {
+                    name: {
+                        "mean": (
+                            sum(getattr(item, name) for item in physical_snapshot_samples)
+                            / len(physical_snapshot_samples)
+                            if physical_snapshot_samples
+                            else 0.0
+                        ),
+                        "p99": percentile(
+                            [getattr(item, name) for item in physical_snapshot_samples],
+                            99,
+                        ),
+                        "max": max(
+                            (
+                                getattr(item, name)
+                                for item in physical_snapshot_samples
+                            ),
+                            default=0.0,
+                        ),
+                    }
+                    for name in (
+                        "queue_collection_ms",
+                        "metadata_indexing_ms",
+                        "radix_ownership_lookup_ms",
+                        "operation_indexing_ms",
+                        "sorting_allocation_ms",
+                    )
+                },
+                "amortized_cpu_ms_per_scheduler_step": (
+                    sum(physical_snapshot_build_ms) / scheduler_step_count
+                    if scheduler_step_count
+                    else 0.0
+                ),
+                "mean_us_per_matched_record": (
+                    physical_snapshot_counts.get("build_us_total", 0)
+                    / physical_snapshot_counts.get(
+                        "matched_snapshot_count_total", 1
+                    )
+                    if physical_snapshot_counts.get(
+                        "matched_snapshot_count_total", 0
+                    )
+                    else 0.0
+                ),
+                "max_outlier": (
+                    {
+                        "total_ms": max_physical_snapshot.total_ms,
+                        "cold_build": max_physical_snapshot.cold_build,
+                        "gc_collections": max_physical_snapshot.gc_collections,
+                        "dominant_phase": max(
+                            (
+                                (
+                                    name,
+                                    getattr(max_physical_snapshot, name),
+                                )
+                                for name in (
+                                    "queue_collection_ms",
+                                    "metadata_indexing_ms",
+                                    "radix_ownership_lookup_ms",
+                                    "operation_indexing_ms",
+                                    "sorting_allocation_ms",
+                                )
+                            ),
+                            key=lambda item: item[1],
+                        )[0],
+                    }
+                    if max_physical_snapshot is not None
+                    else None
+                ),
+            },
+            "correctness_gates": {
+                "all_online_actions_have_source_joint_plan_id": (
+                    missing_source_count == 0
+                ),
+                "missing_source_joint_plan_id_count": missing_source_count,
+                "no_pending_transactions": (
+                    not inflight_command_ids and not pending_transaction_ids
+                ),
+                "pending_transaction_ids": list(pending_transaction_ids),
+                "shutdown_summary_complete": bool(
+                    final
+                    and getattr(self, "_shutdown_state", "running")
+                    == "acknowledged"
+                ),
+                "all_non_user_cancelled_obligations_satisfied": (
+                    not non_user_unsatisfied
+                ),
+                "shutdown_cleanup_did_not_mask_unresolved_transactions": (
+                    not shutdown_cleanup_masked_unresolved
+                ),
+                "failed_unrecoverable_has_explicit_evidence": (
+                    failed_unrecoverable_evidence_complete
+                ),
+            },
+            "audit_writer": (
+                self.audit.summary()
+                if callable(getattr(getattr(self, "audit", None), "summary", None))
+                else None
+            ),
+        }
+
+    def _write_latest_runtime_summary(
+        self,
+        *,
+        now_ms: float,
+        force: bool,
+        final: bool = False,
+    ) -> None:
+        path = getattr(self, "_runtime_summary_path", None)
+        config = getattr(self, "config", None)
+        if path is None or config is None:
+            return
+        last_ms = getattr(self, "_last_runtime_summary_ms", None)
+        if (
+            not force
+            and last_ms is not None
+            and now_ms - last_ms < config.runtime_summary_interval_ms
+        ):
+            return
+        payload = self._runtime_summary_payload(now_ms=now_ms, final=final)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{self.audit.run_id}.tmp")
+        temporary.write_text(
+            json.dumps(payload, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+        self._last_runtime_summary_ms = now_ms
+
+    def prepare_shutdown(self) -> None:
+        """Stop admitting new control plans at a scheduler-safe boundary."""
+
+        if getattr(self, "_shutdown_state", "running") != "running":
+            return
+        now_ms = float(self._now_ms())
+        self._shutdown_state = "preparing"
+        self._shutdown_prepare_ms = now_ms
+        self._shutdown_prepare_transaction_snapshot = (
+            self._transaction_conservation_snapshot()
+        )
+        audit = getattr(self, "audit", None)
+        if audit is not None:
+            audit.emit(
+                "shutdown_prepare",
+                now_ms,
+                transaction_snapshot=self._shutdown_prepare_transaction_snapshot,
+                inflight_command_count=len(
+                    getattr(getattr(self, "controller", None), "inflight_command_ids", ())
+                ),
+                pending_online_residency=bool(
+                    getattr(self, "_pending_online_joint_residency", None)
+                ),
+                pending_retraction=bool(
+                    getattr(self, "_pending_running_retraction_transaction", None)
+                ),
+                active_restore_obligation_count=len(
+                    getattr(self, "_restore_obligations", None).active()
+                    if getattr(self, "_restore_obligations", None) is not None
+                    else ()
+                ),
+            )
+        self._write_latest_runtime_summary(now_ms=now_ms, force=True)
+
+    def _transaction_conservation_snapshot(self) -> dict[str, object]:
+        controller = getattr(self, "controller", None)
+        obligation_index = getattr(self, "_restore_obligations", None)
+        lease_index = getattr(self, "_restore_leases", None)
+        active_obligations = (
+            obligation_index.active() if obligation_index is not None else ()
+        )
+        active_leases = lease_index.active() if lease_index is not None else ()
+        nonterminal_transactions = tuple(
+            sorted(
+                transaction.transaction_id
+                for transaction in getattr(
+                    self, "_restore_transactions", {}
+                ).values()
+                if not transaction.stage.terminal
+            )
+        )
+        return {
+            "inflight_command_ids": list(
+                getattr(controller, "inflight_command_ids", ()) or ()
+            ),
+            "queued_command_ids": [
+                item.command_id
+                for item in (
+                    controller.command_queue.pending_commands()
+                    if controller is not None
+                    and getattr(controller, "command_queue", None) is not None
+                    else ()
+                )
+            ],
+            "active_obligation_ids": [
+                item.obligation_id for item in active_obligations
+            ],
+            "active_lease_ids": [item.lease_id for item in active_leases],
+            "active_funding_request_ids": sorted(
+                getattr(self, "_restore_funding_allocations", {})
+            ),
+            "active_prefix_pin_request_ids": sorted(
+                getattr(self, "_restore_lease_pins", {})
+            ),
+            "nonterminal_restore_transaction_ids": list(
+                nonterminal_transactions
+            ),
+            "command_subscription_ids": sorted(
+                getattr(self, "_restore_command_to_request", {})
+            ),
+            "pending_retraction_transaction_id": (
+                getattr(
+                    self, "_pending_running_retraction_transaction", None
+                ).transaction_id
+                if getattr(
+                    self, "_pending_running_retraction_transaction", None
+                )
+                is not None
+                else None
+            ),
+            "pending_residency_transaction_id": (
+                getattr(self, "_pending_online_joint_residency", None).transaction_id
+                if getattr(self, "_pending_online_joint_residency", None)
+                is not None
+                else None
+            ),
+        }
+
+    def _drain_shutdown_acks(self) -> None:
+        bridge = getattr(self, "bridge", None)
+        controller = getattr(self, "controller", None)
+        config = getattr(self, "config", None)
+        if bridge is None or controller is None or config is None:
+            return
+        deadline = time.monotonic() + config.shutdown_drain_timeout_ms / 1000.0
+        while getattr(controller, "inflight_command_ids", ()):
+            acks = tuple(bridge.drain_acks())
+            if acks:
+                now_ms = float(self._now_ms())
+                for ack in acks:
+                    self.audit.emit(
+                        "transfer_acknowledged",
+                        now_ms,
+                        command_id=ack.command_id,
+                        status=ack.status.value,
+                        actual_bytes=ack.actual_bytes,
+                        page_count=len(ack.page_handles),
+                        reason=ack.reason,
+                        blocker_codes=sorted(
+                            {item.code.value for item in ack.blockers}
+                        ),
+                        blockers=self._audit_blockers(ack.blockers),
+                        shutdown_drain=True,
+                    )
+                self._retire_h2d_commands(acks)
+                try:
+                    self.sync_tree(force=True)
+                except Exception as error:
+                    self.audit.emit(
+                        "shutdown_tree_sync_failed",
+                        now_ms,
+                        error=f"{type(error).__name__}: {error}",
+                    )
+                self._advance_retraction_transaction(acks, now_ms=now_ms)
+                self._advance_online_joint_residency(acks, now_ms=now_ms)
+                self._advance_restore_obligations(acks, now_ms=now_ms)
+            if not getattr(controller, "inflight_command_ids", ()):
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+
+    def _abort_shutdown_transactions(self, *, now_ms: float) -> None:
+        retraction = getattr(
+            self, "_pending_running_retraction_transaction", None
+        )
+        if retraction is not None:
+            retraction.stage = "aborted"
+            retraction.failure_reason = "runtime_shutdown"
+            self._running_retraction_counts["aborted"] += 1
+            self.audit.emit(
+                "running_retraction_transaction_terminal",
+                now_ms,
+                transaction_id=retraction.transaction_id,
+                source_joint_plan_id=retraction.source_joint_plan_id,
+                status="aborted",
+                reason="runtime_shutdown",
+                pending_command_id=retraction.pending_command_id,
+            )
+            self._pending_running_retraction_transaction = None
+        residency = getattr(self, "_pending_online_joint_residency", None)
+        if residency is not None:
+            residency.stage = "aborted"
+            residency.completed_ts_ms = now_ms
+            residency.failure_reason = "runtime_shutdown"
+            self._online_joint_counts["residency_aborted"] += 1
+            self.audit.emit(
+                "online_joint_residency_terminal",
+                now_ms,
+                transaction_id=residency.transaction_id,
+                plan_id=residency.plan_id,
+                intent_index=residency.intent_index,
+                action=residency.action.value,
+                command_id=residency.command_id,
+                command_kind=residency.command_kind.value,
+                source_bundle_id=residency.source_bundle_id,
+                physical_bundle_id=residency.physical_bundle_id,
+                context_id=residency.context_id,
+                status="aborted",
+                actual_bytes=residency.actual_bytes,
+                reason="runtime_shutdown",
+                blocker_codes=[],
+            )
+            self._pending_online_joint_residency = None
+        index = getattr(self, "_restore_obligations", None)
+        if index is not None:
+            for obligation in index.active():
+                self._finish_restore_obligation(
+                    obligation.request_id,
+                    RestoreObligationState.CANCELLED,
+                    now_ms=now_ms,
+                    reason="runtime_shutdown",
+                )
+        for request_id in tuple(
+            getattr(self, "_restore_service_grace_by_request", {})
+        ):
+            self._cancel_restore_service_grace(
+                request_id,
+                now_ms=now_ms,
+                reason="runtime_shutdown",
+            )
+        getattr(self, "_restore_command_to_request", {}).clear()
+        getattr(self, "_restore_funding_target_by_command", {}).clear()
+
     def close(self) -> None:
-        """Release process-local logs and the runtime event socket once."""
+        """Prepare, drain and finalize process-local runtime state once."""
 
         if self._closed:
             return
+        self.prepare_shutdown()
         self._closed = True
         event_server = self.event_server
         self.event_server = None
@@ -1914,6 +2934,8 @@ class EmbeddedSGLangRuntime:
         self.event_log = None
         if event_log is not None:
             event_log.close()
+        self._drain_shutdown_acks()
+        self._abort_shutdown_transactions(now_ms=float(self._now_ms()))
         if getattr(self, "_pending_request_physical_finish_by_id", None):
             try:
                 self.sync_tree(force=True)
@@ -1939,12 +2961,39 @@ class EmbeddedSGLangRuntime:
             )
         config = getattr(self, "config", None)
         if getattr(config, "queue_service_observer_enabled", False):
+            observer_samples = tuple(
+                getattr(self, "_gpu_service_observer_timing_samples", ())
+            )
             self.audit.emit(
                 "gpu_service_observer_summary",
                 self._now_ms(),
                 sample_count=self._gpu_service_sample_count,
+                sample_cap_count=getattr(
+                    self, "_gpu_service_sample_cap_count", 0
+                ),
                 pending_launch_count=len(self._gpu_service_launches),
                 max_samples=config.queue_service_observer_max_samples,
+                observer_cpu_ms={
+                    "count": len(observer_samples),
+                    "build_p50": percentile(
+                        [item[0] for item in observer_samples], 50
+                    ),
+                    "build_p95": percentile(
+                        [item[0] for item in observer_samples], 95
+                    ),
+                    "build_p99": percentile(
+                        [item[0] for item in observer_samples], 99
+                    ),
+                    "audit_enqueue_p50": percentile(
+                        [item[1] for item in observer_samples], 50
+                    ),
+                    "audit_enqueue_p95": percentile(
+                        [item[1] for item in observer_samples], 95
+                    ),
+                    "audit_enqueue_p99": percentile(
+                        [item[1] for item in observer_samples], 99
+                    ),
+                },
             )
         if getattr(self, "_lock_service_ledger", None) is not None:
             self.audit.emit(
@@ -2095,6 +3144,127 @@ class EmbeddedSGLangRuntime:
                 ),
                 prediction_used=False,
             )
+            restore_index = getattr(self, "_restore_obligations", None)
+            if restore_index is not None:
+                obligations = restore_index.all()
+                terminal_waits = tuple(
+                    max(0.0, item.terminal_ts_ms - item.created_ts_ms)
+                    for item in obligations
+                    if item.terminal_ts_ms is not None
+                )
+                self.audit.emit(
+                    "restore_obligation_summary",
+                    self._now_ms(),
+                    obligation_count=len(obligations),
+                    state_counts=dict(
+                        sorted(Counter(item.state.value for item in obligations).items())
+                    ),
+                    active_obligation_ids=[
+                        item.obligation_id for item in restore_index.active()
+                    ],
+                    active_restore_lease_ids=[
+                        item.lease_id
+                        for item in (
+                            getattr(self, "_restore_leases", None).active()
+                            if getattr(self, "_restore_leases", None) is not None
+                            else ()
+                        )
+                    ],
+                    restore_lease_reserved_bytes=(
+                        getattr(self, "_restore_leases", None).reserved_bytes
+                        if getattr(self, "_restore_leases", None) is not None
+                        else 0
+                    ),
+                    restore_funding_reserved_bytes=sum(
+                        len(item) * self.config.kv_bytes_per_token
+                        for allocations in getattr(
+                            self, "_restore_funding_allocations", {}
+                        ).values()
+                        for item in allocations
+                    ),
+                    active_service_grace_count=sum(
+                        grace.active
+                        for grace in getattr(
+                            self, "_restore_service_grace_by_request", {}
+                        ).values()
+                    ),
+                    decision_counts=dict(
+                        sorted(
+                            getattr(self, "_restore_obligation_counts", {}).items()
+                        )
+                    ),
+                    terminal_wait_ms_p50=(
+                        percentile(terminal_waits, 50) if terminal_waits else None
+                    ),
+                    terminal_wait_ms_p95=(
+                        percentile(terminal_waits, 95) if terminal_waits else None
+                    ),
+                    terminal_wait_ms_max=max(terminal_waits, default=None),
+                    total_restored_bytes=sum(
+                        item.restored_bytes for item in obligations
+                    ),
+                    total_funding_reclaim_bytes=sum(
+                        item.funding_reclaim_bytes for item in obligations
+                    ),
+                    liveness_escalation_count=sum(
+                        item.liveness_escalated for item in obligations
+                    ),
+                )
+        if getattr(config, "joint_policy_enabled", False):
+            residency_history = tuple(
+                getattr(self, "_online_joint_residency_history", ())
+            )
+            predictive_counts = dict(
+                sorted(getattr(self, "_joint_predictive_counts", {}).items())
+            )
+            prediction_used = bool(
+                predictive_counts
+                or getattr(config, "joint_predictive_enabled", False)
+            )
+            terminal_stages = {"completed", "failed", "aborted"}
+            pending_residency = getattr(
+                self, "_pending_online_joint_residency", None
+            )
+            self.audit.emit(
+                "online_joint_control_summary",
+                self._now_ms(),
+                decision_counts=dict(
+                    sorted(getattr(self, "_online_joint_counts", {}).items())
+                ),
+                residency_transaction_count=len(residency_history),
+                residency_stage_counts=dict(
+                    sorted(Counter(item.stage for item in residency_history).items())
+                ),
+                residency_terminal_count=sum(
+                    item.stage in terminal_stages for item in residency_history
+                ),
+                unresolved_residency_count=sum(
+                    item.stage not in terminal_stages for item in residency_history
+                ),
+                pending_residency_transaction_id=(
+                    pending_residency.transaction_id
+                    if pending_residency is not None
+                    else None
+                ),
+                current_plan_id=(
+                    current_view.plan_id
+                    if (
+                        current_view := getattr(
+                            self, "_current_online_joint_view", None
+                        )
+                    )
+                    is not None
+                    else None
+                ),
+                reactive_transfer_role=(
+                    "disabled_as_online_policy_source_when_joint_enabled"
+                ),
+                prediction_used=prediction_used,
+                joint_predictive_enabled=getattr(
+                    config, "joint_predictive_enabled", False
+                ),
+                predictive_decision_counts=predictive_counts,
+            )
         joint_shadow_worker = getattr(self, "joint_shadow_worker", None)
         if joint_shadow_worker is not None:
             worker_closed = joint_shadow_worker.close()
@@ -2137,11 +3307,24 @@ class EmbeddedSGLangRuntime:
                     else None
                 ),
             )
+        audit_summary = getattr(self.audit, "summary", None)
+        if callable(audit_summary):
+            self.audit.emit(
+                "runtime_audit_writer_summary",
+                self._now_ms(),
+                **audit_summary(),
+            )
+        self._shutdown_state = "acknowledged"
+        self._write_latest_runtime_summary(
+            now_ms=float(self._now_ms()), force=True, final=True
+        )
+        self.audit.emit("shutdown_ack", self._now_ms())
         self.audit.emit("runtime_shutdown", self._now_ms())
         transfer_telemetry_log = getattr(self, "transfer_telemetry_log", None)
         if transfer_telemetry_log is not None:
             transfer_telemetry_log.close()
         self.audit.close()
+        self._write_shutdown_ack()
 
     @staticmethod
     def _load_config(scheduler: Any, config_path: str | None) -> BeliefKVConfig:
@@ -2159,6 +3342,7 @@ class EmbeddedSGLangRuntime:
                 )
             for field_name in (
                 "runtime_audit_path",
+                "runtime_summary_path",
                 "transfer_telemetry_path",
                 "runtime_event_socket_path",
                 "runtime_event_log_path",
@@ -2355,7 +3539,23 @@ class EmbeddedSGLangRuntime:
             selective_retraction = request_id in getattr(
                 self, "_pending_selective_retraction_ids", set()
             )
-            if selective_retraction or self._now_ms() < cooldown_until:
+            obligation = self._restore_obligation_index().get(request_id)
+            if obligation is not None and not obligation.state.terminal:
+                obligation.requeued = True
+                required = self._request_path_extent_ids(
+                    req, metadata.context_id, cpu_only=True
+                )
+                if required is None:
+                    required = obligation.required_extent_ids
+                obligation.set_required_extents(
+                    required,
+                    restore_bytes=self._extent_ids_bytes(required),
+                    now_ms=self._now_ms(),
+                )
+                self._sync_visible_gate_state(
+                    request_id, metadata, req=req
+                )
+            elif selective_retraction or self._now_ms() < cooldown_until:
                 self.controller.visible_admission.set_policy_blocked(
                     request_id, reason="retraction_cooldown"
                 )
@@ -2372,6 +3572,12 @@ class EmbeddedSGLangRuntime:
                 is_retracted=is_retracted,
                 transition_generation=transition_generation,
                 selective_retraction=selective_retraction,
+                restore_obligation_id=(
+                    obligation.obligation_id if obligation is not None else None
+                ),
+                restore_obligation_state=(
+                    obligation.state.value if obligation is not None else None
+                ),
                 cooldown_until_ms=(
                     cooldown_until if selective_retraction else None
                 ),
@@ -2704,6 +3910,19 @@ class EmbeddedSGLangRuntime:
         if not self.config.running_batch_retraction_enabled:
             return False
         now_ms = float(self._now_ms())
+        if getattr(
+            self, "_restore_authority_mode", RestoreAuthorityMode.NORMAL_JOINT
+        ) != RestoreAuthorityMode.NORMAL_JOINT:
+            self._running_retraction_counts[
+                "barrier_restore_authority_suppressed"
+            ] += 1
+            return False
+        overdue_restore = self._overdue_restore_obligation(now_ms=now_ms)
+        if overdue_restore is not None:
+            self._running_retraction_counts[
+                "barrier_restore_debt_suppressed"
+            ] += 1
+            return False
         previous_decision_ms = getattr(self, "_last_retraction_decision_ms", None)
         if (
             previous_decision_ms is not None
@@ -2712,6 +3931,14 @@ class EmbeddedSGLangRuntime:
         ):
             return False
         if getattr(self, "_pending_running_retraction_transaction", None) is not None:
+            return False
+        if getattr(self, "_pending_online_joint_residency", None) is not None:
+            return False
+        controller = getattr(self, "controller", None)
+        if (
+            controller is not None
+            and controller.has_pending_transfer_work()
+        ):
             return False
         if getattr(self, "_pending_running_retraction_barrier", None) is not None:
             return False
@@ -2754,7 +3981,14 @@ class EmbeddedSGLangRuntime:
             0,
             active.active_kv_footprint_bytes - active_budget_bytes,
         )
-        if replacement_deficit_bytes == 0 and active_excess_bytes == 0:
+        restore_micro_gate_barrier = (
+            self._restore_micro_gate_barrier_pair_visible(requests, replacements)
+        )
+        if (
+            replacement_deficit_bytes == 0
+            and active_excess_bytes == 0
+            and not restore_micro_gate_barrier
+        ):
             self._running_retraction_counts["barrier_no_pressure"] += 1
             return False
 
@@ -2822,6 +4056,7 @@ class EmbeddedSGLangRuntime:
             admission_stall_ms=admission_stall_ms,
             replacement_deficit_bytes=replacement_deficit_bytes,
             active_excess_bytes=active_excess_bytes,
+            restore_micro_gate_forced=restore_micro_gate_barrier,
             active_kv_footprint_bytes=active.active_kv_footprint_bytes,
             active_kv_budget_bytes=active_budget_bytes,
             native_reclaim_capacity_bytes=native_reclaim_bytes,
@@ -2877,6 +4112,1376 @@ class EmbeddedSGLangRuntime:
             ),
         )
 
+    def _restore_obligation_index(self) -> RestoreObligationIndex:
+        index = getattr(self, "_restore_obligations", None)
+        if index is None:
+            index = RestoreObligationIndex(
+                max_active=int(
+                    getattr(
+                        getattr(self, "config", None),
+                        "restore_obligation_max_active",
+                        8,
+                    )
+                )
+            )
+            self._restore_obligations = index
+        if not hasattr(self, "_restore_obligation_counts"):
+            self._restore_obligation_counts = Counter()
+        if not hasattr(self, "_restore_command_to_request"):
+            self._restore_command_to_request = {}
+        if not hasattr(self, "_restore_command_sequence"):
+            self._restore_command_sequence = 0
+        return index
+
+    def _restore_lease_index(self) -> RestoreLeaseIndex:
+        index = getattr(self, "_restore_leases", None)
+        if index is None:
+            index = RestoreLeaseIndex(
+                max_active=int(
+                    getattr(
+                        getattr(self, "config", None),
+                        "restore_lease_max_active",
+                        1,
+                    )
+                )
+            )
+            self._restore_leases = index
+        if not hasattr(self, "_restore_lease_allocations"):
+            self._restore_lease_allocations = {}
+        if not hasattr(self, "_restore_lease_pins"):
+            self._restore_lease_pins = {}
+        if not hasattr(self, "_restore_funding_allocations"):
+            self._restore_funding_allocations = {}
+        if not hasattr(self, "_restore_funding_target_by_command"):
+            self._restore_funding_target_by_command = {}
+        return index
+
+    def _allocator_available_tokens(self) -> int:
+        allocator = self.scheduler.token_to_kv_pool_allocator
+        if hasattr(allocator, "full_available_size"):
+            return max(
+                0,
+                min(
+                    int(allocator.full_available_size()),
+                    int(allocator.swa_available_size()),
+                ),
+            )
+        return max(0, int(allocator.available_size()))
+
+    def _restore_lease_tokens(self, required_bytes: int) -> int:
+        allocator = self.scheduler.token_to_kv_pool_allocator
+        page_size = max(1, int(getattr(allocator, "page_size", 1) or 1))
+        raw_tokens = max(
+            1,
+            (max(0, int(required_bytes)) + self.config.kv_bytes_per_token - 1)
+            // self.config.kv_bytes_per_token,
+        )
+        return ((raw_tokens + page_size - 1) // page_size) * page_size
+
+    def _restore_funding_reserved_tokens(self, request_id: str) -> int:
+        return sum(
+            len(item)
+            for item in getattr(self, "_restore_funding_allocations", {}).get(
+                request_id, ()
+            )
+        )
+
+    def allocator_backed_reservation_tokens(self) -> int:
+        """Return KV slots intentionally held outside native request/cache state."""
+
+        funding_tokens = sum(
+            len(item)
+            for allocations in getattr(
+                self, "_restore_funding_allocations", {}
+            ).values()
+            for item in allocations
+        )
+        lease_tokens = sum(
+            len(item)
+            for allocations in getattr(
+                self, "_restore_lease_allocations", {}
+            ).values()
+            for item in allocations
+        )
+        return funding_tokens + lease_tokens
+
+    def _set_restore_funding_reservation(
+        self,
+        obligation: RestoreObligation,
+        allocations: list[Any],
+    ) -> int:
+        if not hasattr(self, "_restore_funding_allocations"):
+            self._restore_funding_allocations = {}
+        if allocations:
+            self._restore_funding_allocations[obligation.request_id] = allocations
+        else:
+            self._restore_funding_allocations.pop(obligation.request_id, None)
+        tokens = sum(len(item) for item in allocations)
+        obligation.funding_reserved_tokens = tokens
+        obligation.funding_reserved_bytes = (
+            tokens * self.config.kv_bytes_per_token
+        )
+        return tokens
+
+    def _reserve_restore_funding_capacity(
+        self,
+        obligation: RestoreObligation,
+        *,
+        target_bytes: int,
+        reclaimed_bytes: int,
+        now_ms: float,
+    ) -> int:
+        """Turn newly reclaimed capacity into allocator-backed debt ownership."""
+
+        target_bytes = max(0, int(target_bytes))
+        reclaimed_bytes = max(0, int(reclaimed_bytes))
+        if target_bytes == 0 or reclaimed_bytes == 0:
+            return 0
+        allocator = self.scheduler.token_to_kv_pool_allocator
+        page_size = max(1, int(getattr(allocator, "page_size", 1) or 1))
+        target_tokens = (
+            target_bytes + self.config.kv_bytes_per_token - 1
+        ) // self.config.kv_bytes_per_token
+        target_tokens = (
+            (target_tokens + page_size - 1) // page_size
+        ) * page_size
+        reclaimed_tokens = reclaimed_bytes // self.config.kv_bytes_per_token
+        reclaimed_tokens = (reclaimed_tokens // page_size) * page_size
+        claim_tokens = min(target_tokens, reclaimed_tokens)
+        if claim_tokens <= 0:
+            return 0
+        allocation = allocator.alloc(claim_tokens)
+        if allocation is None:
+            self._restore_obligation_counts["funding_reservation_failed"] += 1
+            self.audit.emit(
+                "restore_funding_reservation_failed",
+                now_ms,
+                obligation_id=obligation.obligation_id,
+                request_id=obligation.request_id,
+                target_bytes=target_bytes,
+                reclaimed_bytes=reclaimed_bytes,
+                claim_tokens=claim_tokens,
+                allocator_available_tokens=self._allocator_available_tokens(),
+            )
+            return 0
+        allocations = list(
+            getattr(self, "_restore_funding_allocations", {}).get(
+                obligation.request_id, ()
+            )
+        )
+        allocations.append(allocation)
+        total_tokens = self._set_restore_funding_reservation(
+            obligation, allocations
+        )
+        self._restore_obligation_counts["funding_capacity_reserved"] += 1
+        self.audit.emit(
+            "restore_funding_capacity_reserved",
+            now_ms,
+            obligation_id=obligation.obligation_id,
+            request_id=obligation.request_id,
+            target_bytes=target_bytes,
+            reclaimed_bytes=reclaimed_bytes,
+            newly_reserved_tokens=claim_tokens,
+            total_reserved_tokens=total_tokens,
+            total_reserved_bytes=obligation.funding_reserved_bytes,
+            allocator_available_tokens_after=self._allocator_available_tokens(),
+        )
+        return claim_tokens
+
+    def _release_restore_funding_capacity(
+        self,
+        obligation: RestoreObligation,
+        *,
+        now_ms: float,
+        reason: str,
+    ) -> int:
+        allocations = getattr(self, "_restore_funding_allocations", {}).pop(
+            obligation.request_id, []
+        )
+        if not allocations:
+            self._set_restore_funding_reservation(obligation, [])
+            return 0
+        allocator = self.scheduler.token_to_kv_pool_allocator
+        released_tokens = 0
+        for allocation in allocations:
+            released_tokens += len(allocation)
+            allocator.free(allocation)
+        self._set_restore_funding_reservation(obligation, [])
+        if released_tokens:
+            self.audit.emit(
+                "restore_funding_capacity_released",
+                now_ms,
+                obligation_id=obligation.obligation_id,
+                request_id=obligation.request_id,
+                released_tokens=released_tokens,
+                released_bytes=released_tokens * self.config.kv_bytes_per_token,
+                reason=reason,
+                allocator_available_tokens_after=self._allocator_available_tokens(),
+            )
+        return released_tokens
+
+    def _reacquire_restore_funding_capacity(
+        self,
+        obligation: RestoreObligation,
+        tokens: int,
+        *,
+        now_ms: float,
+        reason: str,
+    ) -> bool:
+        if tokens <= 0:
+            return True
+        allocation = self.scheduler.token_to_kv_pool_allocator.alloc(tokens)
+        if allocation is None:
+            self._restore_obligation_counts[
+                "funding_reservation_reacquire_failed"
+            ] += 1
+            self.audit.emit(
+                "restore_funding_reservation_reacquire_failed",
+                now_ms,
+                obligation_id=obligation.obligation_id,
+                request_id=obligation.request_id,
+                tokens=tokens,
+                reason=reason,
+            )
+            return False
+        self._set_restore_funding_reservation(obligation, [allocation])
+        return True
+
+    def _grant_restore_lease(
+        self,
+        obligation: RestoreObligation,
+        *,
+        h2d_bytes: int,
+        now_ms: float,
+    ) -> RestoreLease | None:
+        if not bool(getattr(self.config, "restore_lease_enabled", True)):
+            return None
+        index = self._restore_lease_index()
+        lease = index.get(obligation.request_id)
+        if lease is not None and lease.state == RestoreLeaseState.ADMISSION_COMMITTING:
+            return None
+        if (
+            lease is None or lease.state.terminal
+        ) and len(index.active()) >= index.max_active:
+            return None
+        required_tokens = self._restore_lease_tokens(
+            obligation.required_admission_bytes
+        )
+        h2d_tokens = (
+            max(0, int(h2d_bytes)) + self.config.kv_bytes_per_token - 1
+        ) // self.config.kv_bytes_per_token
+        current_tokens = sum(
+            len(item)
+            for item in getattr(self, "_restore_lease_allocations", {}).get(
+                obligation.request_id, ()
+            )
+        )
+        additional_tokens = max(0, required_tokens - current_tokens)
+        funding_tokens = self._restore_funding_reserved_tokens(
+            obligation.request_id
+        )
+        if (
+            self._allocator_available_tokens() + funding_tokens
+            < additional_tokens + h2d_tokens
+        ):
+            return None
+        allocator = self.scheduler.token_to_kv_pool_allocator
+        consumed_funding_tokens = self._release_restore_funding_capacity(
+            obligation,
+            now_ms=now_ms,
+            reason="convert_to_restore_lease",
+        )
+        allocation = allocator.alloc(additional_tokens) if additional_tokens else None
+        if additional_tokens and allocation is None:
+            self._reacquire_restore_funding_capacity(
+                obligation,
+                consumed_funding_tokens,
+                now_ms=now_ms,
+                reason="restore_lease_allocation_failed",
+            )
+            return None
+        if self._allocator_available_tokens() < h2d_tokens:
+            if allocation is not None:
+                allocator.free(allocation)
+            self._reacquire_restore_funding_capacity(
+                obligation,
+                consumed_funding_tokens,
+                now_ms=now_ms,
+                reason="restore_h2d_capacity_race",
+            )
+            return None
+        if lease is None or lease.state.terminal:
+            try:
+                lease = index.grant(
+                    obligation=obligation,
+                    granted_ts_ms=now_ms,
+                    reserved_tokens=required_tokens,
+                    reserved_bytes=required_tokens
+                    * self.config.kv_bytes_per_token,
+                    h2d_bytes=max(0, int(h2d_bytes)),
+                )
+            except ValueError:
+                if allocation is not None:
+                    allocator.free(allocation)
+                self._reacquire_restore_funding_capacity(
+                    obligation,
+                    consumed_funding_tokens,
+                    now_ms=now_ms,
+                    reason="restore_lease_index_rejected",
+                )
+                return None
+            self._restore_lease_allocations[obligation.request_id] = []
+            self._restore_obligation_counts["lease_granted"] += 1
+            self.audit.emit(
+                "restore_lease_granted",
+                now_ms,
+                lease_id=lease.lease_id,
+                obligation_id=obligation.obligation_id,
+                request_id=obligation.request_id,
+                workflow_id=obligation.workflow_id,
+                context_id=obligation.context_id,
+                reserved_tokens=lease.reserved_tokens,
+                reserved_bytes=lease.reserved_bytes,
+                h2d_bytes=lease.h2d_bytes,
+                allocator_available_tokens_after=self._allocator_available_tokens(),
+            )
+        else:
+            lease.reserved_tokens = max(lease.reserved_tokens, required_tokens)
+            lease.reserved_bytes = (
+                lease.reserved_tokens * self.config.kv_bytes_per_token
+            )
+            lease.h2d_bytes = max(lease.h2d_bytes, max(0, int(h2d_bytes)))
+        if allocation is not None:
+            self._restore_lease_allocations.setdefault(
+                obligation.request_id, []
+            ).append(allocation)
+        return lease
+
+    def _pin_restore_lease_prefix(
+        self,
+        obligation: RestoreObligation,
+        req: Any,
+        *,
+        now_ms: float,
+        allow_unmaterialized: bool = False,
+    ) -> bool:
+        lease = self._restore_lease_index().get(obligation.request_id)
+        if lease is None or lease.state.terminal:
+            return False
+        if obligation.request_id in self._restore_lease_pins:
+            return True
+        node = getattr(req, "last_node", None)
+        root = getattr(self.tree_cache, "root_node", None)
+        if node is None or (node is root and obligation.restored_bytes > 0):
+            return False
+        if node is root:
+            return True
+        if getattr(node, "value", None) is None:
+            if not allow_unmaterialized or getattr(node, "host_value", None) is None:
+                return False
+            self._restore_obligation_counts[
+                "lease_prefix_pin_deferred_h2d"
+            ] += 1
+            self.audit.emit(
+                "restore_lease_prefix_pin_deferred",
+                now_ms,
+                lease_id=lease.lease_id,
+                obligation_id=obligation.obligation_id,
+                request_id=obligation.request_id,
+                context_id=obligation.context_id,
+                radix_node_id=getattr(node, "id", None),
+                reason="host_only_prefix_waiting_for_h2d",
+            )
+            return True
+        current = node
+        seen: set[int] = set()
+        while current is not root:
+            if current is None or id(current) in seen:
+                return False
+            seen.add(id(current))
+            if getattr(current, "value", None) is None:
+                return False
+            current = getattr(current, "parent", None)
+        inc_lock_ref = getattr(self.tree_cache, "inc_lock_ref", None)
+        dec_lock_ref = getattr(self.tree_cache, "dec_lock_ref", None)
+        if not callable(inc_lock_ref) or not callable(dec_lock_ref):
+            return False
+        token = inc_lock_ref(node)
+        release_with_token = len(inspect.signature(dec_lock_ref).parameters) >= 2
+        self._restore_lease_pins[obligation.request_id] = (
+            node,
+            token,
+            release_with_token,
+        )
+        lease.pin_active = True
+        self._restore_obligation_counts["lease_prefix_pinned"] += 1
+        self.audit.emit(
+            "restore_lease_prefix_pinned",
+            now_ms,
+            lease_id=lease.lease_id,
+            obligation_id=obligation.obligation_id,
+            request_id=obligation.request_id,
+            context_id=obligation.context_id,
+            radix_node_id=getattr(node, "id", None),
+        )
+        return True
+
+    def _unpin_restore_lease_prefix(
+        self,
+        request_id: str,
+        *,
+        now_ms: float,
+        reason: str,
+    ) -> None:
+        pin = getattr(self, "_restore_lease_pins", {}).pop(request_id, None)
+        lease = getattr(self, "_restore_leases", None)
+        lease = lease.get(request_id) if lease is not None else None
+        if pin is None:
+            if lease is not None:
+                lease.pin_active = False
+            return
+        node, token, release_with_token = pin
+        try:
+            if int(getattr(node, "lock_ref", 1) or 0) <= 0:
+                pass
+            elif release_with_token:
+                self.tree_cache.dec_lock_ref(node, token)
+            else:
+                self.tree_cache.dec_lock_ref(node)
+        except Exception as error:
+            self.audit.emit(
+                "restore_lease_prefix_unpin_failed",
+                now_ms,
+                request_id=request_id,
+                reason=reason,
+                error=f"{type(error).__name__}: {error}",
+            )
+        else:
+            self.audit.emit(
+                "restore_lease_prefix_unpinned",
+                now_ms,
+                request_id=request_id,
+                reason=reason,
+                radix_node_id=getattr(node, "id", None),
+            )
+        if lease is not None:
+            lease.pin_active = False
+
+    def _free_restore_lease_allocations(self, request_id: str) -> int:
+        allocations = getattr(self, "_restore_lease_allocations", {}).pop(
+            request_id, []
+        )
+        allocator = getattr(
+            getattr(self, "scheduler", None),
+            "token_to_kv_pool_allocator",
+            None,
+        )
+        released_tokens = 0
+        for allocation in allocations:
+            released_tokens += len(allocation)
+            if allocator is not None:
+                allocator.free(allocation)
+        return released_tokens
+
+    def _release_restore_lease(
+        self,
+        request_id: str,
+        *,
+        now_ms: float,
+        reason: str,
+        rollback: bool,
+    ) -> None:
+        index = getattr(self, "_restore_leases", None)
+        lease = index.get(request_id) if index is not None else None
+        if lease is None or lease.state.terminal:
+            return
+        released_tokens = self._free_restore_lease_allocations(request_id)
+        self._unpin_restore_lease_prefix(
+            request_id, now_ms=now_ms, reason=reason
+        )
+        lease.finish(
+            RestoreLeaseState.ROLLED_BACK if rollback else RestoreLeaseState.RELEASED,
+            now_ms=now_ms,
+            reason=reason,
+        )
+        self._restore_obligation_counts[
+            "lease_rolled_back" if rollback else "lease_released"
+        ] += 1
+        self.audit.emit(
+            "restore_lease_terminal",
+            now_ms,
+            lease_id=lease.lease_id,
+            obligation_id=lease.obligation_id,
+            request_id=request_id,
+            state=lease.state.value,
+            reason=reason,
+            released_tokens=released_tokens,
+            reserved_tokens=lease.reserved_tokens,
+            reserved_bytes=lease.reserved_bytes,
+            admission_attempts=lease.admission_attempts,
+        )
+
+    def _restore_lease_credit_bytes(self) -> dict[str, int]:
+        index = getattr(self, "_restore_leases", None)
+        if index is None:
+            return {}
+        allocations = getattr(self, "_restore_lease_allocations", {})
+        return {
+            lease.request_id: lease.reserved_bytes
+            for lease in index.active()
+            if lease.capacity_held and allocations.get(lease.request_id)
+        }
+
+    def _begin_restore_lease_admission(
+        self,
+        obligation: RestoreObligation,
+        *,
+        now_ms: float,
+    ) -> bool:
+        lease = self._restore_lease_index().get(obligation.request_id)
+        if lease is None or lease.state.terminal:
+            return not bool(getattr(self.config, "restore_lease_enabled", True))
+        if lease.state == RestoreLeaseState.ADMISSION_COMMITTING:
+            return True
+        resized = self._grant_restore_lease(
+            obligation,
+            h2d_bytes=0,
+            now_ms=now_ms,
+        )
+        if resized is None:
+            return False
+        allocations = self._restore_lease_allocations.get(
+            obligation.request_id, []
+        )
+        if sum(len(item) for item in allocations) < lease.reserved_tokens:
+            return False
+        released_tokens = self._free_restore_lease_allocations(
+            obligation.request_id
+        )
+        lease.begin_admission()
+        transaction = self._ensure_restore_transaction(obligation)
+        transaction.stage = RestoreTransactionStage.ADMISSION_COMMITTING
+        transaction.admission_state = "committing"
+        self._restore_obligation_counts["lease_admission_started"] += 1
+        self.audit.emit(
+            "restore_lease_admission_started",
+            now_ms,
+            lease_id=lease.lease_id,
+            obligation_id=obligation.obligation_id,
+            request_id=obligation.request_id,
+            released_tokens=released_tokens,
+            reserved_tokens=lease.reserved_tokens,
+            reserved_bytes=lease.reserved_bytes,
+            admission_attempt=lease.admission_attempts,
+        )
+        return True
+
+    def _reject_restore_lease_admission(
+        self,
+        obligation: RestoreObligation,
+        *,
+        now_ms: float,
+        native_result: str,
+    ) -> None:
+        lease = self._restore_lease_index().get(obligation.request_id)
+        if lease is None or lease.state != RestoreLeaseState.ADMISSION_COMMITTING:
+            return
+        allocator = self.scheduler.token_to_kv_pool_allocator
+        allocation = allocator.alloc(lease.reserved_tokens)
+        if allocation is None:
+            self._release_restore_lease(
+                obligation.request_id,
+                now_ms=now_ms,
+                reason="restore_admission_reservation_reacquire_failed",
+                rollback=True,
+            )
+            obligation.block(
+                blocker_codes=("restore_reservation_reacquire_failed",),
+                blocker_fingerprint="restore_reservation_reacquire_failed",
+                attempt_stamp=self._restore_attempt_stamp(),
+                now_ms=now_ms,
+            )
+            self._restore_obligation_counts[
+                "lease_admission_reacquire_failed"
+            ] += 1
+            return
+        self._restore_lease_allocations[obligation.request_id] = [allocation]
+        lease.admission_rejected()
+        transaction = self._ensure_restore_transaction(obligation)
+        transaction.stage = RestoreTransactionStage.RESTORED_RESERVED
+        transaction.admission_state = "rejected_reserved"
+        self._restore_obligation_counts["lease_admission_rejected"] += 1
+        self.audit.emit(
+            "restore_lease_admission_rejected",
+            now_ms,
+            lease_id=lease.lease_id,
+            obligation_id=obligation.obligation_id,
+            request_id=obligation.request_id,
+            native_result=native_result,
+            reservation_reacquired=True,
+            reserved_tokens=lease.reserved_tokens,
+        )
+
+    def _commit_restore_lease_admission(
+        self,
+        obligation: RestoreObligation,
+        *,
+        now_ms: float,
+    ) -> None:
+        lease = self._restore_lease_index().get(obligation.request_id)
+        if lease is None or lease.state != RestoreLeaseState.ADMISSION_COMMITTING:
+            return
+        lease.mark_admitted()
+        transaction = self._ensure_restore_transaction(obligation)
+        transaction.stage = RestoreTransactionStage.ADMITTED
+        transaction.admission_state = "admitted"
+        self._unpin_restore_lease_prefix(
+            obligation.request_id,
+            now_ms=now_ms,
+            reason="native_admission_committed",
+        )
+        self._restore_obligation_counts["lease_admission_committed"] += 1
+        self.audit.emit(
+            "restore_lease_admission_committed",
+            now_ms,
+            lease_id=lease.lease_id,
+            obligation_id=obligation.obligation_id,
+            request_id=obligation.request_id,
+            reserved_tokens=lease.reserved_tokens,
+            reserved_bytes=lease.reserved_bytes,
+        )
+
+    def _request_path_extent_ids(
+        self,
+        req: Any | None,
+        context_id: str,
+        *,
+        cpu_only: bool,
+    ) -> tuple[str, ...] | None:
+        """Capture the authoritative request path, not all context-owned pages."""
+
+        page_index = self.controller.page_index
+        node = getattr(req, "last_node", None) if req is not None else None
+        registry = getattr(self, "registry", None)
+        root = getattr(getattr(self, "tree_cache", None), "root_node", None)
+        if node is None:
+            return () if not page_index.has_context(context_id) else None
+        if registry is None or root is None:
+            if not page_index.has_context(context_id):
+                return ()
+            return tuple(
+                sorted(
+                    f"page:{page.handle.page_id}:"
+                    f"{page.handle.allocation_generation}"
+                    for page in page_index.context_pages(context_id)
+                    if not cpu_only
+                    or (page.cpu_resident and not page.gpu_resident)
+                )
+            )
+        result: list[str] = []
+        seen: set[int] = set()
+        while node is not None and node is not root:
+            identity = id(node)
+            if identity in seen:
+                return None
+            seen.add(identity)
+            handle = registry.current_handle(int(node.id))
+            if handle is None:
+                return None
+            page = page_index.pages.get(handle)
+            if page is None or page.residency == PhysicalResidency.DEAD:
+                return None
+            if not cpu_only or (page.cpu_resident and not page.gpu_resident):
+                result.append(
+                    f"page:{handle.page_id}:{handle.allocation_generation}"
+                )
+            node = getattr(node, "parent", None)
+        return tuple(sorted(result))
+
+    def _can_prepare_restore_obligations(
+        self,
+        plan: RunningRetractionPlan,
+        requests: tuple[Any, ...],
+    ) -> bool:
+        request_by_id = {
+            str(getattr(req, "rid", "")): req
+            for req in requests
+            if str(getattr(req, "rid", ""))
+        }
+        index = self._restore_obligation_index()
+        if not index.can_create(tuple(plan.request_ids)):
+            return False
+        for request_id in plan.request_ids:
+            req = request_by_id.get(request_id)
+            metadata = self._metadata(req) if req is not None else None
+            if metadata is None:
+                return False
+            context = self.controller.graph.contexts.get(metadata.context_id)
+            if context is None or context.epoch != metadata.context_epoch:
+                return False
+            if self._request_path_extent_ids(
+                req, metadata.context_id, cpu_only=False
+            ) is None:
+                return False
+        return True
+
+    def _capture_restore_paths(
+        self,
+        plan: RunningRetractionPlan,
+        requests: tuple[Any, ...],
+    ) -> dict[str, tuple[str, ...]]:
+        request_by_id = {
+            str(getattr(req, "rid", "")): req
+            for req in requests
+            if str(getattr(req, "rid", ""))
+        }
+        result: dict[str, tuple[str, ...]] = {}
+        for request_id in plan.request_ids:
+            req = request_by_id[request_id]
+            metadata = self._metadata(req)
+            assert metadata is not None
+            path = self._request_path_extent_ids(
+                req, metadata.context_id, cpu_only=False
+            )
+            assert path is not None
+            result[request_id] = path
+        return result
+
+    def _create_restore_obligations(
+        self,
+        transaction: _RunningRetractionTransaction,
+        requests: list[Any] | tuple[Any, ...],
+        *,
+        now_ms: float,
+    ) -> None:
+        index = self._restore_obligation_index()
+        source_plan_id = (
+            getattr(transaction, "source_joint_plan_id", None)
+            or f"{transaction.transaction_id}:emergency"
+        )
+        for req in requests:
+            request_id = str(getattr(req, "rid", ""))
+            metadata = self._metadata(req)
+            if not request_id or metadata is None:
+                continue
+            path_extent_ids = getattr(
+                transaction, "restore_path_extent_ids", {}
+            ).get(request_id)
+            if path_extent_ids is None:
+                path_extent_ids = self._request_path_extent_ids(
+                    req, metadata.context_id, cpu_only=False
+                )
+            if path_extent_ids is None:
+                path_extent_ids = ()
+                self.audit.emit(
+                    "restore_obligation_path_recapture_failed",
+                    now_ms,
+                    request_id=request_id,
+                    source_retraction_transaction_id=transaction.transaction_id,
+                    fallback="native_recompute_on_requeue",
+                )
+            obligation = index.create(
+                request_id=request_id,
+                workflow_id=metadata.root_workflow_id,
+                invocation_id=metadata.invocation_id,
+                context_id=metadata.context_id,
+                context_epoch=metadata.context_epoch,
+                source_retraction_transaction_id=transaction.transaction_id,
+                source_joint_plan_id=source_plan_id,
+                created_ts_ms=now_ms,
+                path_extent_ids=path_extent_ids,
+                cause=RestoreObligationCause.RUNNING_RETRACTION,
+            )
+            self._ensure_restore_transaction(obligation)
+            self._restore_obligation_counts["created"] += 1
+            if getattr(transaction, "restore_micro_gate_id", None) is not None:
+                self._update_restore_micro_gate(
+                    "obligation_created",
+                    now_ms=now_ms,
+                    reason="durable_restore_obligation_created",
+                    transaction_id=transaction.transaction_id,
+                    obligation_id=obligation.obligation_id,
+                    victim_request_id=request_id,
+                )
+            self.audit.emit(
+                "restore_obligation_created",
+                now_ms,
+                obligation_id=obligation.obligation_id,
+                request_id=request_id,
+                workflow_id=obligation.workflow_id,
+                invocation_id=obligation.invocation_id,
+                context_id=obligation.context_id,
+                context_epoch=obligation.context_epoch,
+                source_retraction_transaction_id=(
+                    obligation.source_retraction_transaction_id
+                ),
+                source_joint_plan_id=obligation.source_joint_plan_id,
+                cause=obligation.cause.value,
+                path_extent_count=len(path_extent_ids),
+            )
+
+    def _ensure_ordinary_waiting_restore_obligation(
+        self,
+        request_id: str,
+        metadata: BeliefKVRequestMetadata,
+        req: Any | None,
+        required_extent_ids: tuple[str, ...],
+        *,
+        now_ms: float,
+    ) -> RestoreObligation | None:
+        """Turn an observed CPU-only waiting prefix into a durable H2D debt."""
+
+        index = self._restore_obligation_index()
+        existing = index.get(request_id)
+        if existing is not None and not existing.state.terminal:
+            return existing
+        if not required_extent_ids:
+            return None
+        if not index.can_create((request_id,)):
+            waiters = getattr(
+                self, "_ordinary_restore_capacity_waiters", None
+            )
+            if waiters is None:
+                waiters = set()
+                self._ordinary_restore_capacity_waiters = waiters
+            if request_id not in waiters:
+                waiters.add(request_id)
+                self._restore_obligation_counts[
+                    "ordinary_waiting_capacity_blocked"
+                ] += 1
+                self.audit.emit(
+                    "ordinary_waiting_restore_capacity_blocked",
+                    now_ms,
+                    request_id=request_id,
+                    workflow_id=metadata.root_workflow_id,
+                    invocation_id=metadata.invocation_id,
+                    context_id=metadata.context_id,
+                    active_obligation_count=len(index.active()),
+                    max_active=index.max_active,
+                )
+            return None
+
+        path_extent_ids = self._request_path_extent_ids(
+            req, metadata.context_id, cpu_only=False
+        )
+        if path_extent_ids is None:
+            path_extent_ids = required_extent_ids
+        source_plan_id = (
+            f"joint-restore-liveness:{request_id}:{metadata.context_epoch}"
+        )
+        obligation = index.create(
+            request_id=request_id,
+            workflow_id=metadata.root_workflow_id,
+            invocation_id=metadata.invocation_id,
+            context_id=metadata.context_id,
+            context_epoch=metadata.context_epoch,
+            source_retraction_transaction_id=(
+                f"ordinary-waiting:{request_id}"
+            ),
+            source_joint_plan_id=source_plan_id,
+            created_ts_ms=now_ms,
+            path_extent_ids=path_extent_ids,
+            cause=RestoreObligationCause.ORDINARY_WAITING_PREFIX,
+        )
+        self._ensure_restore_transaction(obligation)
+        obligation.source_transaction_terminal = True
+        obligation.requeued = True
+        obligation.state = RestoreObligationState.PARKED_WAIT
+        obligation.set_required_extents(
+            required_extent_ids,
+            restore_bytes=self._extent_ids_bytes(required_extent_ids),
+            now_ms=now_ms,
+        )
+        getattr(
+            self, "_ordinary_restore_capacity_waiters", set()
+        ).discard(request_id)
+        self._restore_obligation_counts["ordinary_waiting_created"] += 1
+        self.audit.emit(
+            "restore_obligation_created",
+            now_ms,
+            obligation_id=obligation.obligation_id,
+            request_id=request_id,
+            workflow_id=obligation.workflow_id,
+            invocation_id=obligation.invocation_id,
+            context_id=obligation.context_id,
+            context_epoch=obligation.context_epoch,
+            source_retraction_transaction_id=(
+                obligation.source_retraction_transaction_id
+            ),
+            source_joint_plan_id=obligation.source_joint_plan_id,
+            cause=obligation.cause.value,
+            native_admission_fallback=obligation.native_admission_fallback,
+            path_extent_count=len(path_extent_ids),
+            required_extent_count=len(required_extent_ids),
+            restore_bytes=obligation.restore_bytes,
+        )
+        return obligation
+
+    def _ensure_restore_transaction(
+        self, obligation: RestoreObligation
+    ) -> RestoreTransaction:
+        transactions = getattr(self, "_restore_transactions", None)
+        if transactions is None:
+            transactions = {}
+            self._restore_transactions = transactions
+        transaction = transactions.get(obligation.request_id)
+        if (
+            transaction is not None
+            and transaction.obligation.obligation_id == obligation.obligation_id
+        ):
+            return transaction
+        transaction = RestoreTransaction(
+            transaction_id=f"restore-tx:{obligation.obligation_id}",
+            obligation=obligation,
+        )
+        transactions[obligation.request_id] = transaction
+        return transaction
+
+    def _mark_restore_source_transaction_terminal(
+        self,
+        transaction_id: str,
+        *,
+        now_ms: float,
+        reason: str,
+    ) -> None:
+        for obligation in self._restore_obligation_index().for_source_transaction(
+            transaction_id
+        ):
+            obligation.source_transaction_terminal = True
+            if obligation.state in {
+                RestoreObligationState.RETRACTION_PREPARED,
+                RestoreObligationState.D2H_INFLIGHT,
+            }:
+                obligation.state = RestoreObligationState.PARKED_WAIT
+            obligation.last_progress_ts_ms = now_ms
+            self.audit.emit(
+                "restore_obligation_source_terminal",
+                now_ms,
+                obligation_id=obligation.obligation_id,
+                request_id=obligation.request_id,
+                source_retraction_transaction_id=transaction_id,
+                source_terminal_reason=reason,
+                state=obligation.state.value,
+            )
+
+    def _overdue_restore_obligation(
+        self, *, now_ms: float
+    ) -> RestoreObligation | None:
+        if getattr(self, "_restore_obligations", None) is None:
+            return None
+        return next(
+            (
+                item
+                for item in self._restore_obligation_index().active()
+                if now_ms - item.created_ts_ms
+                >= self.config.restore_obligation_escalation_ms
+            ),
+            None,
+        )
+
+    def _request_restore_drain(
+        self, obligation: RestoreObligation, *, now_ms: float
+    ) -> None:
+        mode = getattr(
+            self, "_restore_authority_mode", RestoreAuthorityMode.NORMAL_JOINT
+        )
+        if mode != RestoreAuthorityMode.NORMAL_JOINT:
+            return
+        self._restore_authority_mode = (
+            RestoreAuthorityMode.RESTORE_DRAIN_REQUESTED
+        )
+        self._restore_authority_request_id = obligation.request_id
+        self.audit.emit(
+            "restore_authority_transition",
+            now_ms,
+            previous_mode=mode.value,
+            current_mode=self._restore_authority_mode.value,
+            request_id=obligation.request_id,
+            obligation_id=obligation.obligation_id,
+            reason="oldest_restore_liveness_escalated",
+        )
+
+    def _advance_restore_authority(self, *, now_ms: float) -> None:
+        mode = getattr(
+            self, "_restore_authority_mode", RestoreAuthorityMode.NORMAL_JOINT
+        )
+        request_id = getattr(self, "_restore_authority_request_id", None)
+        obligation = (
+            self._restore_obligation_index().get(request_id)
+            if request_id is not None
+            else None
+        )
+        grace = getattr(self, "_restore_service_grace_by_request", {}).get(
+            request_id
+        )
+        owner_finished = (
+            obligation is None
+            or obligation.state in {
+                RestoreObligationState.CANCELLED,
+                RestoreObligationState.FAILED,
+            }
+            or (
+                obligation.state == RestoreObligationState.SATISFIED
+                and (grace is None or not grace.active)
+            )
+        )
+        if mode != RestoreAuthorityMode.NORMAL_JOINT and owner_finished:
+            self._restore_authority_mode = RestoreAuthorityMode.NORMAL_JOINT
+            self._restore_authority_request_id = None
+            self._current_online_joint_view = None
+            self._current_online_joint_decision = None
+            self._current_joint_plan_epoch = None
+            self.audit.emit(
+                "restore_authority_transition",
+                now_ms,
+                previous_mode=mode.value,
+                current_mode=RestoreAuthorityMode.NORMAL_JOINT.value,
+                request_id=request_id,
+                reason="restore_owner_terminal",
+            )
+            return
+        if mode != RestoreAuthorityMode.RESTORE_DRAIN_REQUESTED:
+            return
+        if self.controller.has_pending_transfer_work():
+            return
+        current_view = getattr(self, "_current_online_joint_view", None)
+        if current_view is not None:
+            self._invalidate_online_joint_plan(
+                current_view.plan_id,
+                reason="restore_drain_active",
+                now_ms=now_ms,
+            )
+        self._online_joint_result = None
+        self._online_joint_source = None
+        self._online_joint_validation = None
+        self._current_online_joint_view = None
+        self._current_online_joint_decision = None
+        self._current_joint_plan_epoch = None
+        self._current_semantic_residency_commit = None
+        self._restore_authority_mode = RestoreAuthorityMode.RESTORE_DRAIN_ACTIVE
+        self.audit.emit(
+            "restore_authority_transition",
+            now_ms,
+            previous_mode=mode.value,
+            current_mode=self._restore_authority_mode.value,
+            request_id=request_id,
+            reason="safe_point_exclusive_authority_acquired",
+        )
+
+    def _active_restore_lease(self) -> RestoreLease | None:
+        index = getattr(self, "_restore_leases", None)
+        if index is None:
+            return None
+        return next(iter(index.active()), None)
+
+    def _select_restore_bypass_request(
+        self,
+        waiting_queue: list[Any] | tuple[Any, ...],
+        *,
+        now_ms: float,
+    ) -> str | None:
+        """Permit one bounded small admission only to avoid an idle engine."""
+
+        if getattr(
+            self, "_restore_authority_mode", RestoreAuthorityMode.NORMAL_JOINT
+        ) != RestoreAuthorityMode.NORMAL_JOINT:
+            return None
+
+        overdue = self._overdue_restore_obligation(now_ms=now_ms)
+        if overdue is None or self._active_restore_lease() is not None:
+            return None
+        if overdue.bypass_count >= self.config.restore_lease_max_bypass_admissions:
+            return None
+        running = tuple(
+            getattr(getattr(self.scheduler, "running_batch", None), "reqs", ()) or ()
+        )
+        if running or getattr(self.scheduler, "chunked_req", None) is not None:
+            return None
+        candidates: list[tuple[int, float, str]] = []
+        for req in waiting_queue:
+            request_id = str(getattr(req, "rid", ""))
+            if not request_id or request_id == overdue.request_id:
+                continue
+            metadata = self._metadata(req)
+            entry = self.controller.visible_admission.get(request_id)
+            if (
+                metadata is None
+                or entry is None
+                or self._metadata_scope_is_terminal(metadata)
+                or self._request_restore_bundle_ids(req, metadata.context_id)
+            ):
+                continue
+            candidates.append(
+                (
+                    entry.request.estimated_incremental_bytes,
+                    entry.request.submitted_ts_ms,
+                    request_id,
+                )
+            )
+        if not candidates:
+            return None
+        request_id = min(candidates)[2]
+        self.audit.emit(
+            "restore_debt_bounded_bypass_selected",
+            now_ms,
+            obligation_id=overdue.obligation_id,
+            restore_request_id=overdue.request_id,
+            bypass_request_id=request_id,
+            prior_bypass_count=overdue.bypass_count,
+            max_bypass_admissions=(
+                self.config.restore_lease_max_bypass_admissions
+            ),
+            reason="engine_idle_without_grantable_restore_lease",
+        )
+        return request_id
+
+    def _start_restore_service_grace(
+        self,
+        obligation: RestoreObligation,
+        *,
+        now_ms: float,
+        req: Any | None = None,
+    ) -> None:
+        required_tokens = int(
+            getattr(self.config, "restore_service_grace_decode_tokens", 0)
+        )
+        if required_tokens <= 0:
+            return
+        graces = getattr(self, "_restore_service_grace_by_request", None)
+        if graces is None:
+            graces = {}
+            self._restore_service_grace_by_request = graces
+        previous = graces.get(obligation.request_id)
+        if previous is not None and previous.active:
+            previous.cancel(now_ms=now_ms, reason="superseded_by_new_restore")
+        grace = RestoreServiceGrace(
+            request_id=obligation.request_id,
+            obligation_id=obligation.obligation_id,
+            granted_ts_ms=now_ms,
+            required_decode_tokens=required_tokens,
+            last_observed_output_tokens=(
+                _sequence_length(getattr(req, "output_ids", None))
+                if req is not None
+                else None
+            ),
+        )
+        graces[obligation.request_id] = grace
+        transaction = self._ensure_restore_transaction(obligation)
+        transaction.stage = RestoreTransactionStage.SERVICE_GRACE
+        transaction.service_grace = grace
+        self._restore_obligation_counts["service_grace_started"] += 1
+        self.audit.emit(
+            "restore_service_grace_started",
+            now_ms,
+            obligation_id=obligation.obligation_id,
+            request_id=obligation.request_id,
+            required_decode_tokens=required_tokens,
+            policy_effect="exclude_from_running_retraction",
+        )
+
+    def _cancel_restore_service_grace(
+        self,
+        request_id: str,
+        *,
+        now_ms: float,
+        reason: str,
+    ) -> None:
+        grace = getattr(self, "_restore_service_grace_by_request", {}).pop(
+            request_id, None
+        )
+        if grace is None:
+            return
+        was_active = grace.active
+        grace.cancel(now_ms=now_ms, reason=reason)
+        if was_active:
+            self._restore_obligation_counts["service_grace_cancelled"] += 1
+            self.audit.emit(
+                "restore_service_grace_terminal",
+                now_ms,
+                obligation_id=grace.obligation_id,
+                request_id=request_id,
+                status="cancelled",
+                reason=reason,
+                served_decode_tokens=grace.served_decode_tokens,
+                required_decode_tokens=grace.required_decode_tokens,
+            )
+
+    def _observe_restore_service_grace(
+        self,
+        batch: Any,
+        *,
+        now_ms: float,
+        phase: str,
+    ) -> None:
+        graces = getattr(self, "_restore_service_grace_by_request", {})
+        if not graces:
+            return
+        steps = max(
+            1,
+            int(
+                getattr(
+                    getattr(self.scheduler, "server_args", None),
+                    "num_continuous_decode_steps",
+                    1,
+                )
+                or 1
+            ),
+        )
+        for req in tuple(getattr(batch, "reqs", ()) or ()):
+            request_id = str(getattr(req, "rid", ""))
+            grace = graces.get(request_id)
+            if grace is None or not grace.active:
+                continue
+            output_ids = getattr(req, "output_ids", None)
+            output_tokens = (
+                _sequence_length(output_ids) if output_ids is not None else None
+            )
+            if phase != "decode":
+                if output_tokens is not None:
+                    grace.last_observed_output_tokens = output_tokens
+                continue
+            if output_tokens is None or grace.last_observed_output_tokens is None:
+                served_tokens = steps
+            else:
+                served_tokens = max(
+                    0, output_tokens - grace.last_observed_output_tokens
+                )
+            if output_tokens is not None:
+                grace.last_observed_output_tokens = output_tokens
+            if not grace.observe_decode(served_tokens, now_ms=now_ms):
+                continue
+            graces.pop(request_id, None)
+            transaction = getattr(self, "_restore_transactions", {}).get(
+                request_id
+            )
+            if transaction is not None:
+                transaction.stage = RestoreTransactionStage.SATISFIED
+            self._restore_obligation_counts["service_grace_satisfied"] += 1
+            gate_state = getattr(self, "_restore_micro_gate_state", {})
+            if (
+                self.config.restore_micro_gate_enabled
+                and gate_state.get("victim_request_id") == request_id
+            ):
+                obligation = self._restore_obligation_index().get(request_id)
+                self._update_restore_micro_gate(
+                    "completed",
+                    now_ms=now_ms,
+                    reason="restore_service_quantum_satisfied",
+                    obligation_id=grace.obligation_id,
+                    restored_h2d_bytes=(
+                        obligation.restored_bytes if obligation is not None else 0
+                    ),
+                    served_decode_tokens=grace.served_decode_tokens,
+                )
+            self.audit.emit(
+                "restore_service_grace_terminal",
+                now_ms,
+                obligation_id=grace.obligation_id,
+                request_id=request_id,
+                status="satisfied",
+                reason=grace.terminal_reason,
+                served_decode_tokens=grace.served_decode_tokens,
+                required_decode_tokens=grace.required_decode_tokens,
+                grace_elapsed_ms=max(0.0, now_ms - grace.granted_ts_ms),
+            )
+
+    def _finish_restore_obligation(
+        self,
+        request_id: str,
+        state: RestoreObligationState,
+        *,
+        now_ms: float,
+        reason: str,
+    ) -> None:
+        index = getattr(self, "_restore_obligations", None)
+        if index is None:
+            return
+        obligation = index.get(request_id)
+        if obligation is None or obligation.state.terminal:
+            return
+        funding_reserved_tokens = obligation.funding_reserved_tokens
+        funding_reserved_bytes = obligation.funding_reserved_bytes
+        released_funding_tokens = self._release_restore_funding_capacity(
+            obligation,
+            now_ms=now_ms,
+            reason=reason,
+        )
+        self._release_restore_lease(
+            request_id,
+            now_ms=now_ms,
+            reason=reason,
+            rollback=state != RestoreObligationState.SATISFIED,
+        )
+        obligation.finish(state, now_ms=now_ms, reason=reason)
+        transaction = self._ensure_restore_transaction(obligation)
+        active_grace = getattr(self, "_restore_service_grace_by_request", {}).get(
+            request_id
+        )
+        transaction.stage = {
+            RestoreObligationState.SATISFIED: (
+                RestoreTransactionStage.SERVICE_GRACE
+                if active_grace is not None and active_grace.active
+                else RestoreTransactionStage.SATISFIED
+            ),
+            RestoreObligationState.CANCELLED: RestoreTransactionStage.CANCELLED,
+            RestoreObligationState.FAILED: (
+                RestoreTransactionStage.FAILED_UNRECOVERABLE
+            ),
+        }[state]
+        if state == RestoreObligationState.FAILED:
+            transaction.failure_evidence = {
+                "reason": reason,
+                "request_cancelled": request_id
+                in getattr(self, "_terminal_cancelled_request_ids", set()),
+                "raw_input_reconstructable": bool(
+                    getattr(self._restore_waiting_request(request_id), "origin_input_ids", None)
+                ),
+                "context_bytes": obligation.restore_bytes
+                + obligation.required_admission_bytes,
+                "hbm_capacity_bytes": self.config.hbm_capacity_bytes,
+                "shutdown_state": getattr(self, "_shutdown_state", "running"),
+                "blocker_codes": list(obligation.blocker_codes),
+            }
+        self._restore_obligation_counts[state.value] += 1
+        gate_state = getattr(self, "_restore_micro_gate_state", {})
+        if (
+            self.config.restore_micro_gate_enabled
+            and gate_state.get("victim_request_id") == request_id
+        ):
+            gate_stage = (
+                "restore_satisfied"
+                if state == RestoreObligationState.SATISFIED
+                else "failed"
+            )
+            self._update_restore_micro_gate(
+                gate_stage,
+                now_ms=now_ms,
+                reason=reason,
+                obligation_id=obligation.obligation_id,
+                restored_h2d_bytes=obligation.restored_bytes,
+                obligation_state=state.value,
+            )
+        self.audit.emit(
+            "restore_obligation_terminal",
+            now_ms,
+            obligation_id=obligation.obligation_id,
+            request_id=obligation.request_id,
+            workflow_id=obligation.workflow_id,
+            invocation_id=obligation.invocation_id,
+            context_id=obligation.context_id,
+            state=obligation.state.value,
+            reason=reason,
+            total_wait_ms=max(0.0, now_ms - obligation.created_ts_ms),
+            restored_bytes=obligation.restored_bytes,
+            funding_reclaim_bytes=obligation.funding_reclaim_bytes,
+            funding_reserved_tokens_before_terminal=funding_reserved_tokens,
+            funding_reserved_bytes_before_terminal=funding_reserved_bytes,
+            released_funding_tokens=released_funding_tokens,
+            command_ids=list(obligation.command_ids),
+            cause=obligation.cause.value,
+            native_admission_fallback=obligation.native_admission_fallback,
+        )
+
     def plan_running_batch_retraction(
         self,
         running_batch: Any,
@@ -2885,7 +5490,22 @@ class EmbeddedSGLangRuntime:
 
         if not self.config.running_batch_retraction_enabled:
             return None
+        if getattr(
+            self, "_restore_authority_mode", RestoreAuthorityMode.NORMAL_JOINT
+        ) != RestoreAuthorityMode.NORMAL_JOINT:
+            return None
         now_ms = float(self._now_ms())
+        overdue_restore = self._overdue_restore_obligation(now_ms=now_ms)
+        if overdue_restore is not None:
+            self._running_retraction_counts["restore_debt_barrier"] += 1
+            self._attribute_running_retraction_barrier(
+                running_batch,
+                now_ms=now_ms,
+                planning_reason=(
+                    f"restore_debt_barrier:{overdue_restore.obligation_id}"
+                ),
+            )
+            return None
         previous_decision_ms = getattr(self, "_last_retraction_decision_ms", None)
         if (
             previous_decision_ms is not None
@@ -2981,18 +5601,10 @@ class EmbeddedSGLangRuntime:
             workflow_id: index for index, workflow_id in enumerate(fair_order)
         }
         ledger = getattr(self, "_lock_service_ledger", None)
-        page_size = max(
-            1,
-            int(
-                getattr(
-                    getattr(self.scheduler, "server_args", None),
-                    "page_size",
-                    1,
-                )
-                or 1
-            ),
-        )
         cooldowns = getattr(self, "_retraction_cooldown_until_by_request", {})
+        service_graces = getattr(
+            self, "_restore_service_grace_by_request", {}
+        )
         retraction_counts = getattr(self, "_retraction_counts_by_request", {})
         candidates: list[RunningRetractionCandidate] = []
         for req in requests:
@@ -3000,17 +5612,7 @@ class EmbeddedSGLangRuntime:
             request_id = str(getattr(req, "rid", ""))
             if metadata is None or not request_id:
                 continue
-            prefix_tokens = _sequence_length(getattr(req, "prefix_indices", None))
-            sequence_tokens = max(
-                int(getattr(req, "seqlen", 0) or 0),
-                _sequence_length(getattr(req, "origin_input_ids", None))
-                + _sequence_length(getattr(req, "output_ids", None)),
-            )
-            last_uncached_pos = (prefix_tokens // page_size) * page_size
-            private_bytes = (
-                max(0, sequence_tokens - last_uncached_pos)
-                * self.config.kv_bytes_per_token
-            )
+            private_bytes = self._estimated_request_private_kv_bytes(req)
             service_status = (
                 ledger.service_status(
                     request_id,
@@ -3056,6 +5658,10 @@ class EmbeddedSGLangRuntime:
                     policy_eligible=(
                         causal_known
                         and now_ms >= cooldowns.get(request_id, 0.0)
+                        and not (
+                            (grace := service_graces.get(request_id)) is not None
+                            and grace.active
+                        )
                         and request_id not in protected_blocker_ids
                         and not self._metadata_scope_is_terminal(metadata)
                     ),
@@ -3111,7 +5717,13 @@ class EmbeddedSGLangRuntime:
             ),
             replacements=replacements,
         )
-        decision = self._running_retraction_planner().decide(snapshot)
+        snapshot, restore_micro_gate_id = self._restore_micro_gate_snapshot(
+            snapshot
+        )
+        decision, source_joint_plan_id = self._running_retraction_decision(
+            snapshot,
+            restore_micro_gate_id=restore_micro_gate_id,
+        )
         plan = decision.plan
         if plan is None:
             self._running_retraction_counts["no_feasible_plan"] += 1
@@ -3122,6 +5734,23 @@ class EmbeddedSGLangRuntime:
                 running_batch,
                 now_ms=now_ms,
                 planning_reason=decision.reason,
+                replacements=replacements,
+                decision=decision,
+            )
+            return None
+
+        if not self._can_prepare_restore_obligations(plan, requests):
+            self._running_retraction_counts["restore_obligation_fail_closed"] += 1
+            if restore_micro_gate_id is not None:
+                self._update_restore_micro_gate(
+                    "waiting_for_pair",
+                    now_ms=now_ms,
+                    reason="restore_obligation_preflight_unavailable",
+                )
+            self._attribute_running_retraction_barrier(
+                running_batch,
+                now_ms=now_ms,
+                planning_reason="restore_obligation_unavailable",
                 replacements=replacements,
                 decision=decision,
             )
@@ -3165,10 +5794,23 @@ class EmbeddedSGLangRuntime:
             created_ts_ms=now_ms,
             barrier_intent_id=barrier_intent_id,
             tentative_unlock_preview=tentative_unlock_preview,
+            source_joint_plan_id=source_joint_plan_id,
+            restore_path_extent_ids=self._capture_restore_paths(
+                plan, requests
+            ),
+            restore_micro_gate_id=restore_micro_gate_id,
         )
         self._pending_running_retraction_transaction = transaction
         self._running_retraction_transactions.append(transaction)
         self._running_retraction_counts["planned"] += 1
+        if restore_micro_gate_id is not None:
+            self._update_restore_micro_gate(
+                "transaction_created",
+                now_ms=now_ms,
+                reason="production_retraction_transaction_created",
+                transaction_id=transaction.transaction_id,
+                source_joint_plan_id=source_joint_plan_id,
+            )
         self.audit.emit(
             "running_retraction_tentative_unlock_preview",
             now_ms,
@@ -3200,6 +5842,7 @@ class EmbeddedSGLangRuntime:
                 tentative_unlock_preview.newly_migratable_bytes
             ),
             reason=plan.reason,
+            source_joint_plan_id=source_joint_plan_id,
         )
         return plan
 
@@ -3242,6 +5885,11 @@ class EmbeddedSGLangRuntime:
             int(native_reclaim_capacity_after_tokens)
             * self.config.kv_bytes_per_token,
         )
+        self._create_restore_obligations(
+            transaction,
+            retracted_requests,
+            now_ms=now_ms,
+        )
         self._pending_selective_retraction_ids.update(actual_ids)
         self._retracted_engine_request_ids.update(actual_ids)
         cooldown_until = now_ms + self.config.running_batch_retraction_cooldown_ms
@@ -3251,6 +5899,15 @@ class EmbeddedSGLangRuntime:
 
         self._mark_full_tree_rebuild()
         self.sync_tree(force=True)
+        source_joint_plan_id = getattr(
+            transaction, "source_joint_plan_id", None
+        )
+        if source_joint_plan_id is not None:
+            self._invalidate_online_joint_plan(
+                source_joint_plan_id,
+                reason="running_retraction_committed",
+                now_ms=now_ms,
+            )
         lock_after = (
             self.controller.page_index.physical_kv_state_breakdown().engine_locked_bytes
         )
@@ -3354,6 +6011,16 @@ class EmbeddedSGLangRuntime:
             if replacement_entry is not None
             else 0
         )
+        if getattr(transaction, "restore_micro_gate_id", None) is not None:
+            self._update_restore_micro_gate(
+                "retraction_committed",
+                now_ms=now_ms,
+                reason="native_selective_retraction_committed",
+                transaction_id=transaction.transaction_id,
+                actual_request_ids=list(actual_ids),
+                native_reclaim_bytes=actual_reclaim,
+                engine_lock_release_bytes=actual_lock_release,
+            )
 
         exact_request_set = set(actual_ids) == set(plan.request_ids)
         reclaim_baseline_matches = (
@@ -3460,6 +6127,22 @@ class EmbeddedSGLangRuntime:
             transaction.plan.replacement_request_ids
         )
         self._running_retraction_counts["reclaim_confirmed"] += 1
+        if getattr(transaction, "restore_micro_gate_id", None) is not None:
+            self._update_restore_micro_gate(
+                "d2h_completed",
+                now_ms=now_ms,
+                reason="retraction_residency_completed",
+                transaction_id=transaction.transaction_id,
+                explicit_d2h_bytes=transaction.explicit_transfer_bytes,
+                allocator_reclaim_bytes=(
+                    transaction.actual_reclaim_capacity_bytes
+                ),
+            )
+        self._mark_restore_source_transaction_terminal(
+            transaction.transaction_id,
+            now_ms=now_ms,
+            reason="source_retraction_completed",
+        )
         self._pending_running_retraction_transaction = None
         self._resync_retraction_barrier_entries()
         self.audit.emit(
@@ -3491,6 +6174,18 @@ class EmbeddedSGLangRuntime:
         transaction.stage = "residency_failed"
         transaction.failure_reason = reason or transaction.failure_reason or "unknown"
         self._running_retraction_counts["residency_failed"] += 1
+        if getattr(transaction, "restore_micro_gate_id", None) is not None:
+            self._update_restore_micro_gate(
+                "failed",
+                now_ms=now_ms,
+                reason=transaction.failure_reason,
+                transaction_id=transaction.transaction_id,
+            )
+        self._mark_restore_source_transaction_terminal(
+            transaction.transaction_id,
+            now_ms=now_ms,
+            reason=f"source_retraction_failed:{transaction.failure_reason}",
+        )
         self._pending_running_retraction_transaction = None
         self._resync_retraction_barrier_entries()
         self.audit.emit(
@@ -3630,6 +6325,9 @@ class EmbeddedSGLangRuntime:
                 metadata={
                     "reason": "running_retraction_joint_residency",
                     "retraction_transaction_id": transaction.transaction_id,
+                    "joint_plan_id": getattr(
+                        transaction, "source_joint_plan_id", None
+                    ),
                     "bypass_owner_context_ids": sorted(victim_contexts),
                     "physical_bundle_scope": preview.bundle.scope.value,
                     "physical_exclusive_action_bytes": (
@@ -3644,13 +6342,19 @@ class EmbeddedSGLangRuntime:
                 },
                 physical_bundle=preview.intent(),
             )
-            if not self.controller.enqueue_control_command(command):
+            enqueue_outcome = self.controller.enqueue_control_command(command)
+            if enqueue_outcome.status != EnqueueStatus.ENQUEUED:
                 queue_conflict = True
                 continue
             transaction.pending_command_id = command.command_id
             transaction.pending_command_kind = command.kind
             transaction.residency_command_ids.append(command.command_id)
             transaction.stage = "residency_pending"
+            for obligation in self._restore_obligation_index().for_source_transaction(
+                transaction.transaction_id
+            ):
+                obligation.state = RestoreObligationState.D2H_INFLIGHT
+                obligation.last_progress_ts_ms = now_ms
             self._running_retraction_counts[
                 f"residency_{command.kind.value}_queued"
             ] += 1
@@ -3710,6 +6414,12 @@ class EmbeddedSGLangRuntime:
             transaction.pending_command_id = None
             command_kind = transaction.pending_command_kind
             transaction.pending_command_kind = None
+            self._record_retraction_restore_extents(
+                transaction,
+                matching_ack,
+                command_kind=command_kind,
+                now_ms=now_ms,
+            )
             if matching_ack.status != CommandStatus.COMPLETED:
                 self._fail_retraction_transaction(
                     transaction,
@@ -3759,6 +6469,1252 @@ class EmbeddedSGLangRuntime:
             transaction, now_ms=now_ms
         )
 
+    def _record_retraction_restore_extents(
+        self,
+        transaction: _RunningRetractionTransaction,
+        ack: CommandAck,
+        *,
+        command_kind: CommandKind | None,
+        now_ms: float,
+    ) -> None:
+        if command_kind != CommandKind.OFFLOAD_CONTEXT:
+            return
+        ack_extent_ids = {
+            f"page:{handle.page_id}:{handle.allocation_generation}"
+            for handle in ack.page_handles
+        }
+        for obligation in self._restore_obligation_index().for_source_transaction(
+            transaction.transaction_id
+        ):
+            exact = tuple(
+                sorted(ack_extent_ids.intersection(obligation.path_extent_ids))
+            )
+            if exact:
+                merged = tuple(
+                    sorted(set(obligation.required_extent_ids).union(exact))
+                )
+                obligation.set_required_extents(
+                    merged,
+                    restore_bytes=self._extent_ids_bytes(merged),
+                    now_ms=now_ms,
+                )
+            self.audit.emit(
+                "restore_obligation_source_d2h_ack",
+                now_ms,
+                obligation_id=obligation.obligation_id,
+                request_id=obligation.request_id,
+                command_id=ack.command_id,
+                status=ack.status.value,
+                exact_path_extent_count=len(exact),
+                required_extent_count=len(obligation.required_extent_ids),
+                actual_bytes=ack.actual_bytes,
+            )
+
+    def _restore_attempt_stamp(self) -> tuple[object, ...]:
+        page_index = self.controller.page_index
+        return (
+            page_index.revision,
+            page_index.topology_revision,
+            self._allocator_available_bytes(),
+            sum(
+                len(item)
+                for allocations in getattr(
+                    self, "_restore_funding_allocations", {}
+                ).values()
+                for item in allocations
+            ),
+            int(getattr(self.controller, "_transfer_epoch", 0)),
+        )
+
+    def _restore_external_progress_token(
+        self,
+        obligation: RestoreObligation,
+        *,
+        required_bytes: int,
+        closure_fingerprint: str,
+        command: ControlCommand | None = None,
+    ) -> ExternalProgressToken:
+        snapshots = self._context_physical_snapshots(obligation.context_id)
+        engine_epoch = tuple(
+            (
+                item.request_id,
+                item.request_generation,
+                item.queue_location.value,
+                item.req_pool_slot,
+                item.radix_lock_owned,
+                item.terminal,
+            )
+            for item in snapshots
+        )
+        native_load_epoch = tuple(
+            (item.request_id, item.native_load_operation_id)
+            for item in snapshots
+            if item.native_load_operation_id is not None
+        )
+        available = (
+            self._allocator_available_bytes()
+            + obligation.funding_reserved_bytes
+        )
+        return ExternalProgressToken(
+            engine_owner_epoch=engine_epoch,
+            closure_fingerprint=closure_fingerprint,
+            effective_capacity_threshold_epoch=(
+                max(0, int(required_bytes)),
+                available >= max(0, int(required_bytes)),
+            ),
+            command_ownership_epoch=(
+                self.controller.command_ownership_epoch(obligation.context_id)
+            ),
+            guard_generation=(
+                self.controller.transfer_guard.generation_for(command)
+                if command is not None
+                else 0
+            ),
+            native_load_generation=native_load_epoch,
+        )
+
+    def _restore_waiting_request(self, request_id: str) -> Any | None:
+        return next(
+            (
+                req
+                for req in tuple(
+                    getattr(self.scheduler, "waiting_queue", ()) or ()
+                )
+                if str(getattr(req, "rid", "")) == request_id
+            ),
+            None,
+        )
+
+    def _refresh_restore_obligation(
+        self,
+        obligation: RestoreObligation,
+        *,
+        now_ms: float,
+    ) -> tuple[Any | None, tuple[str, ...] | None]:
+        req = self._restore_waiting_request(obligation.request_id)
+        if req is None:
+            return None, obligation.required_extent_ids
+        obligation.requeued = True
+        required = self._request_path_extent_ids(
+            req, obligation.context_id, cpu_only=True
+        )
+        if required is None:
+            refresh = getattr(req, "init_next_round_input", None)
+            if callable(refresh):
+                refresh(self.tree_cache)
+                required = self._request_path_extent_ids(
+                    req, obligation.context_id, cpu_only=True
+                )
+        if required is None:
+            return req, None
+        if obligation.cause == RestoreObligationCause.ORDINARY_WAITING_PREFIX:
+            current_path = self._request_path_extent_ids(
+                req, obligation.context_id, cpu_only=False
+            )
+            if current_path is None:
+                return req, None
+            self._rebind_ordinary_restore_path(
+                obligation,
+                current_path,
+                now_ms=now_ms,
+            )
+        obligation.set_required_extents(
+            required,
+            restore_bytes=self._extent_ids_bytes(required),
+            now_ms=now_ms,
+        )
+        entry = self.controller.visible_admission.get(obligation.request_id)
+        obligation.required_admission_bytes = (
+            entry.request.estimated_incremental_bytes if entry is not None else 0
+        )
+        return req, required
+
+    def _rebind_ordinary_restore_path(
+        self,
+        obligation: RestoreObligation,
+        extent_ids: tuple[str, ...],
+        *,
+        now_ms: float,
+    ) -> None:
+        """Make the waiting request's current Radix path physically authoritative."""
+
+        page_index = self.controller.page_index
+        if (
+            not extent_ids
+            or not page_index.has_context(obligation.context_id)
+            or page_index.context_epoch(obligation.context_id)
+            != obligation.context_epoch
+        ):
+            return
+        handles: list[PageHandle] = []
+        for extent_id in extent_ids:
+            try:
+                handle = self._runtime_page_handle_from_extent_id(extent_id)
+            except ValueError:
+                return
+            page = page_index.pages.get(handle)
+            if page is None or page.residency == PhysicalResidency.DEAD:
+                return
+            handles.append(handle)
+        desired = set(handles)
+        previous = {
+            page.handle for page in page_index.context_pages(obligation.context_id)
+        }
+        obligation.path_extent_ids = tuple(sorted(set(extent_ids)))
+        if desired == previous:
+            return
+        page_index.bind_pages(
+            obligation.context_id,
+            obligation.context_epoch,
+            desired,
+            replace=True,
+        )
+        self._restore_obligation_counts["path_rebound"] += 1
+        self.audit.emit(
+            "restore_obligation_path_rebound",
+            now_ms,
+            obligation_id=obligation.obligation_id,
+            request_id=obligation.request_id,
+            context_id=obligation.context_id,
+            context_epoch=obligation.context_epoch,
+            previous_extent_count=len(previous),
+            current_extent_count=len(desired),
+            added_extent_count=len(desired - previous),
+            removed_extent_count=len(previous - desired),
+        )
+
+    def _activate_native_restore_fallback(
+        self,
+        obligation: RestoreObligation,
+        req: Any,
+        *,
+        now_ms: float,
+    ) -> bool:
+        """Reserve admission capacity, then use native HiCache load or prefill."""
+
+        required_extent_count = len(obligation.required_extent_ids)
+        restore_bytes = obligation.restore_bytes
+        if bool(getattr(self.config, "restore_lease_enabled", True)):
+            lease = self._grant_restore_lease(
+                obligation,
+                h2d_bytes=0,
+                now_ms=now_ms,
+            )
+            if lease is None:
+                return False
+            lease.mark_restored()
+        obligation.use_native_admission_fallback(now_ms=now_ms)
+        self._restore_obligation_counts["native_admission_fallback"] += 1
+        metadata = self._request_metadata_by_id.get(obligation.request_id)
+        if metadata is not None:
+            self._sync_visible_gate_state(
+                obligation.request_id,
+                metadata,
+                req=req,
+            )
+        self.audit.emit(
+            "restore_obligation_native_fallback_ready",
+            now_ms,
+            obligation_id=obligation.obligation_id,
+            request_id=obligation.request_id,
+            workflow_id=obligation.workflow_id,
+            context_id=obligation.context_id,
+            context_epoch=obligation.context_epoch,
+            required_extent_count=required_extent_count,
+            restore_bytes=restore_bytes,
+            required_admission_bytes=obligation.required_admission_bytes,
+            fallback="sglang_native_load_back_or_prefill",
+        )
+        return True
+
+    def _restore_h2d_previews(
+        self,
+        obligation: RestoreObligation,
+        *,
+        now_ms: float,
+        device_available_bytes: int,
+    ) -> tuple[PhysicalBundlePreview, ...]:
+        required_handles: set[PageHandle] = set()
+        for extent_id in obligation.required_extent_ids:
+            try:
+                required_handles.add(
+                    self._runtime_page_handle_from_extent_id(extent_id)
+                )
+            except ValueError:
+                continue
+        previews = self.controller.arbiter.bundle_builder.previews_for_context(
+            CommandKind.PREFETCH_CONTEXT,
+            obligation.context_id,
+            obligation.context_epoch,
+            now_ms=now_ms,
+            device_available_bytes=device_available_bytes,
+        )
+        return tuple(
+            sorted(
+                (
+                    preview
+                    for preview in previews
+                    if required_handles.intersection(
+                        action.handle
+                        for action in preview.page_actions
+                        if action.action == PhysicalPageAction.START_H2D
+                    )
+                ),
+                key=lambda preview: (
+                    -len(
+                        required_handles.intersection(
+                            action.handle
+                            for action in preview.page_actions
+                            if action.action == PhysicalPageAction.START_H2D
+                        )
+                    ),
+                    preview.copy_bytes,
+                    preview.bundle.closure_bytes,
+                    preview.bundle.bundle_id,
+                ),
+            )
+        )
+
+    def _restore_funding_preview(
+        self,
+        obligation: RestoreObligation,
+        *,
+        now_ms: float,
+        deficit_bytes: int,
+    ) -> tuple[PhysicalBundlePreview | None, tuple[str, ...]]:
+        observation = self._runtime_resource_observation(now_ms=now_ms)
+        protected_contexts = {
+            item.context_id for item in self._restore_obligation_index().active()
+        }
+        blockers: set[str] = set()
+        candidates: list[PhysicalBundlePreview] = []
+        for context_id, context in sorted(self.controller.graph.contexts.items()):
+            if context_id in protected_contexts:
+                continue
+            previews = self.controller.arbiter.bundle_builder.previews_for_context(
+                CommandKind.OFFLOAD_CONTEXT,
+                context_id,
+                context.epoch,
+                now_ms=now_ms,
+                allow_ready_owners=True,
+                protected_context_id=obligation.context_id,
+                host_available_bytes=observation.host_free_bytes,
+            )
+            for preview in previews:
+                if protected_contexts.intersection(
+                    preview.bundle.owner_context_ids
+                ):
+                    continue
+                if not preview.eligible:
+                    blockers.update(item.code.value for item in preview.blockers)
+                    continue
+                if preview.bundle.marginal_reclaimable_bytes > 0:
+                    candidates.append(preview)
+        if not candidates:
+            return None, tuple(sorted(blockers or {"no_funding_bundle"}))
+        selected = min(
+            candidates,
+            key=lambda preview: (
+                preview.bundle.scope != BundleScope.EXCLUSIVE_SUFFIX,
+                preview.copy_bytes > 0,
+                preview.bundle.marginal_reclaimable_bytes < deficit_bytes,
+                abs(preview.bundle.marginal_reclaimable_bytes - deficit_bytes),
+                preview.copy_bytes,
+                preview.bundle.bundle_id,
+            ),
+        )
+        return selected, ()
+
+    def _restore_lease_allocator_deficit_bytes(
+        self,
+        obligation: RestoreObligation,
+        *,
+        h2d_bytes: int,
+    ) -> int:
+        """Return only the allocator deficit that physical reclaim can satisfy."""
+
+        lease = self._restore_lease_index().get(obligation.request_id)
+        required_tokens = self._restore_lease_tokens(
+            obligation.required_admission_bytes
+        )
+        current_tokens = (
+            lease.reserved_tokens
+            if lease is not None and not lease.state.terminal
+            else 0
+        )
+        additional_tokens = max(0, required_tokens - current_tokens)
+        h2d_tokens = (
+            max(0, int(h2d_bytes)) + self.config.kv_bytes_per_token - 1
+        ) // self.config.kv_bytes_per_token
+        missing_tokens = max(
+            0,
+            additional_tokens
+            + h2d_tokens
+            - self._allocator_available_tokens()
+            - self._restore_funding_reserved_tokens(obligation.request_id),
+        )
+        return missing_tokens * self.config.kv_bytes_per_token
+
+    def _try_queue_restore_lease_funding(
+        self,
+        obligation: RestoreObligation,
+        *,
+        now_ms: float,
+        attempt_stamp: tuple[object, ...],
+        h2d_bytes: int,
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Fund a restore lease only when reclaim can close its allocator deficit."""
+
+        deficit_bytes = self._restore_lease_allocator_deficit_bytes(
+            obligation,
+            h2d_bytes=h2d_bytes,
+        )
+        if deficit_bytes <= 0:
+            return False, ("restore_lease_capacity",)
+        funding, blockers = self._restore_funding_preview(
+            obligation,
+            now_ms=now_ms,
+            deficit_bytes=deficit_bytes,
+        )
+        if funding is None:
+            return False, tuple(
+                sorted({"restore_lease_capacity", *blockers})
+            )
+        queued = self._queue_restore_obligation_command(
+            obligation,
+            funding,
+            now_ms=now_ms,
+            reason="restore_obligation_funding",
+            attempt_stamp=attempt_stamp,
+            funding_target_bytes=deficit_bytes,
+        )
+        if queued:
+            return True, ()
+        return False, ("restore_funding_queue_conflict",)
+
+    def _queue_restore_obligation_command(
+        self,
+        obligation: RestoreObligation,
+        preview: PhysicalBundlePreview,
+        *,
+        now_ms: float,
+        reason: str,
+        attempt_stamp: tuple[object, ...],
+        funding_target_bytes: int = 0,
+        command: ControlCommand | None = None,
+        preflight: Any | None = None,
+    ) -> Any:
+        if command is None:
+            command = self._build_restore_obligation_command(
+                obligation,
+                preview,
+                now_ms=now_ms,
+                reason=reason,
+                funding_target_bytes=funding_target_bytes,
+            )
+        phase = getattr(
+            self, "_safe_point_physical_phase", SafePointPhysicalPhase.IDLE
+        )
+        if phase != SafePointPhysicalPhase.TRANSACTIONAL_COMMIT:
+            if not self._begin_physical_transactional_commit(
+                command.context_id
+            ):
+                return EnqueueOutcome(
+                    status=EnqueueStatus.STALE_CERTIFICATE,
+                    canonical_command_id=None,
+                    attempt_key=(
+                        command.context_id,
+                        command.context_epoch,
+                        command.kind.value,
+                        "native_ownership_readset_changed",
+                    ),
+                    blocker_codes=("native_ownership_readset_changed",),
+                    wake_conditions=("safe_point_epoch_advanced",),
+                )
+        # Canonical ownership may have changed since the planning preflight.
+        preflight = self.controller.preflight_control_command(command)
+        outcome = self.controller.enqueue_control_command(
+            command, preflight=preflight
+        )
+        if not outcome:
+            self._restart_physical_capture_epoch()
+            return outcome
+        canonical_command_id = outcome.canonical_command_id
+        assert canonical_command_id is not None
+        obligation.start_command(
+            canonical_command_id,
+            command.kind,
+            now_ms=now_ms,
+            attempt_stamp=attempt_stamp,
+        )
+        if funding_target_bytes > 0:
+            funding_targets = getattr(
+                self, "_restore_funding_target_by_command", None
+            )
+            if funding_targets is None:
+                funding_targets = {}
+                self._restore_funding_target_by_command = funding_targets
+            funding_targets.setdefault(
+                canonical_command_id, {}
+            )[obligation.request_id] = int(funding_target_bytes)
+        if command.kind == CommandKind.PREFETCH_CONTEXT and bool(
+            getattr(self.config, "restore_lease_enabled", True)
+        ):
+            lease = self._restore_lease_index().get(obligation.request_id)
+            if lease is None or lease.state.terminal:
+                raise RuntimeError(
+                    "restore H2D command was queued without an active capacity lease"
+                )
+            lease.mark_h2d_inflight(canonical_command_id)
+        subscribers = getattr(self, "_restore_command_to_request", None)
+        if subscribers is None:
+            subscribers = {}
+            self._restore_command_to_request = subscribers
+        subscribers.setdefault(
+            canonical_command_id, set()
+        ).add(obligation.request_id)
+        transaction = self._ensure_restore_transaction(obligation)
+        certificate = transaction.feasibility_certificate
+        certificate_generation = (
+            certificate.certificate_generation if certificate is not None else 0
+        )
+        transaction.add_operation(
+            RestorePhysicalOperation(
+                stage=command.kind.value,
+                attempt_key=outcome.attempt_key,
+                certificate_generation=certificate_generation,
+                canonical_command_id=canonical_command_id,
+                adopted=outcome.status == EnqueueStatus.ADOPT_EXISTING,
+            )
+        )
+        transaction.stage = (
+            RestoreTransactionStage.H2D_ADOPTED
+            if outcome.status == EnqueueStatus.ADOPT_EXISTING
+            else RestoreTransactionStage.H2D_QUEUED
+            if command.kind == CommandKind.PREFETCH_CONTEXT
+            else RestoreTransactionStage.WAIT_FUNDING
+        )
+        self._restore_obligation_counts[
+            "command_adopted"
+            if outcome.status == EnqueueStatus.ADOPT_EXISTING
+            else f"{reason}_queued"
+        ] += 1
+        self.audit.emit(
+            "restore_obligation_command_queued",
+            now_ms,
+            obligation_id=obligation.obligation_id,
+            request_id=obligation.request_id,
+            workflow_id=obligation.workflow_id,
+            source_joint_plan_id=obligation.source_joint_plan_id,
+            command_id=canonical_command_id,
+            proposed_command_id=command.command_id,
+            enqueue_status=outcome.status.value,
+            command_kind=command.kind.value,
+            reason=reason,
+            context_id=command.context_id,
+            physical_bundle_id=preview.bundle.bundle_id,
+            closure_bytes=preview.bundle.closure_bytes,
+            copy_bytes=preview.copy_bytes,
+            reclaimable_bytes=preview.bundle.marginal_reclaimable_bytes,
+            funding_target_bytes=max(0, int(funding_target_bytes)),
+        )
+        return outcome
+
+    def _build_restore_obligation_command(
+        self,
+        obligation: RestoreObligation,
+        preview: PhysicalBundlePreview,
+        *,
+        now_ms: float,
+        reason: str,
+        funding_target_bytes: int = 0,
+    ) -> ControlCommand:
+        self._restore_command_sequence += 1
+        command_id = (
+            f"{obligation.obligation_id}-command-{self._restore_command_sequence}"
+        )
+        return ControlCommand(
+            command_id=command_id,
+            kind=preview.command_kind,
+            created_ts_ms=now_ms,
+            context_id=preview.context_id,
+            context_epoch=preview.context_epoch,
+            target_bytes=(
+                preview.copy_bytes
+                if preview.command_kind == CommandKind.PREFETCH_CONTEXT
+                else preview.bundle.marginal_reclaimable_bytes
+            ),
+            priority=5.0e9,
+            deadline_ms=obligation.created_ts_ms
+            + self.config.restore_obligation_escalation_ms,
+            queue_class=CommandQueueClass.URGENT,
+            metadata={
+                "reason": reason,
+                "joint_plan_id": obligation.source_joint_plan_id,
+                "restore_obligation_id": obligation.obligation_id,
+                "restore_request_id": obligation.request_id,
+                "source_retraction_transaction_id": (
+                    obligation.source_retraction_transaction_id
+                ),
+                "physical_bundle_scope": preview.bundle.scope.value,
+                "physical_exclusive_action_bytes": (
+                    preview.bundle.exclusive_action_bytes
+                ),
+                "physical_cross_context_action_bytes": (
+                    preview.bundle.cross_context_action_bytes
+                ),
+                "physical_foreign_owner_context_ids": list(
+                    preview.bundle.foreign_owner_context_ids
+                ),
+                "allow_ready_owners": (
+                    preview.command_kind == CommandKind.OFFLOAD_CONTEXT
+                ),
+                "protected_context_id": obligation.context_id,
+                "restore_funding_target_bytes": max(
+                    0, int(funding_target_bytes)
+                ),
+            },
+            physical_bundle=preview.intent(),
+        )
+
+    def _block_restore_obligation(
+        self,
+        obligation: RestoreObligation,
+        *,
+        now_ms: float,
+        stamp: tuple[object, ...] | None = None,
+        blocker_codes: tuple[str, ...],
+        external_progress_token: ExternalProgressToken | None = None,
+        wake_conditions: tuple[str, ...] = (),
+    ) -> None:
+        fingerprint = "|".join(blocker_codes) or "unknown"
+        if (
+            (
+                external_progress_token is not None
+                and not obligation.external_progressed(external_progress_token)
+                or external_progress_token is None
+                and obligation.last_attempt_stamp == stamp
+            )
+            and obligation.blocker_fingerprint == fingerprint
+        ):
+            return
+        obligation.block(
+            blocker_codes=blocker_codes,
+            blocker_fingerprint=fingerprint,
+            attempt_stamp=stamp,
+            external_progress_token=external_progress_token,
+            wake_conditions=wake_conditions,
+            now_ms=now_ms,
+        )
+        transaction = self._ensure_restore_transaction(obligation)
+        transaction.stage = RestoreTransactionStage.WAIT_EVENT
+        transaction.wait_condition = tuple(sorted(set(wake_conditions)))
+        transaction.external_progress_token = external_progress_token
+        self._restore_obligation_counts["blocked"] += 1
+        self.audit.emit(
+            "restore_obligation_blocked",
+            now_ms,
+            obligation_id=obligation.obligation_id,
+            request_id=obligation.request_id,
+            state=obligation.state.value,
+            blocker_codes=list(obligation.blocker_codes),
+            blocker_fingerprint=obligation.blocker_fingerprint,
+            wake_conditions=list(obligation.wake_conditions),
+            retry_count=obligation.retry_count,
+            wait_ms=max(0.0, now_ms - obligation.created_ts_ms),
+        )
+        wait_ms = max(0.0, now_ms - obligation.created_ts_ms)
+        if (
+            wait_ms >= self.config.restore_obligation_max_blocked_ms
+            and not obligation.liveness_escalated
+        ):
+            obligation.liveness_escalated = True
+            self._restore_obligation_counts["liveness_escalated"] += 1
+            self.audit.emit(
+                "restore_obligation_liveness_escalated",
+                now_ms,
+                obligation_id=obligation.obligation_id,
+                request_id=obligation.request_id,
+                wait_ms=wait_ms,
+                blocker_codes=list(obligation.blocker_codes),
+                action="freeze_normal_admission_and_wait_for_physical_state_change",
+            )
+            oldest = next(iter(self._restore_obligation_index().active()), None)
+            if oldest is not None and oldest.request_id == obligation.request_id:
+                self._request_restore_drain(obligation, now_ms=now_ms)
+
+    def _drive_restore_obligations(self, *, now_ms: float) -> None:
+        phase = getattr(
+            self, "_safe_point_physical_phase", SafePointPhysicalPhase.IDLE
+        )
+        if phase == SafePointPhysicalPhase.IDLE:
+            self._begin_physical_safe_point_apply_events()
+            self._begin_physical_safe_point_capture_and_plan()
+        elif phase == SafePointPhysicalPhase.TRANSACTIONAL_COMMIT:
+            # Direct unit/integration drivers may call this outside scheduler_step.
+            self._restart_physical_capture_epoch()
+        if (
+            getattr(self, "_restore_obligations", None) is None
+            or not self._restore_obligations.active()
+        ):
+            return
+        if self.controller.has_pending_transfer_work():
+            return
+        for obligation in self._restore_obligation_index().active():
+            if obligation.state == RestoreObligationState.TICKET_READY:
+                continue
+            if (
+                not obligation.source_transaction_terminal
+                or not obligation.requeued
+                or obligation.pending_command_id is not None
+            ):
+                continue
+            req, required = self._refresh_restore_obligation(
+                obligation, now_ms=now_ms
+            )
+            stamp = (
+                *self._restore_attempt_stamp(),
+                obligation.context_epoch,
+                obligation.required_admission_bytes,
+                obligation.required_extent_ids,
+            )
+            if (
+                obligation.blocker_codes
+                and obligation.last_external_progress_token is None
+                and obligation.last_attempt_stamp == stamp
+            ):
+                continue
+            if req is None:
+                self._block_restore_obligation(
+                    obligation,
+                    now_ms=now_ms,
+                    stamp=stamp,
+                    blocker_codes=("request_not_requeued",),
+                )
+                continue
+            if required is None:
+                self._block_restore_obligation(
+                    obligation,
+                    now_ms=now_ms,
+                    stamp=stamp,
+                    blocker_codes=("request_path_stale",),
+                )
+                continue
+            if not required:
+                if not self._begin_physical_transactional_commit(
+                    obligation.context_id
+                ):
+                    self._block_restore_obligation(
+                        obligation,
+                        now_ms=now_ms,
+                        stamp=stamp,
+                        blocker_codes=("native_ownership_readset_changed",),
+                        wake_conditions=("safe_point_epoch_advanced",),
+                    )
+                    return
+                if bool(getattr(self.config, "restore_lease_enabled", True)):
+                    lease = self._grant_restore_lease(
+                        obligation,
+                        h2d_bytes=0,
+                        now_ms=now_ms,
+                    )
+                    if lease is None:
+                        self._restart_physical_capture_epoch()
+                        queued, blockers = (
+                            self._try_queue_restore_lease_funding(
+                                obligation,
+                                now_ms=now_ms,
+                                attempt_stamp=stamp,
+                                h2d_bytes=0,
+                            )
+                        )
+                        if queued:
+                            return
+                        self._block_restore_obligation(
+                            obligation,
+                            now_ms=now_ms,
+                            stamp=stamp,
+                            blocker_codes=blockers,
+                        )
+                        continue
+                    if not self._pin_restore_lease_prefix(
+                        obligation, req, now_ms=now_ms
+                    ):
+                        self._release_restore_lease(
+                            obligation.request_id,
+                            now_ms=now_ms,
+                            reason="restore_prefix_pin_failed",
+                            rollback=True,
+                        )
+                        self._restart_physical_capture_epoch()
+                        self._block_restore_obligation(
+                            obligation,
+                            now_ms=now_ms,
+                            stamp=stamp,
+                            blocker_codes=("restore_prefix_pin_failed",),
+                        )
+                        continue
+                    lease.mark_restored()
+                    transaction = self._ensure_restore_transaction(obligation)
+                    transaction.capacity_reservation_id = getattr(
+                        lease, "lease_id", f"restore-lease:{obligation.request_id}"
+                    )
+                    transaction.prefix_pin_token = (
+                        f"restore-pin:{obligation.request_id}:native"
+                    )
+                    transaction.stage = RestoreTransactionStage.RESTORED_RESERVED
+                obligation.mark_ticket_ready(now_ms=now_ms)
+                self._restore_obligation_counts["ticket_ready"] += 1
+                metadata = self._request_metadata_by_id.get(obligation.request_id)
+                if metadata is not None:
+                    self._sync_visible_gate_state(
+                        obligation.request_id, metadata, req=req
+                    )
+                self.audit.emit(
+                    "restore_obligation_ticket_ready",
+                    now_ms,
+                    obligation_id=obligation.obligation_id,
+                    request_id=obligation.request_id,
+                    restored_bytes=obligation.restored_bytes,
+                    funding_reclaim_bytes=obligation.funding_reclaim_bytes,
+                )
+                self._restart_physical_capture_epoch()
+                continue
+            available = self._allocator_available_bytes()
+            available += obligation.funding_reserved_bytes
+            previews = self._restore_h2d_previews(
+                obligation,
+                now_ms=now_ms,
+                device_available_bytes=available,
+            )
+            eligible = next(
+                (
+                    item
+                    for item in previews
+                    if item.eligible
+                    and item.copy_bytes + obligation.required_admission_bytes
+                    <= available
+                ),
+                None,
+            )
+            if eligible is not None:
+                command = self._build_restore_obligation_command(
+                    obligation,
+                    eligible,
+                    now_ms=now_ms,
+                    reason="restore_obligation_h2d",
+                )
+                required_bytes = (
+                    eligible.copy_bytes + obligation.required_admission_bytes
+                )
+                progress_token = self._restore_external_progress_token(
+                    obligation,
+                    required_bytes=required_bytes,
+                    closure_fingerprint=(
+                        eligible.bundle.generation_fingerprint
+                    ),
+                    command=command,
+                )
+                if (
+                    obligation.blocker_codes
+                    and not obligation.external_progressed(progress_token)
+                ):
+                    continue
+                preflight = self.controller.preflight_control_command(command)
+                if not preflight:
+                    blocker_codes = preflight.blocker_codes or (
+                        preflight.status.value,
+                    )
+                    self._block_restore_obligation(
+                        obligation,
+                        now_ms=now_ms,
+                        blocker_codes=blocker_codes,
+                        external_progress_token=progress_token,
+                        wake_conditions=preflight.wake_conditions,
+                    )
+                    continue
+                physical_snapshots = self._context_physical_snapshots(
+                    obligation.context_id
+                )
+                physical_blockers: set[str] = set()
+                wake_conditions: set[str] = set()
+                if any(item.engine_owned for item in physical_snapshots):
+                    physical_blockers.add(TransferBlockerCode.ENGINE_BUSY.value)
+                    wake_conditions.add("engine_owner_changed")
+                if any(
+                    item.native_load_operation_id is not None
+                    for item in physical_snapshots
+                ):
+                    physical_blockers.add(TransferBlockerCode.NODE_LOADING.value)
+                    wake_conditions.add("native_load_terminal")
+                if any(
+                    item.explicit_transfer_ids for item in physical_snapshots
+                ):
+                    physical_blockers.add(TransferBlockerCode.INFLIGHT.value)
+                    wake_conditions.add("explicit_transfer_terminal")
+                if (
+                    preflight.status != EnqueueStatus.ADOPT_EXISTING
+                    and physical_blockers
+                ):
+                    self._block_restore_obligation(
+                        obligation,
+                        now_ms=now_ms,
+                        blocker_codes=tuple(sorted(physical_blockers)),
+                        external_progress_token=progress_token,
+                        wake_conditions=tuple(sorted(wake_conditions)),
+                    )
+                    continue
+                if not self._begin_physical_transactional_commit(
+                    obligation.context_id
+                ):
+                    self._block_restore_obligation(
+                        obligation,
+                        now_ms=now_ms,
+                        blocker_codes=("native_ownership_readset_changed",),
+                        wake_conditions=("safe_point_epoch_advanced",),
+                    )
+                    return
+                transaction = self._ensure_restore_transaction(obligation)
+                self._restore_certificate_sequence = (
+                    getattr(self, "_restore_certificate_sequence", 0) + 1
+                )
+                certificate = RestoreFeasibilityCertificate(
+                    certificate_generation=self._restore_certificate_sequence,
+                    context_epoch=obligation.context_epoch,
+                    attempt_key=preflight.attempt_key,
+                    required_bytes=required_bytes,
+                    closure_fingerprint=(
+                        eligible.bundle.generation_fingerprint
+                    ),
+                )
+                transaction.feasibility_certificate = certificate
+                if bool(getattr(self.config, "restore_lease_enabled", True)):
+                    lease = self._grant_restore_lease(
+                        obligation,
+                        h2d_bytes=eligible.copy_bytes,
+                        now_ms=now_ms,
+                    )
+                    if lease is None:
+                        self._restart_physical_capture_epoch()
+                        self._block_restore_obligation(
+                            obligation,
+                            now_ms=now_ms,
+                            stamp=stamp,
+                            blocker_codes=("restore_lease_capacity",),
+                            external_progress_token=progress_token,
+                            wake_conditions=("capacity_threshold_satisfied",),
+                        )
+                        return
+                    transaction.capacity_reservation_id = lease.lease_id
+                    if not self._pin_restore_lease_prefix(
+                        obligation,
+                        req,
+                        now_ms=now_ms,
+                        allow_unmaterialized=True,
+                    ):
+                        self._release_restore_lease(
+                            obligation.request_id,
+                            now_ms=now_ms,
+                            reason="restore_prefix_pin_prepare_failed",
+                            rollback=True,
+                        )
+                        transaction.capacity_reservation_id = None
+                        self._restart_physical_capture_epoch()
+                        self._block_restore_obligation(
+                            obligation,
+                            now_ms=now_ms,
+                            blocker_codes=("restore_prefix_pin_failed",),
+                            external_progress_token=progress_token,
+                            wake_conditions=("radix_path_changed",),
+                        )
+                        return
+                    if obligation.request_id in getattr(
+                        self, "_restore_lease_pins", {}
+                    ):
+                        transaction.prefix_pin_token = (
+                            f"restore-pin:{obligation.request_id}:"
+                            f"{certificate.certificate_generation}"
+                        )
+                transaction.stage = RestoreTransactionStage.PREPARED
+                queued = self._queue_restore_obligation_command(
+                    obligation,
+                    eligible,
+                    now_ms=now_ms,
+                    reason="restore_obligation_h2d",
+                    attempt_stamp=stamp,
+                    command=command,
+                    preflight=preflight,
+                )
+                if not queued:
+                    self._release_restore_lease(
+                        obligation.request_id,
+                        now_ms=now_ms,
+                        reason="restore_h2d_queue_conflict",
+                        rollback=True,
+                    )
+                    transaction.capacity_reservation_id = None
+                    transaction.prefix_pin_token = None
+                    if getattr(
+                        self,
+                        "_safe_point_physical_phase",
+                        SafePointPhysicalPhase.IDLE,
+                    ) == SafePointPhysicalPhase.TRANSACTIONAL_COMMIT:
+                        self._restart_physical_capture_epoch()
+                    self._block_restore_obligation(
+                        obligation,
+                        now_ms=now_ms,
+                        blocker_codes=(
+                            *(queued.blocker_codes or (queued.status.value,)),
+                        ),
+                        external_progress_token=(
+                            self._restore_external_progress_token(
+                                obligation,
+                                required_bytes=required_bytes,
+                                closure_fingerprint=(
+                                    eligible.bundle.generation_fingerprint
+                                ),
+                                command=command,
+                            )
+                        ),
+                        wake_conditions=queued.wake_conditions,
+                    )
+                    return
+                return
+            h2d_blockers = {
+                blocker.code.value
+                for preview in previews
+                for blocker in preview.blockers
+            }
+            capacity_previews = tuple(
+                preview
+                for preview in previews
+                if (
+                    preview.eligible
+                    and preview.copy_bytes
+                    + obligation.required_admission_bytes
+                    > available
+                )
+                or (
+                    preview.blockers
+                    and {
+                        blocker.code
+                        for blocker in preview.blockers
+                    }.issubset({TransferBlockerCode.DEVICE_CAPACITY})
+                )
+            )
+            if not capacity_previews:
+                if (
+                    not previews
+                    and obligation.cause
+                    == RestoreObligationCause.ORDINARY_WAITING_PREFIX
+                ):
+                    if not self._begin_physical_transactional_commit(
+                        obligation.context_id
+                    ):
+                        self._block_restore_obligation(
+                            obligation,
+                            now_ms=now_ms,
+                            stamp=stamp,
+                            blocker_codes=(
+                                "native_ownership_readset_changed",
+                            ),
+                            wake_conditions=("safe_point_epoch_advanced",),
+                        )
+                        return
+                    ready = self._activate_native_restore_fallback(
+                        obligation,
+                        req,
+                        now_ms=now_ms,
+                    )
+                    if ready:
+                        return
+                    self._restart_physical_capture_epoch()
+                    queued, blockers = self._try_queue_restore_lease_funding(
+                        obligation,
+                        now_ms=now_ms,
+                        attempt_stamp=stamp,
+                        h2d_bytes=0,
+                    )
+                    if queued:
+                        return
+                    self._block_restore_obligation(
+                        obligation,
+                        now_ms=now_ms,
+                        stamp=stamp,
+                        blocker_codes=blockers,
+                    )
+                    return
+                self._block_restore_obligation(
+                    obligation,
+                    now_ms=now_ms,
+                    stamp=stamp,
+                    blocker_codes=tuple(
+                        sorted(h2d_blockers or {"physical_preview_unavailable"})
+                    ),
+                )
+                continue
+            required_h2d_bytes = max(
+                item.copy_bytes + obligation.required_admission_bytes
+                for item in capacity_previews
+            )
+            deficit = max(0, required_h2d_bytes - available)
+            funding, funding_blockers = self._restore_funding_preview(
+                obligation,
+                now_ms=now_ms,
+                deficit_bytes=max(1, deficit),
+            )
+            if funding is not None:
+                queued = self._queue_restore_obligation_command(
+                    obligation,
+                    funding,
+                    now_ms=now_ms,
+                    reason="restore_obligation_funding",
+                    attempt_stamp=stamp,
+                    funding_target_bytes=max(1, deficit),
+                )
+                if queued:
+                    return
+                self._block_restore_obligation(
+                    obligation,
+                    now_ms=now_ms,
+                    stamp=stamp,
+                    blocker_codes=("restore_funding_queue_conflict",),
+                )
+                continue
+            self._block_restore_obligation(
+                obligation,
+                now_ms=now_ms,
+                stamp=stamp,
+                blocker_codes=tuple(
+                    sorted(h2d_blockers.union(funding_blockers))
+                ),
+            )
+
+    def _advance_restore_obligations(
+        self,
+        acks: tuple[CommandAck, ...] | list[CommandAck],
+        *,
+        now_ms: float,
+    ) -> None:
+        mapping = getattr(self, "_restore_command_to_request", {})
+        if not mapping:
+            return
+        index = self._restore_obligation_index()
+        for ack in acks:
+            request_ids = mapping.pop(ack.command_id, None)
+            funding_targets = getattr(
+                self, "_restore_funding_target_by_command", {}
+            ).pop(ack.command_id, {})
+            if not request_ids:
+                continue
+            for request_id in tuple(sorted(request_ids)):
+                funding_target_bytes = funding_targets.get(request_id, 0)
+                obligation = index.get(request_id)
+                if obligation is None or obligation.state.terminal:
+                    continue
+                command_kind = obligation.clear_command()
+                transaction = self._ensure_restore_transaction(obligation)
+                operation = next(
+                    (
+                        item
+                        for item in reversed(transaction.physical_operations)
+                        if item.canonical_command_id == ack.command_id
+                        and item.terminal_status is None
+                    ),
+                    None,
+                )
+                if operation is not None:
+                    operation.terminal_status = ack.status.value
+                if ack.status == CommandStatus.COMPLETED:
+                    if command_kind == CommandKind.PREFETCH_CONTEXT:
+                        obligation.restored_bytes += ack.actual_bytes
+                        obligation.state = RestoreObligationState.RESTORE_ACKED
+                        lease = self._restore_lease_index().get(request_id)
+                        if lease is not None and not lease.state.terminal:
+                            lease.mark_restored()
+                        if (
+                            bool(getattr(self.config, "restore_lease_enabled", True))
+                            and (
+                                req := self._restore_waiting_request(request_id)
+                            ) is not None
+                            and not self._pin_restore_lease_prefix(
+                                obligation, req, now_ms=now_ms
+                            )
+                        ):
+                            self._release_restore_lease(
+                                request_id,
+                                now_ms=now_ms,
+                                reason="restore_prefix_pin_after_h2d_failed",
+                                rollback=True,
+                            )
+                            obligation.block(
+                                blocker_codes=("restore_prefix_pin_failed",),
+                                blocker_fingerprint="restore_prefix_pin_failed",
+                                now_ms=now_ms,
+                            )
+                            transaction.stage = RestoreTransactionStage.WAIT_EVENT
+                            continue
+                        transaction.stage = (
+                            RestoreTransactionStage.RESTORED_RESERVED
+                        )
+                    else:
+                        obligation.funding_reclaim_bytes += ack.actual_bytes
+                        self._reserve_restore_funding_capacity(
+                            obligation,
+                            target_bytes=funding_target_bytes,
+                            reclaimed_bytes=ack.actual_bytes,
+                            now_ms=now_ms,
+                        )
+                        obligation.state = RestoreObligationState.PARKED_WAIT
+                        transaction.stage = RestoreTransactionStage.WAIT_FEASIBILITY
+                    obligation.last_attempt_stamp = None
+                    obligation.last_external_progress_token = None
+                    obligation.blocker_codes = ()
+                    obligation.blocker_fingerprint = None
+                    obligation.last_progress_ts_ms = now_ms
+                    outcome = "completed"
+                else:
+                    if command_kind == CommandKind.PREFETCH_CONTEXT:
+                        self._release_restore_lease(
+                            request_id,
+                            now_ms=now_ms,
+                            reason=f"restore_h2d_{ack.status.value}",
+                            rollback=True,
+                        )
+                    blocker_codes = tuple(
+                        sorted(
+                            {item.code.value for item in ack.blockers}
+                            or {ack.status.value}
+                        )
+                    )
+                    obligation.block(
+                        blocker_codes=blocker_codes,
+                        blocker_fingerprint="|".join(blocker_codes),
+                        now_ms=now_ms,
+                    )
+                    transaction.stage = RestoreTransactionStage.WAIT_EVENT
+                    outcome = ack.status.value
+                self._restore_obligation_counts[f"command_{outcome}"] += 1
+                self.audit.emit(
+                    "restore_obligation_command_terminal",
+                    now_ms,
+                    obligation_id=obligation.obligation_id,
+                    request_id=obligation.request_id,
+                    command_id=ack.command_id,
+                    subscriber_count=len(request_ids),
+                    command_kind=(
+                        command_kind.value if command_kind is not None else None
+                    ),
+                    status=ack.status.value,
+                    actual_bytes=ack.actual_bytes,
+                    state=obligation.state.value,
+                    blocker_codes=[item.code.value for item in ack.blockers],
+                    reason=ack.reason,
+                    funding_target_bytes=funding_target_bytes,
+                    funding_reserved_tokens=obligation.funding_reserved_tokens,
+                    funding_reserved_bytes=obligation.funding_reserved_bytes,
+                )
+
     def _allocator_available_bytes(self) -> int:
         allocator = self.scheduler.token_to_kv_pool_allocator
         if hasattr(allocator, "full_available_size"):
@@ -3770,8 +7726,8 @@ class EmbeddedSGLangRuntime:
             available_tokens = int(allocator.available_size())
         return max(0, available_tokens * self.config.kv_bytes_per_token)
 
-    def _running_retraction_planner(self) -> ObservedRetractionPlanner:
-        planner = getattr(self, "running_retraction_planner", None)
+    def _joint_retraction_planner(self) -> ObservedRetractionPlanner:
+        planner = getattr(self, "_joint_retraction_solver", None)
         if planner is None:
             planner = ObservedRetractionPlanner(
                 ObservedRetractionConfig(
@@ -3786,8 +7742,444 @@ class EmbeddedSGLangRuntime:
                     ),
                 )
             )
-            self.running_retraction_planner = planner
+            self._joint_retraction_solver = planner
         return planner
+
+    def _update_restore_micro_gate(
+        self,
+        stage: str,
+        *,
+        now_ms: float,
+        **fields: object,
+    ) -> None:
+        if not self.config.restore_micro_gate_enabled:
+            return
+        state = getattr(self, "_restore_micro_gate_state", None)
+        if state is None:
+            state = {
+                "enabled": True,
+                "gate_id": self.config.restore_micro_gate_id,
+            }
+            self._restore_micro_gate_state = state
+        state.update(fields)
+        state["stage"] = stage
+        state["last_update_ts_ms"] = now_ms
+        signature = (
+            stage,
+            state.get("victim_request_id"),
+            state.get("replacement_request_id"),
+            state.get("transaction_id"),
+            state.get("obligation_id"),
+            state.get("reason"),
+        )
+        if signature == getattr(
+            self, "_restore_micro_gate_last_audit_signature", None
+        ):
+            return
+        self._restore_micro_gate_last_audit_signature = signature
+        self.audit.emit(
+            "restore_micro_gate_state",
+            now_ms,
+            **dict(state),
+        )
+
+    def _restore_micro_gate_barrier_pair_visible(
+        self,
+        requests: tuple[Any, ...],
+        replacements: tuple[RetractionReplacement, ...],
+    ) -> bool:
+        """Request one overlap drain only for the configured deterministic pair."""
+
+        if not self.config.restore_micro_gate_enabled:
+            return False
+        stage = str(self._restore_micro_gate_state.get("stage", "armed"))
+        if stage not in {"armed", "waiting_for_pair", "pair_eligible"}:
+            return False
+        ledger = getattr(self, "_lock_service_ledger", None)
+        victim_visible = any(
+            (metadata := self._metadata(req)) is not None
+            and metadata.root_workflow_id
+            == self.config.restore_micro_gate_victim_workflow_id
+            and ledger is not None
+            and (record := ledger.progress_record(str(getattr(req, "rid", ""))))
+            is not None
+            and record.completed_service_count > 0
+            and self._estimated_request_private_kv_bytes(req)
+            >= self.config.restore_micro_gate_min_private_bytes
+            for req in requests
+        )
+        if not victim_visible:
+            return False
+        metadata_by_id = getattr(self, "_request_metadata_by_id", {})
+        return any(
+            (metadata := metadata_by_id.get(item.request_id)) is not None
+            and metadata.root_workflow_id
+            == self.config.restore_micro_gate_replacement_workflow_id
+            for item in replacements
+        )
+
+    def _estimated_request_private_kv_bytes(self, req: Any) -> int:
+        """Return the scheduler-visible private suffix lower bound for a request."""
+
+        page_size = max(
+            1,
+            int(
+                getattr(
+                    getattr(getattr(self, "scheduler", None), "server_args", None),
+                    "page_size",
+                    1,
+                )
+                or 1
+            ),
+        )
+        prefix_tokens = _sequence_length(getattr(req, "prefix_indices", None))
+        sequence_tokens = max(
+            int(getattr(req, "seqlen", 0) or 0),
+            _sequence_length(getattr(req, "origin_input_ids", None))
+            + _sequence_length(getattr(req, "output_ids", None)),
+        )
+        last_uncached_pos = (prefix_tokens // page_size) * page_size
+        return (
+            max(0, sequence_tokens - last_uncached_pos)
+            * self.config.kv_bytes_per_token
+        )
+
+    def _restore_micro_gate_snapshot(
+        self,
+        snapshot: ObservedRetractionSnapshot,
+    ) -> tuple[ObservedRetractionSnapshot, str | None]:
+        """Select one explicit test pair without relaxing physical safety."""
+
+        if not self.config.restore_micro_gate_enabled:
+            return snapshot, None
+        stage = str(self._restore_micro_gate_state.get("stage", "armed"))
+        if stage not in {"armed", "waiting_for_pair", "pair_eligible"}:
+            return snapshot, None
+        ledger = getattr(self, "_lock_service_ledger", None)
+        victims = tuple(
+            item
+            for item in snapshot.candidates
+            if item.workflow_id
+            == self.config.restore_micro_gate_victim_workflow_id
+            and item.private_kv_bytes
+            >= self.config.restore_micro_gate_min_private_bytes
+            and item.policy_eligible
+            and ledger is not None
+            and (
+                record := ledger.progress_record(item.request_id)
+            )
+            is not None
+            and record.completed_service_count > 0
+        )
+        replacements = tuple(
+            item
+            for item in snapshot.replacements
+            if (
+                metadata := getattr(self, "_request_metadata_by_id", {}).get(
+                    item.request_id
+                )
+            )
+            is not None
+            and metadata.root_workflow_id
+            == self.config.restore_micro_gate_replacement_workflow_id
+        )
+        now_ms = snapshot.observed_ts_ms
+        if not victims or not replacements:
+            self._update_restore_micro_gate(
+                "waiting_for_pair",
+                now_ms=now_ms,
+                reason=(
+                    "victim_not_physically_eligible"
+                    if not victims
+                    else "replacement_not_waiting"
+                ),
+                eligible_victim_count=len(victims),
+                waiting_replacement_count=len(replacements),
+            )
+            return snapshot, None
+        victim = min(victims, key=lambda item: item.request_id)
+        replacement = min(replacements, key=lambda item: item.request_id)
+        forced = replace(
+            snapshot,
+            active_kv_footprint_bytes=max(
+                snapshot.active_kv_footprint_bytes,
+                snapshot.active_kv_budget_bytes
+                + victim.private_kv_bytes
+                + self.config.running_batch_retraction_min_reclaim_bytes,
+            ),
+            admission_stall_ms=max(
+                snapshot.admission_stall_ms,
+                self.config.running_batch_retraction_min_stall_ms,
+            ),
+            candidates=(
+                replace(
+                    victim,
+                    service_status="stale",
+                    stale_for_ms=max(
+                        victim.stale_for_ms,
+                        self.config.running_batch_retraction_min_stall_ms,
+                    ),
+                ),
+            ),
+            replacements=(replacement,),
+        )
+        self._update_restore_micro_gate(
+            "pair_eligible",
+            now_ms=now_ms,
+            reason="explicit_test_pair_observed",
+            victim_request_id=victim.request_id,
+            replacement_request_id=replacement.request_id,
+            victim_private_bytes=victim.private_kv_bytes,
+        )
+        return forced, self.config.restore_micro_gate_id
+
+    def _restore_micro_gate_decision(
+        self,
+        snapshot: ObservedRetractionSnapshot,
+        gate_id: str,
+    ) -> tuple[ObservedRetractionDecision, str]:
+        replacement_ids = tuple(
+            item.request_id for item in snapshot.replacements
+        )
+        victim_id = snapshot.candidates[0].request_id
+        self._online_joint_epoch_sequence = (
+            getattr(self, "_online_joint_epoch_sequence", 0) + 1
+        )
+        seed = compile_bounded_seed_epoch(
+            ordered_request_ids=replacement_ids,
+            visible_request_ids=replacement_ids,
+            epoch_sequence=self._online_joint_epoch_sequence,
+            emergency=True,
+        )
+        assert seed.view is not None and seed.epoch is not None
+        retraction_slice = ActionSlice(
+            slice_id=f"retraction:{victim_id}",
+            kind="retraction",
+            action_key=victim_id,
+            dependency_keys=tuple(
+                f"request:{request_id}" for request_id in replacement_ids
+            ),
+            committed=True,
+        )
+        epoch = append_committed_action_slice(seed.epoch, retraction_slice)
+        self._current_online_joint_view = seed.view
+        self._current_online_joint_decision = OnlineJointPlanDecision(
+            seed.view, "applicable", epoch
+        )
+        self._current_joint_plan_epoch = epoch
+        decision = self._joint_retraction_planner().decide(snapshot)
+        if decision.plan is not None:
+            decision = replace(
+                decision,
+                plan=replace(
+                    decision.plan,
+                    reason="restore_micro_gate_forced",
+                ),
+            )
+        self._update_restore_micro_gate(
+            "plan_selected" if decision.plan is not None else "pair_eligible",
+            now_ms=snapshot.observed_ts_ms,
+            reason=(
+                "joint_retraction_plan_created"
+                if decision.plan is not None
+                else decision.reason
+            ),
+            source_joint_plan_id=epoch.source_plan_id,
+            joint_epoch_id=epoch.epoch_id,
+            gate_id=gate_id,
+        )
+        self.audit.emit(
+            "online_joint_retraction_intent_committed",
+            snapshot.observed_ts_ms,
+            plan_id=epoch.source_plan_id,
+            epoch_id=epoch.epoch_id,
+            request_id=victim_id,
+            intent_mode="deterministic_restore_micro_gate",
+            source_joint_plan_id=epoch.source_plan_id,
+            restore_micro_gate_id=gate_id,
+        )
+        return decision, epoch.source_plan_id
+
+    def _running_retraction_decision(
+        self,
+        snapshot: ObservedRetractionSnapshot,
+        *,
+        restore_micro_gate_id: str | None = None,
+    ) -> tuple[ObservedRetractionDecision, str | None]:
+        if restore_micro_gate_id is not None:
+            return self._restore_micro_gate_decision(
+                snapshot, restore_micro_gate_id
+            )
+        if not self.config.joint_policy_enabled:
+            return self._joint_retraction_planner().decide(snapshot), None
+
+        view = getattr(self, "_current_online_joint_view", None)
+        epoch = getattr(self, "_current_joint_plan_epoch", None)
+        result = getattr(self, "_online_joint_result", None)
+        if view is None:
+            self._online_joint_epoch_sequence = (
+                getattr(self, "_online_joint_epoch_sequence", 0) + 1
+            )
+            seed = compile_bounded_seed_epoch(
+                ordered_request_ids=(
+                    item.request_id for item in snapshot.replacements
+                ),
+                visible_request_ids=(
+                    item.request_id for item in snapshot.replacements
+                ),
+                epoch_sequence=self._online_joint_epoch_sequence,
+                emergency=True,
+            )
+            assert seed.view is not None and seed.epoch is not None
+            view = seed.view
+            epoch = seed.epoch
+            self._current_online_joint_view = view
+            self._current_online_joint_decision = seed
+            self._current_joint_plan_epoch = epoch
+            counts = getattr(self, "_online_joint_counts", None)
+            if counts is not None:
+                counts["emergency_retraction_seed"] += 1
+            audit = getattr(self, "audit", None)
+            if audit is not None:
+                audit.emit(
+                    "online_joint_epoch_committed",
+                    snapshot.observed_ts_ms,
+                    epoch_id=epoch.epoch_id,
+                    plan_id=epoch.source_plan_id,
+                    planner_mode=epoch.planner_mode.value,
+                    commit_reason=seed.reason,
+                    source_action_count=epoch.source_action_count,
+                    committed_action_count=epoch.committed_action_count,
+                    actionable_coverage=epoch.actionable_coverage,
+                    rejected_slices=[],
+                    trigger="running_retraction_emergency",
+                )
+        source_plan_id = (
+            epoch.source_plan_id
+            if epoch is not None and epoch.source_plan_id == view.plan_id
+            else view.plan_id
+        )
+
+        candidate_ids = {item.request_id for item in snapshot.candidates}
+        explicit_retractions = (
+            tuple(
+                item.request_id
+                for item in getattr(result.plan, "retractions", ())
+                if item.request_id in candidate_ids
+            )
+            if result is not None
+            and result.plan is not None
+            and result.plan.plan_id == view.plan_id
+            else ()
+        )
+        if explicit_retractions:
+            selected_victim = explicit_retractions[0]
+            intent_mode = "optimized"
+        elif epoch is not None and epoch.planner_mode in {
+            JointPlannerMode.BOUNDED_SEED,
+            JointPlannerMode.EMERGENCY,
+        }:
+            selected_victim = self._bounded_retraction_victim(snapshot)
+            intent_mode = "emergency"
+        else:
+            selected_victim = None
+            intent_mode = "optimized_no_intent"
+        pause_authorized = (
+            {selected_victim} if selected_victim is not None else set()
+        )
+        if not pause_authorized:
+            return (
+                ObservedRetractionDecision(
+                    plan=None,
+                    reason="joint_plan_has_no_pause_authorized_running_request",
+                    candidate_count=len(snapshot.candidates),
+                ),
+                source_plan_id,
+            )
+        assert epoch is not None
+        slice_id = f"retraction:{selected_victim}"
+        if all(item.slice_id != slice_id for item in epoch.action_slices):
+            retraction_slice = ActionSlice(
+                slice_id=slice_id,
+                kind="retraction",
+                action_key=str(selected_victim),
+                dependency_keys=tuple(
+                    f"request:{item}" for item in view.immediate_request_ids
+                ),
+                committed=True,
+            )
+            epoch = append_committed_action_slice(epoch, retraction_slice)
+            self._current_joint_plan_epoch = epoch
+            self.audit.emit(
+                "online_joint_retraction_intent_committed",
+                snapshot.observed_ts_ms,
+                plan_id=source_plan_id,
+                epoch_id=epoch.epoch_id,
+                request_id=selected_victim,
+                intent_mode=intent_mode,
+                source_joint_plan_id=source_plan_id,
+            )
+        restricted = replace(
+            snapshot,
+            candidates=tuple(
+                replace(
+                    candidate,
+                    service_status=(
+                        "stale"
+                        if candidate.request_id in pause_authorized
+                        else candidate.service_status
+                    ),
+                    policy_eligible=(
+                        candidate.policy_eligible
+                        and candidate.request_id in pause_authorized
+                    ),
+                )
+                for candidate in snapshot.candidates
+            ),
+        )
+        decision = self._joint_retraction_planner().decide(restricted)
+        if decision.plan is not None:
+            decision = replace(
+                decision,
+                plan=replace(
+                    decision.plan,
+                    reason="observed_joint_pause_authorized_lock_reclaim",
+                ),
+            )
+        return decision, source_plan_id
+
+    def _bounded_retraction_victim(
+        self,
+        snapshot: ObservedRetractionSnapshot,
+    ) -> str | None:
+        unlock_bytes: Counter[str] = Counter()
+        for extent in snapshot.locked_extents:
+            if not extent.fully_attributed or len(extent.blocker_request_ids) != 1:
+                continue
+            unlock_bytes[extent.blocker_request_ids[0]] += extent.size_bytes
+        eligible = [
+            item
+            for item in snapshot.candidates
+            if item.policy_eligible
+            and item.prior_retraction_count
+            < self.config.running_batch_retraction_max_per_request
+        ]
+        if not eligible:
+            return None
+        service_rank = {"stale": 0, "unknown": 1, "warming": 2, "recent": 3}
+        selected = min(
+            eligible,
+            key=lambda item: (
+                service_rank[item.service_status],
+                -unlock_bytes[item.request_id],
+                -item.private_kv_bytes,
+                -item.causal_rank,
+                -item.workflow_fair_rank,
+                item.prior_retraction_count,
+                item.request_id,
+            ),
+        )
+        return selected.request_id
 
     def _running_retraction_replacements(
         self,
@@ -3806,6 +8198,24 @@ class EmbeddedSGLangRuntime:
             tagged.append((native_index, req, metadata))
         if not tagged:
             return ()
+        view = getattr(self, "_current_online_joint_view", None)
+        if self.config.joint_policy_enabled and view is not None:
+            tagged_by_request = {
+                str(req.rid): (native_index, req, metadata)
+                for native_index, req, metadata in tagged
+            }
+            return tuple(
+                RetractionReplacement(
+                    request_id=request_id,
+                    estimated_incremental_bytes=(
+                        self.controller.visible_admission.get(
+                            request_id
+                        ).request.estimated_incremental_bytes
+                    ),
+                )
+                for request_id in view.immediate_request_ids
+                if request_id in tagged_by_request
+            )
         workflow_ids = {item[2].root_workflow_id for item in tagged}
         fair_order = self.controller.fairness.ordered(
             workflow_ids,
@@ -3815,6 +8225,9 @@ class EmbeddedSGLangRuntime:
         fair_rank = {
             workflow_id: index for index, workflow_id in enumerate(fair_order)
         }
+        active_workflow_ids = frozenset(
+            fair_order[: self.config.joint_workflow_active_window]
+        )
         frontier_rank = {
             workflow_id: {
                 item.invocation_id: index
@@ -3825,7 +8238,11 @@ class EmbeddedSGLangRuntime:
             for workflow_id in workflow_ids
         }
         ordered = sorted(
-            tagged,
+            (
+                item
+                for item in tagged
+                if item[2].root_workflow_id in active_workflow_ids
+            ),
             key=lambda item: self._observed_ticket_order_key(
                 item[0],
                 item[1],
@@ -3865,6 +8282,7 @@ class EmbeddedSGLangRuntime:
     def scheduler_step(self) -> None:
         step_started_ns = time.perf_counter_ns()
         telemetry_overhead_ns = 0
+        self._begin_physical_safe_point_apply_events()
         # Close the previous GPU service interval before freezing fairness state.
         self._charge_previous_batch(self._now_ms())
         if self.event_server is not None:
@@ -3879,8 +8297,19 @@ class EmbeddedSGLangRuntime:
                     error=delivery.error,
                 )
         # ACKs are applied before the Radix mirror observes physical mutations.
-        # This preserves prepare/commit/drop state-machine ordering.
-        acks = self.bridge.drain_acks()
+        # This preserves prepare/commit/drop state-machine ordering. Transfer
+        # completion is slow-moving (100ms+), so the backend poll is gated to
+        # a bounded interval instead of running at event-loop rate.
+        ack_now_ms = float(self._now_ms())
+        last_ack_poll_ms = getattr(self, "_last_ack_poll_ms", None)
+        if (
+            last_ack_poll_ms is None
+            or ack_now_ms - last_ack_poll_ms >= _ACK_POLL_INTERVAL_MS
+        ):
+            self._last_ack_poll_ms = ack_now_ms
+            acks = self.bridge.drain_acks()
+        else:
+            acks = ()
         retired_h2d = self._retire_h2d_commands(acks)
         drain_telemetry = getattr(self.bridge, "drain_transfer_telemetry", None)
         telemetry_started_ns = time.perf_counter_ns()
@@ -3924,6 +8353,17 @@ class EmbeddedSGLangRuntime:
             acks,
             now_ms=float(self._now_ms()),
         )
+        self._advance_online_joint_residency(
+            acks,
+            now_ms=float(self._now_ms()),
+        )
+        self._advance_restore_obligations(
+            acks,
+            now_ms=float(self._now_ms()),
+        )
+        self._advance_restore_authority(now_ms=float(self._now_ms()))
+        self._enforce_queue_timeouts(now_ms=float(self._now_ms()))
+        self._enforce_execution_timeouts(now_ms=float(self._now_ms()))
         for context_id, bundle_ids, status in retired_h2d:
             if status == CommandStatus.COMPLETED:
                 self._release_h2d_waiters(context_id)
@@ -3933,16 +8373,93 @@ class EmbeddedSGLangRuntime:
                     bundle_ids=bundle_ids,
                     status=status,
                 )
+        self._begin_physical_safe_point_capture_and_plan()
         if hasattr(self, "_last_resource_telemetry_ms"):
             self._emit_resource_snapshot(force=bool(acks or telemetry))
         policy_snapshot_log = getattr(self, "policy_snapshot_log", None)
+        policy_check_now_ms = float(self._now_ms())
+        last_policy_check_ms = getattr(self, "_last_policy_check_ms", None)
         if (
-            policy_snapshot_log is not None and policy_snapshot_log.enabled
-        ) or getattr(self, "joint_shadow_worker", None) is not None:
-            self._maybe_record_policy_snapshot(
-                self._runtime_resource_observation()
+            last_policy_check_ms is None
+            or policy_check_now_ms - last_policy_check_ms
+            >= _POLICY_CHECK_INTERVAL_MS
+        ):
+            self._last_policy_check_ms = policy_check_now_ms
+            if (
+                policy_snapshot_log is not None
+                and policy_snapshot_log.enabled
+            ) or getattr(self, "joint_shadow_worker", None) is not None:
+                self._maybe_record_policy_snapshot(
+                    self._runtime_resource_observation()
+                )
+        restore_authority_mode = getattr(
+            self, "_restore_authority_mode", RestoreAuthorityMode.NORMAL_JOINT
+        )
+        if restore_authority_mode != RestoreAuthorityMode.NORMAL_JOINT:
+            online_joint_decision = OnlineJointPlanDecision(
+                None, f"restore_authority:{restore_authority_mode.value}"
             )
-        tick = self.bridge.scheduler_step(self._now_ms(), drain_acks=False)
+        elif getattr(
+            getattr(self, "config", None), "joint_policy_enabled", False
+        ):
+            online_joint_decision = self._online_joint_admission_decision(
+                now_ms=float(self._now_ms()),
+            )
+            if online_joint_decision.view is None:
+                online_joint_decision = self._safe_point_seed_decision(
+                    now_ms=float(self._now_ms())
+                )
+        else:
+            online_joint_decision = OnlineJointPlanDecision(None, "disabled")
+        self._current_online_joint_view = online_joint_decision.view
+        self._current_online_joint_decision = online_joint_decision
+        self._drive_restore_obligations(now_ms=float(self._now_ms()))
+        self._advance_restore_authority(now_ms=float(self._now_ms()))
+        restore_authority_mode = getattr(
+            self, "_restore_authority_mode", RestoreAuthorityMode.NORMAL_JOINT
+        )
+        if (
+            restore_authority_mode == RestoreAuthorityMode.NORMAL_JOINT
+            and online_joint_decision.view is not None
+        ):
+            self._queue_online_joint_residency(
+                online_joint_decision.view,
+                now_ms=float(self._now_ms()),
+            )
+        joint_policy_enabled = bool(
+            getattr(
+                getattr(self, "config", None),
+                "joint_policy_enabled",
+                False,
+            )
+        )
+        online_joint_has_authority = bool(
+            restore_authority_mode != RestoreAuthorityMode.NORMAL_JOINT
+            or joint_policy_enabled
+            and (
+                online_joint_decision.view is not None
+                or getattr(self, "_pending_online_joint_residency", None)
+                is not None
+            )
+        )
+        if joint_policy_enabled and not online_joint_has_authority:
+            self._online_joint_counts["safe_point_missing_joint_authority"] += 1
+        self._begin_physical_transactional_commit()
+        tick = self.bridge.scheduler_step(
+            self._now_ms(),
+            drain_acks=False,
+            allow_reactive_transfer=(
+                not joint_policy_enabled
+                and restore_authority_mode == RestoreAuthorityMode.NORMAL_JOINT
+                and bool(
+                    getattr(
+                        getattr(self, "config", None),
+                        "reactive_transfer_enabled",
+                        True,
+                    )
+                )
+            ),
+        )
         for guard_event in getattr(tick, "transfer_guard_events", ()):
             self.audit.emit(
                 guard_event.kind,
@@ -3954,6 +8471,31 @@ class EmbeddedSGLangRuntime:
                 bundle_event.kind,
                 bundle_event.ts_ms,
                 **dict(bundle_event.fields),
+            )
+        for shadow_event in getattr(tick, "frontier_shadow_events", ()):
+            self.audit.emit(
+                "frontier_shadow",
+                shadow_event.ts_ms,
+                context_id=shadow_event.context_id,
+                invocation_id=shadow_event.invocation_id,
+                workflow_id=shadow_event.workflow_id,
+                state=shadow_event.state,
+                agent_definition_id=shadow_event.agent_definition_id,
+                support_level=shadow_event.support_level,
+                ood_reasons=list(shadow_event.ood_reasons),
+                boundary_top=shadow_event.boundary_top,
+                boundary_distribution=dict(shadow_event.boundary_distribution),
+                remaining_decode_tokens_p50=(
+                    shadow_event.remaining_decode_tokens_p50
+                ),
+                remaining_external_wait_ms_p50=(
+                    shadow_event.remaining_external_wait_ms_p50
+                ),
+                prompt_growth_tokens_p50=(
+                    shadow_event.prompt_growth_tokens_p50
+                ),
+                next_output_tokens_p50=shadow_event.next_output_tokens_p50,
+                feature_source=shadow_event.feature_source,
             )
         decision = tick.admission
         if decision is not None:
@@ -3991,24 +8533,65 @@ class EmbeddedSGLangRuntime:
                     pending_contexts = set()
                     self._pending_h2d_contexts = pending_contexts
                 bundle = tick.transfer.command.physical_bundle
-                bundle_ids = (
-                    (bundle.bundle_id,)
-                    if bundle is not None and bundle.bundle_id
-                    else self._context_restore_bundle_ids(context_id)
+                restored_extent_ids = tuple(
+                    sorted(
+                        f"page:{item.handle.page_id}:"
+                        f"{item.handle.allocation_generation}"
+                        for item in tick.transfer.page_actions
+                        if item.action == PhysicalPageAction.START_H2D
+                    )
                 )
-                if not bundle_ids:
-                    bundle_ids = (f"context:{context_id}",)
-                h2d_commands[command_id] = (context_id, bundle_ids)
-                pending_contexts.add(context_id)
-                self._mark_context_wait_restore(
+                if not restored_extent_ids and bundle is not None:
+                    restored_extent_ids = tuple(
+                        sorted(
+                            f"page:{handle.page_id}:"
+                            f"{handle.allocation_generation}"
+                            for handle in bundle.closure_handles
+                        )
+                    )
+                if not restored_extent_ids:
+                    restored_extent_ids = self._context_restore_bundle_ids(
+                        context_id
+                    )
+                h2d_commands[command_id] = (
                     context_id,
-                    bundle_ids=bundle_ids,
+                    restored_extent_ids,
+                )
+                pending_contexts.add(context_id)
+                self._mark_h2d_waiters(
+                    context_id,
+                    restored_extent_ids=restored_extent_ids,
                     reason="h2d_inflight",
                 )
             action_counts: dict[str, int] = {}
             for page_action in tick.transfer.page_actions:
                 action = page_action.action.value
                 action_counts[action] = action_counts.get(action, 0) + 1
+            source_joint_plan_id = tick.transfer.command.metadata.get(
+                "joint_plan_id"
+            )
+            policy_reason = tick.transfer.command.metadata.get("reason")
+            lifecycle_action = str(policy_reason).startswith(
+                ("terminal_", "shutdown_", "host_capacity_")
+            )
+            action_source = (
+                "joint_plan"
+                if source_joint_plan_id
+                else "lifecycle"
+                if lifecycle_action
+                else "unified_liveness"
+            )
+            if (
+                getattr(
+                    getattr(self, "config", None),
+                    "joint_policy_enabled",
+                    False,
+                )
+                and action_source == "unified_liveness"
+            ):
+                self._online_joint_counts[
+                    "online_action_missing_source_joint_plan_id"
+                ] += 1
             self.audit.emit(
                 "transfer_dispatched",
                 tick.now_ms,
@@ -4019,7 +8602,9 @@ class EmbeddedSGLangRuntime:
                 selected_bytes=tick.transfer.resolved_bytes,
                 page_count=len(tick.transfer.page_actions),
                 action_counts=action_counts,
-                policy_reason=tick.transfer.command.metadata.get("reason"),
+                policy_reason=policy_reason,
+                action_source=action_source,
+                source_joint_plan_id=source_joint_plan_id,
                 bundle_scope=tick.transfer.command.metadata.get(
                     "physical_bundle_scope"
                 ),
@@ -4061,6 +8646,14 @@ class EmbeddedSGLangRuntime:
                 tuple(tick.local_acks),
                 now_ms=float(self._now_ms()),
             )
+            self._advance_online_joint_residency(
+                tuple(tick.local_acks),
+                now_ms=float(self._now_ms()),
+            )
+            self._advance_restore_obligations(
+                tuple(tick.local_acks),
+                now_ms=float(self._now_ms()),
+            )
         for command_id in getattr(tick, "stalled_command_ids", ()):
             if command_id in self._stalled_command_audited:
                 continue
@@ -4071,6 +8664,7 @@ class EmbeddedSGLangRuntime:
                 command_id=command_id,
                 action="await_nonpreemptible_transfer_completion",
             )
+        self._finish_physical_safe_point()
         self._record_scheduler_timing(
             total_ms=(time.perf_counter_ns() - step_started_ns) / 1_000_000.0,
             telemetry_ms=telemetry_overhead_ns / 1_000_000.0,
@@ -4098,28 +8692,379 @@ class EmbeddedSGLangRuntime:
         return tuple(retired)
 
     def _context_has_engine_request(self, context_id: str) -> bool:
-        # Native waiting requests do not own a req-pool slot or a Radix lock.
-        # Counting them here would reject every explicit restore after making
-        # the waiting queue visible.
-        request_ids = set(getattr(self, "_active_request_ids", set()))
-        request_ids.difference_update(
-            getattr(self, "_retracted_engine_request_ids", set())
+        phase = getattr(
+            self, "_safe_point_physical_phase", SafePointPhysicalPhase.IDLE
         )
-        scheduler = getattr(self, "scheduler", None)
-        if scheduler is not None:
-            running_batch = getattr(scheduler, "running_batch", None)
-            requests = list(getattr(running_batch, "reqs", ()) or ())
-            chunked_req = getattr(scheduler, "chunked_req", None)
-            if chunked_req is not None:
-                requests.append(chunked_req)
-            request_ids.update(
-                str(getattr(req, "rid", f"object:{id(req)}")) for req in requests
+        if phase == SafePointPhysicalPhase.TRANSACTIONAL_COMMIT:
+            # Backend submission is commit-time validation, never a new decision.
+            snapshot = self._capture_safe_point_physical_snapshot(
+                epoch=getattr(self, "_safe_point_physical_epoch_sequence", 0),
+                record_metrics=False,
             )
-        for request_id in request_ids:
-            metadata = getattr(self, "_request_metadata_by_id", {}).get(request_id)
-            if metadata is not None and metadata.context_id == context_id:
-                return True
-        return False
+            self._native_physical_snapshot_counts[
+                "commit_validation_capture_count"
+            ] += 1
+            snapshots = snapshot.for_context(context_id)
+            explicit_transfers = snapshot.explicit_transfers_by_context.get(
+                context_id, ()
+            )
+        else:
+            snapshot = self._lazy_safe_point_physical_snapshot()
+            snapshots = snapshot.for_context(context_id)
+            explicit_transfers = snapshot.explicit_transfers_by_context.get(
+                context_id, ()
+            )
+        return any(
+            snapshot.engine_owned
+            or snapshot.native_load_operation_id is not None
+            or bool(snapshot.explicit_transfer_ids)
+            for snapshot in snapshots
+        ) or bool(explicit_transfers)
+
+    def _begin_physical_safe_point_apply_events(self) -> None:
+        if not hasattr(self, "_native_physical_snapshot_counts"):
+            self._native_physical_snapshot_counts = Counter()
+        self._safe_point_physical_epoch_sequence = (
+            getattr(self, "_safe_point_physical_epoch_sequence", 0) + 1
+        )
+        self._safe_point_physical_phase = SafePointPhysicalPhase.APPLY_EVENTS
+        self._safe_point_physical_snapshot = None
+
+    def _begin_physical_safe_point_capture_and_plan(self) -> None:
+        phase = getattr(
+            self, "_safe_point_physical_phase", SafePointPhysicalPhase.IDLE
+        )
+        if phase == SafePointPhysicalPhase.IDLE:
+            self._begin_physical_safe_point_apply_events()
+        elif phase == SafePointPhysicalPhase.TRANSACTIONAL_COMMIT:
+            self._safe_point_physical_epoch_sequence += 1
+            self._safe_point_physical_snapshot = None
+        self._safe_point_physical_phase = SafePointPhysicalPhase.CAPTURE_AND_PLAN
+
+    def _restart_physical_capture_epoch(self) -> None:
+        """Start a new read epoch after a failed or completed commit attempt."""
+
+        self._safe_point_physical_epoch_sequence = (
+            getattr(self, "_safe_point_physical_epoch_sequence", 0) + 1
+        )
+        self._safe_point_physical_phase = SafePointPhysicalPhase.CAPTURE_AND_PLAN
+        self._safe_point_physical_snapshot = None
+        self._native_physical_snapshot_counts["capture_epoch_restarted"] += 1
+
+    def _begin_physical_transactional_commit(
+        self, context_id: str | None = None
+    ) -> bool:
+        """Revalidate a captured read-set and close the epoch before mutation."""
+
+        phase = getattr(
+            self, "_safe_point_physical_phase", SafePointPhysicalPhase.IDLE
+        )
+        if phase == SafePointPhysicalPhase.IDLE:
+            self._begin_physical_safe_point_apply_events()
+            self._begin_physical_safe_point_capture_and_plan()
+            phase = SafePointPhysicalPhase.CAPTURE_AND_PLAN
+        elif phase == SafePointPhysicalPhase.APPLY_EVENTS:
+            self._begin_physical_safe_point_capture_and_plan()
+            phase = SafePointPhysicalPhase.CAPTURE_AND_PLAN
+        if phase == SafePointPhysicalPhase.TRANSACTIONAL_COMMIT:
+            return True
+
+        captured = getattr(self, "_safe_point_physical_snapshot", None)
+        if captured is not None and context_id is not None:
+            started_ns = time.perf_counter_ns()
+            current = self._capture_safe_point_physical_snapshot(
+                epoch=captured.epoch,
+                record_metrics=False,
+            )
+            elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+            self._native_physical_snapshot_counts[
+                "commit_readset_validation_count"
+            ] += 1
+            self._native_physical_snapshot_counts[
+                "commit_readset_validation_us_total"
+            ] += int(round(elapsed_ms * 1000.0))
+            if captured.context_readset(context_id) != current.context_readset(
+                context_id
+            ):
+                self._native_physical_snapshot_counts[
+                    "commit_readset_stale"
+                ] += 1
+                audit = getattr(self, "audit", None)
+                if audit is not None:
+                    audit.emit(
+                        "physical_snapshot_commit_rejected",
+                        self._now_ms(),
+                        epoch=captured.epoch,
+                        context_id=context_id,
+                        reason="native_ownership_readset_changed",
+                    )
+                self._restart_physical_capture_epoch()
+                return False
+
+        self._safe_point_physical_phase = (
+            SafePointPhysicalPhase.TRANSACTIONAL_COMMIT
+        )
+        self._safe_point_physical_snapshot = None
+        self._native_physical_snapshot_counts["transactional_commit_entered"] += 1
+        return True
+
+    def _finish_physical_safe_point(self) -> None:
+        self._safe_point_physical_phase = SafePointPhysicalPhase.IDLE
+        self._safe_point_physical_snapshot = None
+
+    @staticmethod
+    def _gc_collection_count() -> int:
+        return sum(int(item.get("collections", 0)) for item in gc.get_stats())
+
+    def _capture_safe_point_physical_snapshot(
+        self,
+        *,
+        epoch: int,
+        record_metrics: bool,
+    ) -> SafePointPhysicalSnapshot:
+        """Capture native ownership once; callers decide whether it is cached."""
+
+        total_started_ns = time.perf_counter_ns()
+        gc_before = self._gc_collection_count()
+        scheduler = getattr(self, "scheduler", None)
+        if scheduler is None:
+            empty_timing = SafePointSnapshotBuildTiming(
+                total_ms=0.0,
+                queue_collection_ms=0.0,
+                metadata_indexing_ms=0.0,
+                radix_ownership_lookup_ms=0.0,
+                operation_indexing_ms=0.0,
+                sorting_allocation_ms=0.0,
+            )
+            return SafePointPhysicalSnapshot(
+                epoch=epoch,
+                records=(),
+                by_request={},
+                by_context={},
+                explicit_transfers_by_context={},
+                queue_record_count=0,
+                metadata_record_count=0,
+                timing=empty_timing,
+            )
+
+        phase_started_ns = time.perf_counter_ns()
+        waiting = tuple(getattr(scheduler, "waiting_queue", ()) or ())
+        running = tuple(
+            getattr(getattr(scheduler, "running_batch", None), "reqs", ()) or ()
+        )
+        chunked = getattr(scheduler, "chunked_req", None)
+        locations: dict[str, tuple[Any, NativeQueueLocation]] = {}
+        for req in waiting:
+            locations[str(getattr(req, "rid", f"object:{id(req)}"))] = (
+                req,
+                NativeQueueLocation.WAITING,
+            )
+        for req in running:
+            locations[str(getattr(req, "rid", f"object:{id(req)}"))] = (
+                req,
+                NativeQueueLocation.RUNNING,
+            )
+        if chunked is not None:
+            locations[str(getattr(chunked, "rid", f"object:{id(chunked)}"))] = (
+                chunked,
+                NativeQueueLocation.CHUNKED,
+            )
+        queue_record_count = len(waiting) + len(running) + int(chunked is not None)
+        queue_collection_ms = (
+            time.perf_counter_ns() - phase_started_ns
+        ) / 1_000_000.0
+
+        phase_started_ns = time.perf_counter_ns()
+        request_metadata = getattr(self, "_request_metadata_by_id", {})
+        metadata_items = tuple(sorted(request_metadata.items()))
+        metadata_indexing_ms = (
+            time.perf_counter_ns() - phase_started_ns
+        ) / 1_000_000.0
+
+        phase_started_ns = time.perf_counter_ns()
+        explicit_by_context: dict[str, list[str]] = {}
+        for command_id, state in getattr(
+            self, "_h2d_context_by_command", {}
+        ).items():
+            explicit_by_context.setdefault(str(state[0]), []).append(
+                str(command_id)
+            )
+        explicit_transfers = {
+            context_id: tuple(sorted(command_ids))
+            for context_id, command_ids in explicit_by_context.items()
+        }
+        native_load_by_request: dict[str, str] = {}
+        for request_id, (req, _location) in locations.items():
+            for field_name in (
+                "hicache_load_operation_id",
+                "load_operation_id",
+                "current_load_operation_id",
+            ):
+                value = getattr(req, field_name, None)
+                if value is not None:
+                    native_load_by_request[request_id] = str(value)
+                    break
+        operation_indexing_ms = (
+            time.perf_counter_ns() - phase_started_ns
+        ) / 1_000_000.0
+
+        phase_started_ns = time.perf_counter_ns()
+        snapshots: list[NativeRequestPhysicalSnapshot] = []
+        submitted_by_id = getattr(self, "_request_submitted_ts_by_id", {})
+        terminal_cancelled = getattr(
+            self, "_terminal_cancelled_request_ids", set()
+        )
+        has_controller = hasattr(self, "controller")
+        for request_id, metadata in metadata_items:
+            req, location = locations.get(
+                request_id, (None, NativeQueueLocation.NONE)
+            )
+            slot = getattr(req, "req_pool_idx", None) if req is not None else None
+            if slot is not None:
+                try:
+                    slot = int(slot)
+                except (TypeError, ValueError):
+                    slot = None
+                if slot is not None and slot < 0:
+                    slot = None
+            node = getattr(req, "last_node", None) if req is not None else None
+            lock_owned = bool(
+                location
+                in {NativeQueueLocation.RUNNING, NativeQueueLocation.CHUNKED}
+                and node is not None
+                and int(getattr(node, "lock_ref", 0) or 0) > 0
+            )
+            native_load_id = native_load_by_request.get(request_id)
+            submitted = submitted_by_id.get(request_id, 0.0)
+            generation = max(
+                0,
+                (int(metadata.context_epoch) << 48)
+                + int(max(0.0, float(submitted)) * 1000.0),
+            )
+            snapshots.append(
+                NativeRequestPhysicalSnapshot(
+                    request_id=request_id,
+                    context_id=metadata.context_id,
+                    queue_location=location,
+                    req_pool_slot=slot,
+                    radix_lock_owned=lock_owned,
+                    native_load_operation_id=native_load_id,
+                    explicit_transfer_ids=explicit_transfers.get(
+                        metadata.context_id, ()
+                    ),
+                    request_generation=generation,
+                    terminal=(
+                        request_id in terminal_cancelled
+                        or has_controller
+                        and self._metadata_scope_is_terminal(metadata)
+                    ),
+                )
+            )
+        radix_ownership_lookup_ms = (
+            time.perf_counter_ns() - phase_started_ns
+        ) / 1_000_000.0
+
+        phase_started_ns = time.perf_counter_ns()
+        records = tuple(sorted(snapshots, key=lambda item: item.request_id))
+        by_request = {item.request_id: item for item in records}
+        mutable_by_context: dict[str, list[NativeRequestPhysicalSnapshot]] = {}
+        for item in records:
+            mutable_by_context.setdefault(item.context_id, []).append(item)
+        by_context = {
+            context_id: tuple(items)
+            for context_id, items in mutable_by_context.items()
+        }
+        counts = getattr(self, "_native_physical_snapshot_counts", None)
+        if counts is None:
+            counts = Counter()
+            self._native_physical_snapshot_counts = counts
+        placeholder_timing = SafePointSnapshotBuildTiming(
+            total_ms=0.0,
+            queue_collection_ms=queue_collection_ms,
+            metadata_indexing_ms=metadata_indexing_ms,
+            radix_ownership_lookup_ms=radix_ownership_lookup_ms,
+            operation_indexing_ms=operation_indexing_ms,
+            sorting_allocation_ms=0.0,
+            queue_record_count=queue_record_count,
+            metadata_record_count=len(metadata_items),
+            matched_record_count=len(records),
+            cold_build=counts.get("call_count", 0) == 0,
+        )
+        snapshot = SafePointPhysicalSnapshot(
+            epoch=epoch,
+            records=records,
+            by_request=by_request,
+            by_context=by_context,
+            explicit_transfers_by_context=explicit_transfers,
+            queue_record_count=queue_record_count,
+            metadata_record_count=len(metadata_items),
+            timing=placeholder_timing,
+        )
+        sorting_allocation_ms = (
+            time.perf_counter_ns() - phase_started_ns
+        ) / 1_000_000.0
+        total_ms = (time.perf_counter_ns() - total_started_ns) / 1_000_000.0
+        timing = SafePointSnapshotBuildTiming(
+            total_ms=total_ms,
+            queue_collection_ms=queue_collection_ms,
+            metadata_indexing_ms=metadata_indexing_ms,
+            radix_ownership_lookup_ms=radix_ownership_lookup_ms,
+            operation_indexing_ms=operation_indexing_ms,
+            sorting_allocation_ms=sorting_allocation_ms,
+            queue_record_count=queue_record_count,
+            metadata_record_count=len(metadata_items),
+            matched_record_count=len(records),
+            gc_collections=max(0, self._gc_collection_count() - gc_before),
+            cold_build=counts.get("call_count", 0) == 0,
+        )
+        object.__setattr__(snapshot, "timing", timing)
+        if record_metrics:
+            samples = getattr(
+                self, "_native_physical_snapshot_timing_samples", None
+            )
+            if samples is None:
+                samples = deque(maxlen=65_536)
+                self._native_physical_snapshot_timing_samples = samples
+            samples.append(timing)
+            counts["call_count"] += 1
+            counts["queue_records_scanned_total"] += queue_record_count
+            counts["metadata_records_scanned_total"] += len(metadata_items)
+            counts["matched_snapshot_count_total"] += len(records)
+            counts["build_us_total"] += int(round(total_ms * 1000.0))
+            counts["gc_collections_during_build"] += timing.gc_collections
+        return snapshot
+
+    def _lazy_safe_point_physical_snapshot(self) -> SafePointPhysicalSnapshot:
+        phase = getattr(
+            self, "_safe_point_physical_phase", SafePointPhysicalPhase.IDLE
+        )
+        if phase == SafePointPhysicalPhase.IDLE:
+            self._begin_physical_safe_point_apply_events()
+            self._begin_physical_safe_point_capture_and_plan()
+        elif phase == SafePointPhysicalPhase.APPLY_EVENTS:
+            self._begin_physical_safe_point_capture_and_plan()
+        elif phase == SafePointPhysicalPhase.TRANSACTIONAL_COMMIT:
+            raise RuntimeError(
+                "cannot build a planning snapshot after transactional commit"
+            )
+        snapshot = getattr(self, "_safe_point_physical_snapshot", None)
+        epoch = getattr(self, "_safe_point_physical_epoch_sequence", 0)
+        if snapshot is None:
+            snapshot = self._capture_safe_point_physical_snapshot(
+                epoch=epoch,
+                record_metrics=True,
+            )
+            self._safe_point_physical_snapshot = snapshot
+        else:
+            self._native_physical_snapshot_counts["cache_hit_count"] += 1
+        return snapshot
+
+    def _context_physical_snapshots(
+        self, context_id: str
+    ) -> tuple[NativeRequestPhysicalSnapshot, ...]:
+        """Return one context from the epoch-local immutable snapshot."""
+
+        return self._lazy_safe_point_physical_snapshot().for_context(context_id)
 
     def _record_scheduler_timing(
         self, *, total_ms: float, telemetry_ms: float, telemetry_count: int
@@ -4129,6 +9074,11 @@ class EmbeddedSGLangRuntime:
             samples = deque(maxlen=65_536)
             self._scheduler_timing_samples = samples
         samples.append((total_ms, telemetry_ms, telemetry_count))
+        counts = getattr(self, "_native_physical_snapshot_counts", None)
+        if counts is None:
+            counts = Counter()
+            self._native_physical_snapshot_counts = counts
+        counts["scheduler_step_count"] += 1
 
     @staticmethod
     def _audit_blockers(
@@ -4232,6 +9182,28 @@ class EmbeddedSGLangRuntime:
                 self.controller.admission.cancel(request_id)
         for request_id in tuple(self._request_metadata_by_id):
             if matches(request_id):
+                terminal_reason = (
+                    "queue_timeout"
+                    if request_id
+                    in getattr(self, "_queue_timeout_request_ids", set())
+                    else "execution_timeout"
+                    if request_id
+                    in getattr(self, "_execution_timeout_request_ids", set())
+                    else "request_aborted"
+                )
+                self._finish_restore_obligation(
+                    request_id,
+                    RestoreObligationState.CANCELLED,
+                    now_ms=float(
+                        getattr(self, "_now_ms", lambda: 0.0)()
+                    ),
+                    reason=terminal_reason,
+                )
+                self._cancel_restore_service_grace(
+                    request_id,
+                    now_ms=float(getattr(self, "_now_ms", lambda: 0.0)()),
+                    reason=terminal_reason,
+                )
                 self._request_metadata_by_id.pop(request_id, None)
                 ledger = getattr(self, "_lock_service_ledger", None)
                 if ledger is not None:
@@ -4239,6 +9211,29 @@ class EmbeddedSGLangRuntime:
                 getattr(self, "_request_submitted_ts_by_id", {}).pop(
                     request_id, None
                 )
+                start = getattr(self, "_request_physical_start_by_id", {}).pop(
+                    request_id, None
+                )
+                if start is not None:
+                    aborted_starts = getattr(
+                        self, "_aborted_request_physical_start_by_id", None
+                    )
+                    if aborted_starts is None:
+                        aborted_starts = {}
+                        self._aborted_request_physical_start_by_id = aborted_starts
+                    aborted_starts[request_id] = {
+                        **start,
+                        "abort_ts_ms": float(
+                            getattr(self, "_now_ms", lambda: 0.0)()
+                        ),
+                        "abort_reason": terminal_reason,
+                    }
+                getattr(self, "_queue_timeout_request_ids", set()).discard(
+                    request_id
+                )
+                getattr(
+                    self, "_execution_timeout_request_ids", set()
+                ).discard(request_id)
                 getattr(self, "_retracted_engine_request_ids", set()).discard(
                     request_id
                 )
@@ -4248,6 +9243,9 @@ class EmbeddedSGLangRuntime:
                 getattr(self, "_retraction_cooldown_until_by_request", {}).pop(
                     request_id, None
                 )
+                getattr(
+                    self, "_ordinary_restore_capacity_waiters", set()
+                ).discard(request_id)
         return removed
 
     def on_batch_selected(self, batch: Any) -> None:
@@ -4280,6 +9278,17 @@ class EmbeddedSGLangRuntime:
                 req,
                 metadata,
                 now_ms=now_ms,
+            )
+            obligation = self._restore_obligation_index().get(str(req.rid))
+            if obligation is not None and not obligation.state.terminal:
+                self._start_restore_service_grace(
+                    obligation, now_ms=now_ms, req=req
+                )
+            self._finish_restore_obligation(
+                str(req.rid),
+                RestoreObligationState.SATISFIED,
+                now_ms=now_ms,
+                reason="gpu_service_resumed",
             )
             workflow_counts[metadata.root_workflow_id] = (
                 workflow_counts.get(metadata.root_workflow_id, 0) + 1
@@ -4328,6 +9337,7 @@ class EmbeddedSGLangRuntime:
     def _observe_gpu_batch_launch(self, batch: Any, now_ms: float) -> None:
         if not self.config.queue_service_observer_enabled:
             return
+        observer_started_ns = time.perf_counter_ns()
         descriptor: dict[str, Any] | None = None
         reqs = tuple(getattr(batch, "reqs", ()) or ())
         metadata = tuple(self._metadata(req) for req in reqs)
@@ -4395,6 +9405,10 @@ class EmbeddedSGLangRuntime:
                         observation_scope = None
             elif self.config.queue_service_observer_include_runtime_batches:
                 observation_scope = "runtime"
+        elif phase is not None and tokens > 0 and all_tagged and not under_limit:
+            self._gpu_service_sample_cap_count = (
+                getattr(self, "_gpu_service_sample_cap_count", 0) + 1
+            )
         if observation_scope is not None:
             sequence_tokens_before = []
             for req in reqs:
@@ -4418,6 +9432,42 @@ class EmbeddedSGLangRuntime:
                 prefix_tokens_before = sequence_tokens_before[0]
             self._gpu_service_sequence += 1
             sample_id = f"gpu-service-{self._gpu_service_sequence:09d}"
+            request_samples = []
+            decode_steps = max(1, tokens // max(1, len(reqs)))
+            for req, item, sequence_tokens in zip(
+                reqs, metadata, sequence_tokens_before
+            ):
+                assert item is not None
+                output_ids = getattr(req, "output_ids", None)
+                output_tokens_before = (
+                    len(output_ids) if output_ids is not None else None
+                )
+                token_delta = (
+                    decode_steps
+                    if phase == "decode"
+                    else max(
+                        0,
+                        int(getattr(req, "extend_input_len", 0) or 0),
+                    )
+                )
+                request_samples.append(
+                    {
+                        "request_id": str(req.rid),
+                        "workflow_id": item.root_workflow_id,
+                        "invocation_id": item.invocation_id,
+                        "context_id": item.context_id,
+                        "context_epoch": item.context_epoch,
+                        "phase": phase,
+                        "token_delta": token_delta,
+                        "token_delta_semantics": (
+                            "scheduled_decode_steps"
+                            if phase == "decode"
+                            else "prefill_extend_input_len"
+                        ),
+                        "output_tokens_before": output_tokens_before,
+                        "sequence_tokens_before": sequence_tokens,
+                    }
+                )
             descriptor = {
                 "sample_id": sample_id,
                 "observation_scope": observation_scope,
@@ -4439,7 +9489,11 @@ class EmbeddedSGLangRuntime:
                     {item.root_workflow_id for item in metadata if item is not None}
                 ),
                 "request_ids": sorted(str(req.rid) for req in reqs),
+                "request_samples": request_samples,
             }
+            descriptor["launch_observer_cpu_ms"] = (
+                time.perf_counter_ns() - observer_started_ns
+            ) / 1_000_000.0
         self._gpu_service_launches.append(descriptor)
 
     def on_batch_completed(self, batch: Any) -> None:
@@ -4447,10 +9501,16 @@ class EmbeddedSGLangRuntime:
         if mode is None or mode.is_idle() or mode.is_dummy_first():
             return
         now_ms = self._now_ms()
+        phase = self._gpu_batch_phase(mode)
+        self._observe_restore_service_grace(
+            batch,
+            now_ms=now_ms,
+            phase=phase,
+        )
         self._observe_request_service_completed(
             batch,
             now_ms=now_ms,
-            phase=self._gpu_batch_phase(mode),
+            phase=phase,
         )
         if not self.config.queue_service_observer_enabled:
             return
@@ -4469,6 +9529,22 @@ class EmbeddedSGLangRuntime:
         descriptor = self._gpu_service_launches.popleft()
         if descriptor is None:
             return
+        observer_started_ns = time.perf_counter_ns()
+        if descriptor["phase"] == "decode":
+            current_output_tokens = {
+                str(req.rid): len(output_ids)
+                for req in tuple(getattr(batch, "reqs", ()) or ())
+                if (output_ids := getattr(req, "output_ids", None)) is not None
+            }
+            for request_sample in descriptor["request_samples"]:
+                before = request_sample.get("output_tokens_before")
+                after = current_output_tokens.get(request_sample["request_id"])
+                if before is None or after is None:
+                    continue
+                request_sample["token_delta"] = max(0, after - int(before))
+                request_sample["token_delta_semantics"] = (
+                    "observed_output_ids_delta"
+                )
         launch_ts_ms = float(descriptor["launch_ts_ms"])
         service_start_ts_ms = max(
             launch_ts_ms,
@@ -4489,6 +9565,10 @@ class EmbeddedSGLangRuntime:
             )
             return
         self._gpu_service_sample_count += 1
+        build_ms = (
+            time.perf_counter_ns() - observer_started_ns
+        ) / 1_000_000.0 + float(descriptor.get("launch_observer_cpu_ms", 0.0))
+        enqueue_started_ns = time.perf_counter_ns()
         self.audit.emit(
             "gpu_service_sample",
             now_ms,
@@ -4509,6 +9589,14 @@ class EmbeddedSGLangRuntime:
                 else None
             ),
         )
+        enqueue_ms = (
+            time.perf_counter_ns() - enqueue_started_ns
+        ) / 1_000_000.0
+        samples = getattr(self, "_gpu_service_observer_timing_samples", None)
+        if samples is None:
+            samples = deque(maxlen=65_536)
+            self._gpu_service_observer_timing_samples = samples
+        samples.append((build_ms, enqueue_ms))
 
     def _observe_request_selected_for_lock_service(
         self,
@@ -4661,6 +9749,9 @@ class EmbeddedSGLangRuntime:
         self._ticket_native_rejections.clear()
         now_ms = self._now_ms()
         self.controller.policy_control_state(now_ms)
+        self._restore_bypass_request_id = self._select_restore_bypass_request(
+            waiting_queue, now_ms=now_ms
+        )
 
         tagged: list[tuple[int, Any, BeliefKVRequestMetadata]] = []
         for native_index, req in enumerate(waiting_queue):
@@ -4679,6 +9770,9 @@ class EmbeddedSGLangRuntime:
             workflow_ids,
             memory_charges=self.controller.workflow_memory_charges(),
             hbm_capacity_bytes=self.config.hbm_capacity_bytes,
+        )
+        active_workflow_ids = frozenset(
+            fair_order[: self.config.joint_workflow_active_window]
         )
         fair_rank = {
             workflow_id: index for index, workflow_id in enumerate(fair_order)
@@ -4709,10 +9803,89 @@ class EmbeddedSGLangRuntime:
         )
         observed_window: ObservedAdmissionWindow | None = None
         observed_admission_error: str | None = None
+        cached_online_decision = getattr(
+            self, "_current_online_joint_decision", None
+        )
+        current_online_result = getattr(self, "_online_joint_result", None)
+        if (
+            cached_online_decision is not None
+            and cached_online_decision.view is not None
+            and current_online_result is not None
+            and current_online_result.plan is not None
+            and current_online_result.plan.plan_id
+            == cached_online_decision.view.plan_id
+        ):
+            online_joint_decision = cached_online_decision
+            self._online_joint_counts["safe_point_decision_reused"] += 1
+        else:
+            online_joint_decision = self._online_joint_admission_decision(
+                now_ms=now_ms,
+            )
+        online_joint_view = online_joint_decision.view
+        if online_joint_view is None and self.config.joint_policy_enabled:
+            ordered_tagged = sorted(
+                (
+                    item
+                    for item in tagged
+                    if item[2].root_workflow_id in active_workflow_ids
+                ),
+                key=lambda item: self._observed_ticket_order_key(
+                    item[0],
+                    item[1],
+                    item[2],
+                    now_ms,
+                    fair_rank=fair_rank,
+                    frontier_rank=frontier_rank,
+                ),
+            )
+            self._online_joint_epoch_sequence += 1
+            online_joint_decision = compile_bounded_seed_epoch(
+                ordered_request_ids=(
+                    str(item[1].rid) for item in ordered_tagged
+                ),
+                visible_request_ids=(str(item[1].rid) for item in tagged),
+                epoch_sequence=self._online_joint_epoch_sequence,
+                emergency=(
+                    self.controller.actual_hbm_used_bytes
+                    / self.config.hbm_capacity_bytes
+                    >= self.config.joint_emergency_hbm_ratio
+                ),
+                restore_requirements=(
+                    (
+                        request_id,
+                        entry.restore_bundle_ids,
+                    )
+                    for request_id, entry in entries.items()
+                    if entry.state == AdmissionSideState.WAIT_RESTORE
+                ),
+            )
+            online_joint_view = online_joint_decision.view
+            self._current_joint_plan_epoch = online_joint_decision.epoch
+            self._online_joint_counts["bounded_seed_epoch"] += 1
+            assert online_joint_decision.epoch is not None
+            self.audit.emit(
+                "online_joint_epoch_committed",
+                now_ms,
+                epoch_id=online_joint_decision.epoch.epoch_id,
+                plan_id=online_joint_decision.epoch.source_plan_id,
+                planner_mode=online_joint_decision.epoch.planner_mode.value,
+                commit_reason=online_joint_decision.reason,
+                source_action_count=(
+                    online_joint_decision.epoch.source_action_count
+                ),
+                committed_action_count=(
+                    online_joint_decision.epoch.committed_action_count
+                ),
+                actionable_coverage=(
+                    online_joint_decision.epoch.actionable_coverage
+                ),
+                rejected_slices=[],
+                trigger="safe_point_no_async_plan",
+            )
         observed_admission_enabled = (
             self.config.observed_admission_scheduling_enabled
         )
-        if observed_admission_enabled:
+        if online_joint_view is None and observed_admission_enabled:
             try:
                 observed_candidates = self._observed_admission_candidates(
                     tagged,
@@ -4737,8 +9910,32 @@ class EmbeddedSGLangRuntime:
                     error=observed_admission_error,
                     fallback="observed_reactive",
                     blocker_semantics="visible_side_state_preserved",
-                )
-        if observed_window is not None:
+        )
+        if online_joint_view is not None:
+            waiting_request_ids = {
+                str(req.rid) for _, req, _ in tagged
+            }
+            ordered_request_ids = tuple(
+                request_id
+                for request_id in online_joint_view.immediate_request_ids
+                if request_id in waiting_request_ids
+                and request_id in entries
+                and entries[request_id].request.workflow_id
+                in active_workflow_ids
+            )
+            compile_max_requests = max(0, int(max_requests))
+            compile_hbm_bytes = native_hbm_bytes
+            current_epoch = getattr(self, "_current_joint_plan_epoch", None)
+            planner_mode = (
+                current_epoch.planner_mode.value
+                if current_epoch is not None
+                and current_epoch.source_plan_id == online_joint_view.plan_id
+                else "optimized"
+            )
+            ticket_source = f"joint_{planner_mode}"
+            ticket_reason = f"joint_plan:{online_joint_view.plan_id}"
+            self._online_joint_counts["ticket_epoch"] += 1
+        elif observed_window is not None:
             ordered_request_ids = observed_window.ordered_request_ids
             compile_max_requests = observed_window.max_new_requests
             compile_hbm_bytes = min(
@@ -4785,9 +9982,73 @@ class EmbeddedSGLangRuntime:
                 else "observed_reactive"
             )
             ticket_reason = (
-                "policy_error_reactive_fallback"
+                f"online_joint_fallback:{online_joint_decision.reason}"
+                if self.config.joint_policy_enabled
+                else "policy_error_reactive_fallback"
                 if observed_admission_error is not None
                 else "visible_bounded_fallback"
+            )
+        restore_ready_priority = self._restore_ready_ticket_priority(entries)
+        if restore_ready_priority and self.config.joint_policy_enabled:
+            base_order = (
+                online_joint_view.ordered_request_ids
+                if online_joint_view is not None
+                else ordered_request_ids
+            )
+            priority_set = set(restore_ready_priority)
+            restore_liveness_order = restore_ready_priority + tuple(
+                request_id
+                for request_id in base_order
+                if request_id not in priority_set
+            )
+            self._online_joint_epoch_sequence += 1
+            online_joint_decision = compile_bounded_seed_epoch(
+                ordered_request_ids=restore_liveness_order,
+                visible_request_ids=(str(item[1].rid) for item in tagged),
+                epoch_sequence=self._online_joint_epoch_sequence,
+                emergency=(
+                    self.controller.actual_hbm_used_bytes
+                    / self.config.hbm_capacity_bytes
+                    >= self.config.joint_emergency_hbm_ratio
+                ),
+                restore_requirements=(
+                    (request_id, entry.restore_bundle_ids)
+                    for request_id, entry in entries.items()
+                    if entry.state == AdmissionSideState.WAIT_RESTORE
+                ),
+            )
+            assert online_joint_decision.view is not None
+            assert online_joint_decision.epoch is not None
+            online_joint_view = online_joint_decision.view
+            self._current_joint_plan_epoch = online_joint_decision.epoch
+            ordered_request_ids = online_joint_view.immediate_request_ids
+            ticket_source = (
+                f"joint_{online_joint_decision.epoch.planner_mode.value}"
+                "+restore_liveness"
+            )
+            ticket_reason = (
+                f"joint_plan:{online_joint_view.plan_id}:"
+                "restore_obligation_ticket_ready"
+            )
+            self._online_joint_counts["restore_liveness_epoch"] += 1
+            self.audit.emit(
+                "online_joint_epoch_committed",
+                now_ms,
+                epoch_id=online_joint_decision.epoch.epoch_id,
+                plan_id=online_joint_view.plan_id,
+                planner_mode=online_joint_decision.epoch.planner_mode.value,
+                commit_reason=online_joint_decision.reason,
+                source_action_count=(
+                    online_joint_decision.epoch.source_action_count
+                ),
+                committed_action_count=(
+                    online_joint_decision.epoch.committed_action_count
+                ),
+                actionable_coverage=(
+                    online_joint_decision.epoch.actionable_coverage
+                ),
+                rejected_slices=[],
+                trigger="restore_ticket_liveness",
             )
         retraction_priority = tuple(
             request_id
@@ -4797,19 +10058,45 @@ class EmbeddedSGLangRuntime:
             if request_id in entries
             and entries[request_id].state == AdmissionSideState.VISIBLE_PENDING
         )
-        if retraction_priority:
-            priority_set = set(retraction_priority)
+        liveness_priority = tuple(
+            dict.fromkeys((*restore_ready_priority, *retraction_priority))
+        )
+        if liveness_priority:
+            priority_set = set(liveness_priority)
             ordered_request_ids = (
-                retraction_priority
+                liveness_priority
                 + tuple(
                     request_id
                     for request_id in ordered_request_ids
                     if request_id not in priority_set
                 )
             )
-            ticket_source = f"{ticket_source}+retraction_replacement"
-            ticket_reason = "retraction_reclaim_confirmed"
+            if restore_ready_priority and not self.config.joint_policy_enabled:
+                ticket_source = f"{ticket_source}+restore_liveness"
+                ticket_reason = "restore_obligation_ticket_ready"
+            elif not restore_ready_priority:
+                ticket_source = f"{ticket_source}+retraction_replacement"
+                ticket_reason = "retraction_reclaim_confirmed"
+        restore_authority_mode = getattr(
+            self, "_restore_authority_mode", RestoreAuthorityMode.NORMAL_JOINT
+        )
+        if restore_authority_mode != RestoreAuthorityMode.NORMAL_JOINT:
+            restore_request_id = getattr(
+                self, "_restore_authority_request_id", None
+            )
+            restore_entry = entries.get(restore_request_id)
+            ordered_request_ids = (
+                (restore_request_id,)
+                if restore_request_id is not None
+                and restore_entry is not None
+                and restore_entry.state == AdmissionSideState.VISIBLE_PENDING
+                else ()
+            )
+            compile_max_requests = 1 if ordered_request_ids else 0
+            ticket_source = "emergency_restore_coordinator"
+            ticket_reason = restore_authority_mode.value
         self._retraction_priority_request_ids = ()
+        restore_lease_credits = self._restore_lease_credit_bytes()
         candidate_limit = min(
             len(ordered_request_ids),
             max(64, max(0, int(max_requests)) * 4),
@@ -4827,6 +10114,7 @@ class EmbeddedSGLangRuntime:
             ),
             source=ticket_source,
             reason=ticket_reason,
+            reservation_credits=restore_lease_credits,
         )
         visible_pending = any(
             entry.state == AdmissionSideState.VISIBLE_PENDING
@@ -4838,6 +10126,8 @@ class EmbeddedSGLangRuntime:
         elif not visible_pending:
             self._retraction_admission_stall_since_ms = None
         self._current_observed_admission_window = observed_window
+        self._current_online_joint_view = online_joint_view
+        self._current_online_joint_decision = online_joint_decision
         self._current_ticket_epoch = ticket_epoch
         self._current_tickets_by_request = dict(ticket_epoch.by_request_id)
         compile_ms = (
@@ -4862,12 +10152,34 @@ class EmbeddedSGLangRuntime:
             native_hbm_tokens=native_hbm_tokens,
             native_hbm_bytes=native_hbm_bytes,
             policy_hbm_bytes=compile_hbm_bytes,
+            restore_lease_reserved_bytes=sum(restore_lease_credits.values()),
             active_budget_binding=(
                 observed_window is not None
                 and observed_window.active_growth_budget_bytes
                 < native_hbm_bytes
             ),
             observed_admission_error=observed_admission_error,
+            online_joint_plan_id=(
+                online_joint_view.plan_id
+                if online_joint_view is not None
+                else None
+            ),
+            source_joint_plan_id=(
+                online_joint_view.plan_id
+                if online_joint_view is not None
+                else None
+            ),
+            online_joint_decision=online_joint_decision.reason,
+            online_joint_restore_blocked_count=(
+                len(online_joint_view.restore_requirements)
+                if online_joint_view is not None
+                else 0
+            ),
+            workflow_active_window=self.config.joint_workflow_active_window,
+            active_workflow_ids=sorted(active_workflow_ids),
+            inactive_workflow_count=max(
+                0, len(workflow_ids) - len(active_workflow_ids)
+            ),
             observed_admission_window=(
                 self._observed_admission_window_fields(observed_window)
                 if observed_window is not None
@@ -4883,6 +10195,9 @@ class EmbeddedSGLangRuntime:
                     "estimated_prefill_tokens": ticket.estimated_prefill_tokens,
                     "estimated_incremental_bytes": (
                         ticket.estimated_incremental_bytes
+                    ),
+                    "reservation_credit_bytes": (
+                        ticket.reservation_credit_bytes
                     ),
                 }
                 for ticket in ticket_epoch.tickets
@@ -4986,6 +10301,24 @@ class EmbeddedSGLangRuntime:
                 "prefix_rematch:" + "+".join(validation.reasons),
             )
             return False
+        obligation = self._restore_obligation_index().get(request_id)
+        if (
+            obligation is not None
+            and not obligation.state.terminal
+            and obligation.state == RestoreObligationState.TICKET_READY
+        ):
+            refreshed = self.controller.visible_admission.get(request_id)
+            if refreshed is not None:
+                obligation.required_admission_bytes = (
+                    refreshed.request.estimated_incremental_bytes
+                )
+            if not self._begin_restore_lease_admission(
+                obligation, now_ms=float(self._now_ms())
+            ):
+                self._record_ticket_skip(
+                    request_id, "restore_lease_admission_capacity"
+                )
+                return False
         return True
 
     def on_prefill_candidate_result(
@@ -5003,8 +10336,31 @@ class EmbeddedSGLangRuntime:
         if ticket is None:
             return
         self._ticket_attempted_request_ids.add(request_id)
+        obligation = self._restore_obligation_index().get(request_id)
         if admitted:
+            if obligation is not None and not obligation.state.terminal:
+                self._commit_restore_lease_admission(
+                    obligation, now_ms=float(self._now_ms())
+                )
             self._ticket_selected_request_ids.add(request_id)
+            bypass_request_id = getattr(
+                self, "_restore_bypass_request_id", None
+            )
+            if request_id == bypass_request_id:
+                overdue = self._overdue_restore_obligation(
+                    now_ms=float(self._now_ms())
+                )
+                if overdue is not None:
+                    overdue.bypass_count += 1
+                    self._restore_obligation_counts["bounded_bypass_admitted"] += 1
+                    self.audit.emit(
+                        "restore_debt_bounded_bypass_admitted",
+                        self._now_ms(),
+                        obligation_id=overdue.obligation_id,
+                        restore_request_id=overdue.request_id,
+                        bypass_request_id=request_id,
+                        bypass_count=overdue.bypass_count,
+                    )
             entry = self.controller.visible_admission.cancel(request_id)
             wait_ms = (
                 max(0.0, self._now_ms() - entry.request.submitted_ts_ms)
@@ -5018,9 +10374,15 @@ class EmbeddedSGLangRuntime:
                 "rank": ticket.rank,
                 "native_result": result,
                 "admission_wait_ms": wait_ms,
-                "reserved_bytes": 0,
+                "reserved_bytes": ticket.reservation_credit_bytes,
             }
         else:
+            if obligation is not None and not obligation.state.terminal:
+                self._reject_restore_lease_admission(
+                    obligation,
+                    now_ms=float(self._now_ms()),
+                    native_result=result,
+                )
             self._ticket_native_rejections[request_id] = result
 
     def end_prefill_epoch(self, can_run_list: Any) -> None:
@@ -5048,6 +10410,22 @@ class EmbeddedSGLangRuntime:
             for ticket in ticket_epoch.tickets
             if ticket.request_id not in selected
         ]
+        for ticket in ticket_epoch.tickets:
+            if ticket.request_id in selected:
+                continue
+            obligation = self._restore_obligation_index().get(ticket.request_id)
+            lease = self._restore_lease_index().get(ticket.request_id)
+            if (
+                obligation is not None
+                and not obligation.state.terminal
+                and lease is not None
+                and lease.state == RestoreLeaseState.ADMISSION_COMMITTING
+            ):
+                self._reject_restore_lease_admission(
+                    obligation,
+                    now_ms=float(self._now_ms()),
+                    native_result="ticket_epoch_expired",
+                )
         self.audit.emit(
             "admission_ticket_epoch_finished",
             self._now_ms(),
@@ -5293,6 +10671,21 @@ class EmbeddedSGLangRuntime:
             workflow_fair_rank,
         )
 
+    def _restore_ready_ticket_priority(
+        self,
+        entries: Mapping[str, Any],
+    ) -> tuple[str, ...]:
+        """Return oldest restored debts that must not be lost to plan staleness."""
+
+        return tuple(
+            obligation.request_id
+            for obligation in self._restore_obligation_index().active()
+            if obligation.state == RestoreObligationState.TICKET_READY
+            and obligation.request_id in entries
+            and entries[obligation.request_id].state
+            == AdmissionSideState.VISIBLE_PENDING
+        )
+
     def _sync_visible_gate_state(
         self,
         request_id: str,
@@ -5320,23 +10713,72 @@ class EmbeddedSGLangRuntime:
             )
         cooldowns = getattr(self, "_retraction_cooldown_until_by_request", {})
         cooldown_until = cooldowns.get(request_id, 0.0)
-        if self._now_ms() < cooldown_until:
-            self.controller.visible_admission.set_policy_blocked(
-                request_id, reason="retraction_cooldown"
+        obligation = self._restore_obligation_index().get(request_id)
+        if obligation is not None and not obligation.state.terminal:
+            if (
+                obligation.native_admission_fallback
+                and obligation.state == RestoreObligationState.TICKET_READY
+            ):
+                self.controller.visible_admission.set_visible(request_id)
+                return
+            required = self._request_path_extent_ids(
+                req, metadata.context_id, cpu_only=True
             )
-            return
-        cooldowns.pop(request_id, None)
-        transaction = getattr(
-            self, "_pending_running_retraction_transaction", None
-        )
-        if transaction is not None and transaction.stage in {
-            "residency_pending",
-            "residency_wait_queue",
-        }:
-            self.controller.visible_admission.set_policy_blocked(
-                request_id,
-                reason=f"retraction_residency_pending:{transaction.transaction_id}",
+            if required is None:
+                required = obligation.required_extent_ids
+            obligation.set_required_extents(
+                required,
+                restore_bytes=self._extent_ids_bytes(required),
+                now_ms=self._now_ms(),
             )
+            if not obligation.source_transaction_terminal:
+                self.controller.visible_admission.set_wait_restore(
+                    request_id,
+                    required or (f"obligation:{obligation.obligation_id}",),
+                    reason="retraction_source_d2h_pending",
+                )
+            elif required or obligation.pending_command_id is not None:
+                self.controller.visible_admission.set_wait_restore(
+                    request_id,
+                    required or (f"obligation:{obligation.obligation_id}",),
+                    reason=(
+                        "h2d_inflight"
+                        if obligation.state == RestoreObligationState.H2D_INFLIGHT
+                        else "restore_obligation_pending"
+                    ),
+                )
+            else:
+                lease = self._restore_lease_index().get(request_id)
+                lease_ready = (
+                    not bool(getattr(self.config, "restore_lease_enabled", True))
+                    or (
+                        lease is not None
+                        and lease.state
+                        in {
+                            RestoreLeaseState.RESTORED_RESERVED,
+                            RestoreLeaseState.ADMISSION_COMMITTING,
+                            RestoreLeaseState.ADMITTED,
+                        }
+                        and (
+                            obligation.restored_bytes == 0
+                            or request_id in self._restore_lease_pins
+                            or lease.state
+                            in {
+                                RestoreLeaseState.ADMISSION_COMMITTING,
+                                RestoreLeaseState.ADMITTED,
+                            }
+                        )
+                    )
+                )
+                if lease_ready:
+                    obligation.mark_ticket_ready(now_ms=self._now_ms())
+                    self.controller.visible_admission.set_visible(request_id)
+                else:
+                    self.controller.visible_admission.set_wait_restore(
+                        request_id,
+                        (f"obligation:{obligation.obligation_id}",),
+                        reason="restore_lease_pending",
+                    )
             return
         if self._metadata_scope_is_terminal(metadata):
             self.controller.visible_admission.set_policy_blocked(
@@ -5350,21 +10792,72 @@ class EmbeddedSGLangRuntime:
             metadata.context_id in self._pending_h2d_contexts
             or restore_bundle_ids
         ):
+            obligation = None
+            if restore_bundle_ids:
+                obligation = self._ensure_ordinary_waiting_restore_obligation(
+                    request_id,
+                    metadata,
+                    req,
+                    restore_bundle_ids,
+                    now_ms=self._now_ms(),
+                )
+            if metadata.context_id in self._pending_h2d_contexts:
+                restore_reason = "h2d_inflight"
+            elif obligation is not None:
+                restore_reason = "restore_obligation_pending"
+            else:
+                restore_reason = "restore_obligation_capacity"
             self.controller.visible_admission.set_wait_restore(
                 request_id,
                 restore_bundle_ids or (f"context:{metadata.context_id}",),
-                reason=(
-                    "h2d_inflight"
-                    if metadata.context_id in self._pending_h2d_contexts
-                    else "cpu_prefix_requires_restore"
-                ),
-            )
-        elif transition_open:
-            self.controller.visible_admission.set_policy_blocked(
-                request_id, reason="transition_open"
+                reason=restore_reason,
             )
         else:
-            self.controller.visible_admission.set_visible(request_id)
+            overdue_restore = self._overdue_restore_obligation(
+                now_ms=self._now_ms()
+            )
+            bypass_request_id = getattr(
+                self, "_restore_bypass_request_id", None
+            )
+            if (
+                overdue_restore is not None
+                and request_id != overdue_restore.request_id
+                and request_id != bypass_request_id
+            ):
+                self.controller.visible_admission.set_policy_blocked(
+                    request_id,
+                    reason=(
+                        f"restore_debt_barrier:{overdue_restore.obligation_id}"
+                    ),
+                )
+                return
+            if self._now_ms() < cooldown_until:
+                self.controller.visible_admission.set_policy_blocked(
+                    request_id, reason="retraction_cooldown"
+                )
+                return
+            cooldowns.pop(request_id, None)
+            transaction = getattr(
+                self, "_pending_running_retraction_transaction", None
+            )
+            if transaction is not None and transaction.stage in {
+                "residency_pending",
+                "residency_wait_queue",
+            }:
+                self.controller.visible_admission.set_policy_blocked(
+                    request_id,
+                    reason=(
+                        "retraction_residency_pending:"
+                        f"{transaction.transaction_id}"
+                    ),
+                )
+                return
+            if transition_open:
+                self.controller.visible_admission.set_policy_blocked(
+                    request_id, reason="transition_open"
+                )
+            else:
+                self.controller.visible_admission.set_visible(request_id)
 
     def _workflow_transition_state(self, workflow_id: str) -> tuple[int, bool]:
         state = self.controller._transition_by_workflow.get(workflow_id, {})
@@ -5387,32 +10880,36 @@ class EmbeddedSGLangRuntime:
     ) -> tuple[str, ...]:
         """Return only CPU extents on this request's matched Radix path."""
 
-        node = getattr(req, "last_node", None) if req is not None else None
-        registry = getattr(self, "registry", None)
-        tree_cache = getattr(self, "tree_cache", None)
-        root = getattr(tree_cache, "root_node", None)
-        if node is None or registry is None or root is None:
-            return self._context_restore_bundle_ids(context_id)
-        page_index = self.controller.page_index
-        result: list[str] = []
-        seen: set[int] = set()
-        while node is not None and node is not root:
-            identity = id(node)
-            if identity in seen:
-                raise SGLangBackendError("Radix parent cycle detected")
-            seen.add(identity)
-            handle = registry.current_handle(int(node.id))
-            if handle is None:
-                return self._context_restore_bundle_ids(context_id)
-            page = page_index.pages.get(handle)
-            if page is None or page.residency == PhysicalResidency.DEAD:
-                return self._context_restore_bundle_ids(context_id)
-            if page.cpu_resident and not page.gpu_resident:
-                result.append(
-                    f"page:{handle.page_id}:{handle.allocation_generation}"
-                )
-            node = getattr(node, "parent", None)
-        return tuple(sorted(result))
+        result = self._request_path_extent_ids(req, context_id, cpu_only=True)
+        return (
+            self._context_restore_bundle_ids(context_id)
+            if result is None
+            else result
+        )
+
+    def _extent_ids_bytes(self, extent_ids: tuple[str, ...]) -> int:
+        total = 0
+        for extent_id in extent_ids:
+            try:
+                handle = self._runtime_page_handle_from_extent_id(extent_id)
+            except ValueError:
+                continue
+            page = self.controller.page_index.pages.get(handle)
+            if page is not None and page.residency != PhysicalResidency.DEAD:
+                total += page.size_bytes
+        return total
+
+    @staticmethod
+    def _runtime_page_handle_from_extent_id(extent_id: str) -> PageHandle:
+        parts = extent_id.split(":")
+        if len(parts) == 3 and parts[0] == "page":
+            try:
+                return PageHandle(int(parts[1]), int(parts[2]))
+            except ValueError as error:
+                raise ValueError(
+                    f"invalid runtime page extent ID: {extent_id}"
+                ) from error
+        return page_handle_from_extent_id(extent_id)
 
     def _context_bundle_generations(self, context_id: str) -> dict[str, str]:
         page_index = self.controller.page_index
@@ -5458,6 +10955,30 @@ class EmbeddedSGLangRuntime:
                 self.controller.visible_admission.set_wait_restore(
                     entry.request.request_id,
                     bundle_ids,
+                    reason=reason,
+                )
+
+    def _mark_h2d_waiters(
+        self,
+        context_id: str,
+        *,
+        restored_extent_ids: tuple[str, ...],
+        reason: str,
+    ) -> None:
+        restored = frozenset(restored_extent_ids)
+        waiting = {
+            str(req.rid): req
+            for req in tuple(getattr(self.scheduler, "waiting_queue", ()) or ())
+        }
+        for entry in tuple(self.controller.visible_admission.entries()):
+            if entry.request.context_id != context_id:
+                continue
+            req = waiting.get(entry.request.request_id)
+            required = self._request_restore_bundle_ids(req, context_id)
+            if required and (not restored or restored.intersection(required)):
+                self.controller.visible_admission.set_wait_restore(
+                    entry.request.request_id,
+                    required,
                     reason=reason,
                 )
 
@@ -5508,12 +11029,26 @@ class EmbeddedSGLangRuntime:
         bundle_ids: tuple[str, ...],
         status: CommandStatus,
     ) -> None:
-        remaining = self._context_restore_bundle_ids(context_id)
-        self._mark_context_wait_restore(
-            context_id,
-            bundle_ids=remaining or bundle_ids or (f"context:{context_id}",),
-            reason=f"h2d_{status.value}",
-        )
+        waiting = {
+            str(req.rid): req
+            for req in tuple(getattr(self.scheduler, "waiting_queue", ()) or ())
+        }
+        for entry in tuple(self.controller.visible_admission.entries()):
+            if entry.request.context_id != context_id:
+                continue
+            request_id = entry.request.request_id
+            req = waiting.get(request_id)
+            remaining = self._request_restore_bundle_ids(req, context_id)
+            if remaining:
+                self.controller.visible_admission.set_wait_restore(
+                    request_id,
+                    remaining,
+                    reason=f"h2d_{status.value}",
+                )
+                continue
+            metadata = self._request_metadata_by_id.get(request_id)
+            if metadata is not None:
+                self._sync_visible_gate_state(request_id, metadata, req=req)
 
     def _capture_request_physical_start(
         self,
@@ -5525,6 +11060,9 @@ class EmbeddedSGLangRuntime:
         if starts is None:
             starts = {}
             self._request_physical_start_by_id = starts
+        getattr(self, "_aborted_request_physical_start_by_id", {}).pop(
+            str(req.rid), None
+        )
         try:
             checkpoint = self._context_physical_checkpoint(metadata.context_id)
             origin_input_ids = getattr(req, "origin_input_ids", None)
@@ -5562,6 +11100,18 @@ class EmbeddedSGLangRuntime:
                 ),
                 "allocator_page_size_tokens": page_size,
                 "checkpoint_ts_ms": now_ms,
+                "submitted_ts_ms": getattr(
+                    self, "_request_submitted_ts_by_id", {}
+                ).get(str(req.rid)),
+                "queue_wait_ms": max(
+                    0.0,
+                    now_ms
+                    - float(
+                        getattr(self, "_request_submitted_ts_by_id", {}).get(
+                            str(req.rid), now_ms
+                        )
+                    ),
+                ),
             }
             starts[str(req.rid)] = value
             self.audit.emit("request_physical_start", now_ms, **value)
@@ -5576,6 +11126,96 @@ class EmbeddedSGLangRuntime:
                 context_id=metadata.context_id,
                 error=f"{type(error).__name__}: {error}",
             )
+
+    def _enforce_queue_timeouts(self, *, now_ms: float) -> None:
+        starts = getattr(self, "_request_physical_start_by_id", {})
+        submitted = getattr(self, "_request_submitted_ts_by_id", {})
+        if not submitted:
+            return
+        timed_out = getattr(self, "_queue_timeout_request_ids", set())
+        timeout_ms = float(self.config.request_queue_timeout_ms)
+        for request_id, submitted_ms in tuple(submitted.items()):
+            if request_id in starts or request_id in timed_out:
+                continue
+            metadata = self._request_metadata_by_id.get(request_id)
+            if metadata is None:
+                continue
+            elapsed_ms = max(0.0, now_ms - float(submitted_ms))
+            if elapsed_ms < timeout_ms:
+                continue
+            timed_out.add(request_id)
+            self._terminal_cancelled_request_ids.add(request_id)
+            self.audit.emit(
+                "request_queue_timeout",
+                now_ms,
+                request_id=request_id,
+                workflow_id=metadata.root_workflow_id,
+                invocation_id=metadata.invocation_id,
+                submitted_ts_ms=submitted_ms,
+                queue_wait_ms=elapsed_ms,
+                queue_timeout_ms=timeout_ms,
+                timeout_scope="submission_to_physical_start",
+            )
+            self.scheduler.abort_request(self._new_abort_request(request_id))
+
+    def _enforce_execution_timeouts(self, *, now_ms: float) -> None:
+        starts = getattr(self, "_request_physical_start_by_id", {})
+        timed_out = getattr(self, "_execution_timeout_request_ids", set())
+        ledger = getattr(self, "_lock_service_ledger", None)
+        for request_id, checkpoint in tuple(starts.items()):
+            if request_id in timed_out:
+                continue
+            metadata = self._request_metadata_by_id.get(request_id)
+            if metadata is None or metadata.execution_timeout_s is None:
+                continue
+            started_ms = float(checkpoint.get("checkpoint_ts_ms", now_ms))
+            elapsed_ms = max(0.0, now_ms - started_ms)
+            timeout_ms = metadata.execution_timeout_s * 1000.0
+            progress = (
+                ledger.progress_record(request_id)
+                if ledger is not None
+                else None
+            )
+            no_progress_ms = (
+                ledger.stale_for_ms(request_id, now_ms=now_ms)
+                if progress is not None
+                else elapsed_ms
+            )
+            if no_progress_ms < timeout_ms:
+                continue
+            timed_out.add(request_id)
+            self._terminal_cancelled_request_ids.add(request_id)
+            self.audit.emit(
+                "request_execution_timeout",
+                now_ms,
+                request_id=request_id,
+                workflow_id=metadata.root_workflow_id,
+                invocation_id=metadata.invocation_id,
+                execution_started_ts_ms=started_ms,
+                execution_elapsed_ms=elapsed_ms,
+                last_gpu_service_ts_ms=(
+                    progress.last_completed_service_ts_ms
+                    if progress is not None
+                    else None
+                ),
+                completed_gpu_service_count=(
+                    progress.completed_service_count
+                    if progress is not None
+                    else 0
+                ),
+                gpu_service_no_progress_ms=no_progress_ms,
+                execution_timeout_ms=timeout_ms,
+                timeout_kind="gpu_service_inactivity",
+                timeout_scope=(
+                    "last_completed_gpu_service_to_scheduler_abort"
+                    if progress is not None
+                    and progress.last_completed_service_ts_ms is not None
+                    else "first_gpu_selection_to_scheduler_abort"
+                    if progress is not None
+                    else "physical_start_to_scheduler_abort_fallback"
+                ),
+            )
+            self.scheduler.abort_request(self._new_abort_request(request_id))
 
     def _queue_request_physical_finish(
         self,
@@ -5608,9 +11248,12 @@ class EmbeddedSGLangRuntime:
         if getattr(controller, "inflight_command_ids", ()):
             return
         starts = getattr(self, "_request_physical_start_by_id", {})
+        aborted_starts = getattr(
+            self, "_aborted_request_physical_start_by_id", {}
+        )
         now_ms = self._now_ms()
         for request_id, finish in tuple(sorted(pending.items())):
-            start = starts.get(request_id)
+            start = starts.get(request_id) or aborted_starts.get(request_id)
             if start is None:
                 self.audit.emit(
                     "request_physical_checkpoint_failed",
@@ -5654,6 +11297,9 @@ class EmbeddedSGLangRuntime:
                 )
                 fields = {
                     **finish,
+                    "request_aborted_during_finish": request_id in aborted_starts,
+                    "request_abort_reason": start.get("abort_reason"),
+                    "request_abort_ts_ms": start.get("abort_ts_ms"),
                     "checkpoint_ts_ms": now_ms,
                     "prompt_tokens": int(start["prompt_tokens"]),
                     "observed_cache_hit_tokens": int(start["cache_hit_tokens"]),
@@ -5719,6 +11365,7 @@ class EmbeddedSGLangRuntime:
                 )
             finally:
                 starts.pop(request_id, None)
+                aborted_starts.pop(request_id, None)
                 pending.pop(request_id, None)
 
     def _context_physical_checkpoint(self, context_id: str) -> dict[str, Any]:
@@ -5758,6 +11405,17 @@ class EmbeddedSGLangRuntime:
         metadata = self._metadata(req)
         if metadata is None:
             return
+        self._finish_restore_obligation(
+            str(req.rid),
+            RestoreObligationState.SATISFIED,
+            now_ms=float(self._now_ms()),
+            reason="request_finished_after_restore",
+        )
+        self._cancel_restore_service_grace(
+            str(req.rid),
+            now_ms=float(self._now_ms()),
+            reason="request_finished",
+        )
         last_node = self._match_terminal_node(token_ids)
         if last_node is not None:
             self._terminal_node_by_context[metadata.context_id] = last_node
@@ -5776,10 +11434,15 @@ class EmbeddedSGLangRuntime:
         logical_scope_terminal = self._metadata_scope_is_terminal(metadata)
         terminal_cancelled = terminal_marker or logical_scope_terminal
         self._terminal_cancelled_request_ids.discard(req.rid)
+        getattr(self, "_queue_timeout_request_ids", set()).discard(req.rid)
+        getattr(self, "_execution_timeout_request_ids", set()).discard(req.rid)
         self._request_metadata_by_id.pop(req.rid, None)
         getattr(self, "_request_submitted_ts_by_id", {}).pop(req.rid, None)
         if terminal_cancelled:
             getattr(self, "_request_physical_start_by_id", {}).pop(req.rid, None)
+            getattr(self, "_aborted_request_physical_start_by_id", {}).pop(
+                req.rid, None
+            )
             getattr(self, "_pending_request_physical_finish_by_id", {}).pop(
                 req.rid, None
             )
@@ -5877,8 +11540,28 @@ class EmbeddedSGLangRuntime:
         if ledger is not None:
             ledger.clear()
         getattr(self, "_request_physical_start_by_id", {}).clear()
+        getattr(self, "_aborted_request_physical_start_by_id", {}).clear()
         getattr(self, "_pending_request_physical_finish_by_id", {}).clear()
         self._request_partial_commit_count.clear()
+        index = getattr(self, "_restore_obligations", None)
+        if index is not None:
+            for obligation in index.active():
+                self._finish_restore_obligation(
+                    obligation.request_id,
+                    RestoreObligationState.FAILED,
+                    now_ms=float(self._now_ms()),
+                    reason="authoritative_cache_reset",
+                )
+        for request_id in tuple(
+            getattr(self, "_restore_service_grace_by_request", {})
+        ):
+            self._cancel_restore_service_grace(
+                request_id,
+                now_ms=float(self._now_ms()),
+                reason="authoritative_cache_reset",
+            )
+        getattr(self, "_restore_command_to_request", {}).clear()
+        getattr(self, "_restore_funding_target_by_command", {}).clear()
         self._mark_full_tree_rebuild()
 
     def _record_request_token_trace(
@@ -5983,6 +11666,26 @@ class EmbeddedSGLangRuntime:
             context_epoch=context.epoch if context is not None else None,
             command_kind=source,
             compute_phase="native_hicache",
+            host_copy_state=str(record.get("host_copy_state", "unknown")),
+            pinned_host=(
+                bool(record["pinned_host"])
+                if record.get("pinned_host") is not None
+                else None
+            ),
+            native_concurrent_bytes=max(
+                0,
+                int(record.get("native_inflight_token_count", token_count))
+                * self.config.kv_bytes_per_token,
+            ),
+            allocator_submit_ms=(
+                max(0.0, float(record["allocator_submit_ms"]))
+                if record.get("allocator_submit_ms") is not None
+                else None
+            ),
+            callback_overhead_ms=max(
+                0.0, float(self._now_ms()) - complete_ts_ms
+            ),
+            start_timestamp_semantics="unavailable",
         )
         self._emit_transfer_telemetry(
             telemetry,
@@ -5990,6 +11693,9 @@ class EmbeddedSGLangRuntime:
             backend_operation_id=record.get("backend_operation_id"),
             radix_node_ids=node_ids,
             owner_context_ids=tuple(sorted(owner_context_ids)),
+            native_inflight_operation_count_at_submit=record.get(
+                "native_inflight_operation_count"
+            ),
             start_timestamp_observed=False,
         )
 
@@ -6029,6 +11735,30 @@ class EmbeddedSGLangRuntime:
     def _process_events(self, events: tuple[RuntimeEvent, ...]) -> None:
         committed_events, adjustments = self._commit_event_times(events)
         self.controller.process_runtime_events(committed_events)
+        for event in committed_events:
+            if (
+                event.kind == RuntimeEventKind.CONTEXT_COMPACT
+                and event.context_id is not None
+            ):
+                previous_terminal = self._terminal_node_by_context.pop(
+                    event.context_id, None
+                )
+                self._mark_context_dirty(event.context_id)
+                self.audit.emit(
+                    "context_compaction_committed",
+                    event.ts_ms,
+                    workflow_id=event.workflow_id,
+                    invocation_id=event.invocation_id,
+                    context_id=event.context_id,
+                    context_epoch=event.context_epoch,
+                    previous_context_epoch=event.attributes.get(
+                        "previous_context_epoch"
+                    ),
+                    previous_terminal_present=previous_terminal is not None,
+                    old_kv_disposition=event.attributes.get(
+                        "old_kv_disposition"
+                    ),
+                )
         for event in committed_events:
             consumer_delta = self.controller.data_consumers.delta_for_event(
                 event.event_id
@@ -6644,6 +12374,13 @@ class EmbeddedSGLangRuntime:
             "context_epoch": telemetry.context_epoch,
             "command_kind": telemetry.command_kind,
             "compute_phase": telemetry.compute_phase,
+            "host_copy_state": telemetry.host_copy_state,
+            "pinned_host": telemetry.pinned_host,
+            "native_concurrent_bytes": telemetry.native_concurrent_bytes,
+            "allocator_wait_ms": telemetry.allocator_wait_ms,
+            "allocator_submit_ms": telemetry.allocator_submit_ms,
+            "callback_overhead_ms": telemetry.callback_overhead_ms,
+            "start_timestamp_semantics": telemetry.start_timestamp_semantics,
             **extra_fields,
         }
         observed_ts_ms = max(float(self._now_ms()), telemetry.complete_ts_ms)
@@ -6832,6 +12569,16 @@ class EmbeddedSGLangRuntime:
             untracked_allocator_delta_bytes=max(
                 0, observation.hbm_used_bytes - page_index_gpu_bytes
             ),
+            restore_lease_reserved_bytes=(
+                getattr(self, "_restore_leases", None).reserved_bytes
+                if getattr(self, "_restore_leases", None) is not None
+                else 0
+            ),
+            active_restore_lease_count=len(
+                getattr(self, "_restore_leases", None).active()
+                if getattr(self, "_restore_leases", None) is not None
+                else ()
+            ),
             engine_locked_gpu_bytes=(
                 breakdown.engine_locked_bytes if breakdown is not None else None
             ),
@@ -6864,6 +12611,7 @@ class EmbeddedSGLangRuntime:
             **lock_service_fields,
         )
         self._last_resource_telemetry_ms = now_ms
+        self._write_latest_runtime_summary(now_ms=now_ms, force=False)
 
     def _runtime_resource_observation(
         self, *, now_ms: float | None = None
@@ -6935,7 +12683,34 @@ class EmbeddedSGLangRuntime:
         runnable_signature = self._joint_shadow_runnable_signature(
             additional_runnable
         )
-        control_state = self.controller.policy_control_state(observation.ts_ms)
+        control_state = dict(
+            self.controller.policy_control_state(observation.ts_ms)
+        )
+        restore_lease_index = getattr(self, "_restore_leases", None)
+        liveness_tracker = getattr(
+            self, "_persistent_liveness_revisions", None
+        )
+        if liveness_tracker is None:
+            liveness_tracker = PersistentLivenessRevisionTracker()
+            self._persistent_liveness_revisions = liveness_tracker
+        liveness = liveness_tracker.observe(
+            obligations=self._restore_obligation_index().all(),
+            leases=(restore_lease_index.all() if restore_lease_index else ()),
+            graces=tuple(
+                getattr(self, "_restore_service_grace_by_request", {}).values()
+            ),
+        )
+        control_state["persistent_liveness"] = liveness.to_dict()
+        action_frontier = self.controller.action_frontier_observer
+        control_state["action_frontier"] = {
+            "revision": action_frontier.revision,
+            # Coverage is only consumed by a captured delta and is not part of
+            # any change signature; it is computed lazily at capture time.
+            "coverage": None,
+            "observer_error_count": getattr(
+                self.controller, "_action_frontier_observer_errors", 0
+            ),
+        }
         stamp = JointShadowStateStamp(
             graph_version=self.controller.graph.graph_version,
             consumer_version=self.controller.data_consumers.version,
@@ -6947,7 +12722,54 @@ class EmbeddedSGLangRuntime:
             runnable_signature=runnable_signature,
             hbm_used_bytes=observation.hbm_used_bytes,
             host_free_bytes=observation.host_free_bytes,
+            obligation_revision=liveness.obligation_revision,
+            lease_revision=liveness.lease_revision,
+            grace_revision=liveness.grace_revision,
+            parser_frontier_revision=action_frontier.revision,
         )
+        elapsed = (
+            float("inf")
+            if self._last_policy_snapshot_ms is None
+            else observation.ts_ms - self._last_policy_snapshot_ms
+        )
+        watchdog_due = bool(additional_runnable) and elapsed >= (
+            self.config.reference_policy_snapshot_min_interval_ms
+        )
+        # Cheap structural pre-check: every field that can feed the full
+        # structural/physical signatures is represented here. When none of
+        # them changed, no snapshot capture can fire and no new shadow result
+        # is pending, so the expensive signature construction and coverage
+        # computation can be skipped without changing observable behavior.
+        cheap_signature = (
+            stamp.graph_version,
+            stamp.consumer_version,
+            stamp.event_sequence,
+            stamp.page_revision,
+            stamp.topology_revision,
+            stamp.fairness_revision,
+            stamp.transfer_epoch,
+            stamp.runnable_signature,
+            stamp.parser_frontier_revision,
+            stamp.obligation_revision,
+            stamp.lease_revision,
+            stamp.grace_revision,
+            observation.hbm_used_bytes
+            // self.config.reference_policy_hbm_bucket_bytes,
+            observation.host_used_bytes,
+            observation.host_free_bytes,
+            observation.pcie_utilization,
+            observation.gpu_compute_utilization,
+            self.controller.transfer_backlog_bytes(),
+        )
+        if (
+            cheap_signature
+            == getattr(self, "_last_policy_snapshot_cheap_signature", None)
+            and not watchdog_due
+            and result is None
+        ):
+            self._joint_shadow_counts["incremental_snapshot_skipped"] += 1
+            return
+        self._last_policy_snapshot_cheap_signature = cheap_signature
         # Queue/graph transitions publish immediately. Fairness service and
         # allocator progress change on nearly every decode quantum, so they
         # belong to the interval-gated progress signature below.
@@ -6955,6 +12777,10 @@ class EmbeddedSGLangRuntime:
             stamp.graph_version,
             stamp.consumer_version,
             stamp.transfer_epoch,
+            stamp.obligation_revision,
+            stamp.lease_revision,
+            stamp.grace_revision,
+            stamp.parser_frontier_revision,
             runnable_signature,
             tuple(
                 (
@@ -6996,14 +12822,6 @@ class EmbeddedSGLangRuntime:
         )
         physical_changed = (
             physical_signature != self._last_policy_snapshot_physical_signature
-        )
-        elapsed = (
-            float("inf")
-            if self._last_policy_snapshot_ms is None
-            else observation.ts_ms - self._last_policy_snapshot_ms
-        )
-        watchdog_due = bool(additional_runnable) and elapsed >= (
-            self.config.reference_policy_snapshot_min_interval_ms
         )
         changed_snapshot_due = (
             structural_changed
@@ -7050,6 +12868,10 @@ class EmbeddedSGLangRuntime:
                     urgent_d2h_bytes=urgent_d2h,
                     urgent_h2d_bytes=urgent_h2d,
                 )
+                control_state["action_frontier"] = {
+                    **control_state["action_frontier"],
+                    "coverage": action_frontier.coverage().to_dict(),
+                }
                 fairness_accounts = tuple(
                     WorkflowFairnessReplica(
                         workflow_id=workflow_id,
@@ -7079,6 +12901,9 @@ class EmbeddedSGLangRuntime:
                     stamp=stamp,
                     trigger=trigger,
                     captured_monotonic_ms=time.monotonic_ns() / 1_000_000.0,
+                    frontier_predictions=dict(
+                        self._last_frontier_predictions or {}
+                    ),
                 )
                 submission = worker.submit_delta(delta)
             except Exception as error:
@@ -7088,7 +12913,7 @@ class EmbeddedSGLangRuntime:
                     observation.ts_ms,
                     error=f"{type(error).__name__}: {error}",
                     trigger=trigger,
-                    application_connected=False,
+                    application_connected=self.config.joint_policy_enabled,
                 )
             else:
                 capture_ms = (
@@ -7128,7 +12953,7 @@ class EmbeddedSGLangRuntime:
                     replaced_sequence=submission.replaced_sequence,
                     worker_pending_count=worker_stats.pending_count,
                     worker_busy=worker_stats.busy,
-                    application_connected=False,
+                    application_connected=self.config.joint_policy_enabled,
                 )
             finally:
                 self._last_policy_snapshot_structural_signature = (
@@ -7153,7 +12978,7 @@ class EmbeddedSGLangRuntime:
                 worker_sequence=result.sequence,
                 source_snapshot_id=result.snapshot_id,
                 error=result.error or "worker returned no PolicyInput",
-                application_connected=False,
+                application_connected=self.config.joint_policy_enabled,
             )
             return
 
@@ -7432,7 +13257,7 @@ class EmbeddedSGLangRuntime:
                     worker_sequence=result.sequence,
                     source_snapshot_id=result.snapshot_id,
                     error=error_text,
-                    application_connected=False,
+                    application_connected=self.config.joint_policy_enabled,
                 )
         else:
             build_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
@@ -7499,7 +13324,7 @@ class EmbeddedSGLangRuntime:
                             observation.ts_ms,
                             snapshot_id=policy_input.snapshot_id,
                             error=f"{type(error).__name__}: {error}",
-                            application_connected=False,
+                            application_connected=self.config.joint_policy_enabled,
                         )
                     else:
                         self._joint_shadow_counts["submitted"] += 1
@@ -7524,7 +13349,7 @@ class EmbeddedSGLangRuntime:
                             replaced_sequence=submission.replaced_sequence,
                             worker_pending_count=worker_stats.pending_count,
                             worker_busy=worker_stats.busy,
-                            application_connected=False,
+                            application_connected=self.config.joint_policy_enabled,
                         )
             if result is not None:
                 self._record_joint_shadow_result(
@@ -7638,6 +13463,1044 @@ class EmbeddedSGLangRuntime:
             strict_global_reasons=strict_global_reasons,
         )
 
+    def _online_joint_admission_decision(
+        self,
+        *,
+        now_ms: float,
+    ) -> OnlineJointPlanDecision:
+        if not self.config.joint_policy_enabled:
+            return OnlineJointPlanDecision(None, "disabled")
+        result = getattr(self, "_online_joint_result", None)
+        source = getattr(self, "_online_joint_source", None)
+        if result is None or source is None or result.plan is None:
+            self._online_joint_counts["fallback_no_plan"] += 1
+            return OnlineJointPlanDecision(None, "no_validated_plan")
+        cached = getattr(self, "_current_online_joint_decision", None)
+        reuse = False
+        try:
+            signature_matches = True
+            if (
+                self._last_joint_signature_check_ms is None
+                or now_ms - self._last_joint_signature_check_ms
+                >= _JOINT_SIGNATURE_CHECK_INTERVAL_MS
+            ):
+                self._last_joint_signature_check_ms = now_ms
+                signature_matches = (
+                    self._joint_decision_state_signature(now_ms)
+                    == self._last_joint_decision_state_signature
+                )
+            reuse = (
+                cached is not None
+                and self._last_joint_decision_plan_id == result.plan.plan_id
+                and self._last_joint_decision_ms is not None
+                and now_ms - self._last_joint_decision_ms
+                < _JOINT_DECISION_REUSE_INTERVAL_MS
+                and signature_matches
+            )
+        except Exception:
+            reuse = False
+        if reuse:
+            self._online_joint_counts["safe_point_decision_reused"] += 1
+            return cached
+        commit_started_ns = time.perf_counter_ns()
+        try:
+            observation = self._runtime_resource_observation(now_ms=now_ms)
+            current_runnable = self._policy_runtime_runnable(now_ms)
+            current_control_state = self.controller.policy_control_state(now_ms)
+            current_state = self._joint_plan_current_state(
+                result,
+                source=source,
+                observation=observation,
+                current_runnable=current_runnable,
+                current_control_state=current_control_state,
+                strict_global_reasons=(),
+            )
+            validation = validate_joint_plan_components(
+                result.plan,
+                source,
+                current_state,
+            )
+            decision = compile_online_joint_view(
+                result.plan,
+                validation,
+                visible_request_ids=(
+                    item.request_id for item in current_runnable
+                ),
+                epoch_sequence=self._online_joint_epoch_sequence + 1,
+            )
+            if result.plan.semantic_residency and decision.view is not None:
+                decision = self._physical_commit_semantic_residency(
+                    result.plan,
+                    decision,
+                    now_ms=now_ms,
+                )
+        except Exception as error:
+            self._online_joint_counts["fallback_validation_error"] += 1
+            self.audit.emit(
+                "online_joint_plan_fallback",
+                now_ms,
+                plan_id=result.plan.plan_id,
+                reason="current_state_validation_error",
+                error=f"{type(error).__name__}: {error}",
+            )
+            return OnlineJointPlanDecision(None, "current_state_validation_error")
+        commit_ms = (time.perf_counter_ns() - commit_started_ns) / 1_000_000.0
+        self._joint_shadow_timing_samples["physical_commit_ms"].append(commit_ms)
+        if commit_ms > self.config.joint_physical_commit_budget_ms:
+            self._online_joint_counts["physical_commit_budget_exceeded"] += 1
+            self._record_joint_decision_cache(now_ms=now_ms)
+            self.audit.emit(
+                "online_joint_physical_commit_budget_exceeded",
+                now_ms,
+                plan_id=result.plan.plan_id,
+                elapsed_ms=commit_ms,
+                budget_ms=self.config.joint_physical_commit_budget_ms,
+                action="publish_safe_point_seed",
+            )
+            return OnlineJointPlanDecision(
+                None, "physical_commit_budget_exceeded"
+            )
+        if decision.view is None:
+            self._online_joint_counts[f"fallback_{decision.reason}"] += 1
+        else:
+            self._online_joint_counts["current_state_applicable"] += 1
+            self._online_joint_validation = validation
+            self._online_joint_epoch_sequence += 1
+            self._current_joint_plan_epoch = decision.epoch
+            if decision.epoch is not None:
+                self._online_joint_counts[
+                    f"epoch_{decision.epoch.planner_mode.value}"
+                ] += 1
+                self._online_joint_counts[
+                    f"epoch_{decision.reason}"
+                ] += 1
+                self.audit.emit(
+                    "online_joint_epoch_committed",
+                    now_ms,
+                    epoch_id=decision.epoch.epoch_id,
+                    plan_id=decision.epoch.source_plan_id,
+                    planner_mode=decision.epoch.planner_mode.value,
+                    commit_reason=decision.reason,
+                    source_action_count=decision.epoch.source_action_count,
+                    committed_action_count=(
+                        decision.epoch.committed_action_count
+                    ),
+                    actionable_coverage=decision.epoch.actionable_coverage,
+                    rejected_slices=[
+                        {
+                            "slice_id": item.slice_id,
+                            "kind": item.kind,
+                            "action_key": item.action_key,
+                            "reasons": list(item.reasons),
+                        }
+                for item in decision.epoch.action_slices
+                if not item.committed
+                ],
+            )
+        self._record_joint_decision_cache(now_ms=now_ms)
+        return decision
+
+    def _joint_decision_state_signature(self, now_ms: float) -> tuple[object, ...]:
+        """Cheap state signature for reusing the online joint decision.
+
+        Every field that can change the admission decision or the fallback
+        seed epoch is represented here. When the plan id and this signature
+        are unchanged, re-validating would produce an identical decision, so
+        the cached decision can be reused.
+        """
+
+        runnable = self._policy_runtime_runnable(now_ms)
+        runnable_signature = self._joint_shadow_runnable_signature(runnable)
+        liveness_tracker = getattr(
+            self, "_persistent_liveness_revisions", None
+        )
+        if liveness_tracker is None:
+            liveness_tracker = PersistentLivenessRevisionTracker()
+            self._persistent_liveness_revisions = liveness_tracker
+        lease_index = getattr(self, "_restore_leases", None)
+        liveness = liveness_tracker.observe(
+            obligations=self._restore_obligation_index().all(),
+            leases=(lease_index.all() if lease_index is not None else ()),
+            graces=tuple(
+                getattr(self, "_restore_service_grace_by_request", {}).values()
+            ),
+        )
+        control_state = self.controller.policy_control_state(now_ms)
+        transfer_epoch = int(control_state.get("transfer_epoch", 0))
+        return (
+            self.controller.graph.graph_version,
+            self.controller.data_consumers.version,
+            self.controller.runtime_event_sequence,
+            self.controller.page_index.revision,
+            self.controller.page_index.topology_revision,
+            self.controller.fairness.revision,
+            transfer_epoch,
+            runnable_signature,
+            self.controller.action_frontier_observer.revision,
+            liveness.obligation_revision,
+            liveness.lease_revision,
+            liveness.grace_revision,
+            tuple(
+                (
+                    workflow_id,
+                    tuple(sorted(state.items())),
+                )
+                for workflow_id, state in sorted(
+                    control_state.get("transitions", {}).items()
+                )
+                if isinstance(state, Mapping)
+            ),
+            self.controller.actual_hbm_used_bytes
+            // self.config.reference_policy_hbm_bucket_bytes,
+            self.controller.signals.host_free_bytes,
+        )
+
+    def _record_joint_decision_cache(self, *, now_ms: float) -> None:
+        result = getattr(self, "_online_joint_result", None)
+        self._last_joint_decision_plan_id = (
+            result.plan.plan_id
+            if result is not None and result.plan is not None
+            else None
+        )
+        self._last_joint_decision_ms = now_ms
+        try:
+            self._last_joint_decision_state_signature = (
+                self._joint_decision_state_signature(now_ms)
+            )
+        except Exception:
+            self._last_joint_decision_state_signature = None
+
+    def _physical_commit_semantic_residency(
+        self,
+        plan: Any,
+        decision: OnlineJointPlanDecision,
+        *,
+        now_ms: float,
+    ) -> OnlineJointPlanDecision:
+        """Resolve at most one stable context target to a live Radix bundle."""
+
+        if decision.view is None or decision.epoch is None:
+            return decision
+        self._current_semantic_residency_commit = None
+        checked_slices: list[ActionSlice] = []
+        host_available = self.controller.signals.host_free_bytes
+        device_available = max(
+            0,
+            self.config.hbm_capacity_bytes
+            - self.controller.actual_hbm_used_bytes
+            - self.controller.admission.reserved_bytes,
+        )
+        selected: tuple[
+            int, SemanticResidencyTarget, PhysicalBundlePreview
+        ] | None = None
+        for index, target in enumerate(plan.semantic_residency):
+            reasons: list[str] = []
+            context = self.controller.graph.contexts.get(target.context_id)
+            if context is None:
+                reasons.append("context_missing")
+            elif context.epoch != target.context_epoch:
+                reasons.append("context_epoch_changed")
+            command_kind = self._online_residency_command_kind(target.action)
+            if command_kind is None:
+                reasons.append("no_physical_action")
+            elif (
+                command_kind == CommandKind.SHADOW_CONTEXT
+                and not self.config.shadow_enabled
+            ):
+                reasons.append("shadow_disabled")
+            candidates: list[PhysicalBundlePreview] = []
+            blockers: set[str] = set()
+            if not reasons and command_kind is not None:
+                previews = (
+                    self.controller.arbiter.bundle_builder.previews_for_context(
+                        command_kind,
+                        target.context_id,
+                        target.context_epoch,
+                        now_ms=now_ms,
+                        host_available_bytes=host_available,
+                        device_available_bytes=device_available,
+                    )
+                )
+                expected_actions = self._online_residency_expected_page_actions(
+                    target.action
+                )
+                for preview in previews:
+                    actual_actions = {
+                        item.action for item in preview.page_actions
+                    }
+                    if not actual_actions.intersection(expected_actions):
+                        continue
+                    if preview.eligible:
+                        candidates.append(preview)
+                    else:
+                        blockers.update(
+                            item.code.value for item in preview.blockers
+                        )
+                if not candidates:
+                    reasons.extend(
+                        f"physical:{item}" for item in sorted(blockers)
+                    )
+                    if not blockers:
+                        reasons.append("physical_preview_unavailable")
+            if reasons:
+                checked_slices.append(
+                    ActionSlice(
+                        slice_id=f"semantic-residency:{index}",
+                        kind="semantic_residency",
+                        action_key=target.context_id,
+                        dependency_keys=(),
+                        committed=False,
+                        reasons=tuple(reasons),
+                    )
+                )
+                continue
+            preview = min(
+                candidates,
+                key=lambda item: (
+                    item.bundle.closure_bytes,
+                    item.copy_bytes,
+                    item.context_id,
+                    item.bundle.bundle_id,
+                ),
+            )
+            checked_slices.append(
+                ActionSlice(
+                    slice_id=f"semantic-residency:{index}",
+                    kind="semantic_residency",
+                    action_key=target.context_id,
+                    dependency_keys=(),
+                    committed=True,
+                )
+            )
+            selected = (index, target, preview)
+            break
+
+        view = decision.view
+        if selected is not None:
+            index, target, preview = selected
+            view = replace(view, residency_intent_indices=(index,))
+            self._current_semantic_residency_commit = (
+                plan.plan_id,
+                index,
+                target,
+                preview,
+            )
+            self._online_joint_counts["semantic_physical_commit"] += 1
+        elif plan.semantic_residency:
+            self._online_joint_counts["semantic_physical_no_action"] += 1
+        slices = decision.epoch.action_slices + tuple(checked_slices)
+        epoch = replace(
+            decision.epoch,
+            view=view,
+            action_slices=slices,
+            source_action_count=len(slices),
+            committed_action_count=sum(item.committed for item in slices),
+        )
+        has_action = bool(
+            view.ordered_request_ids or view.residency_intent_indices
+        )
+        partial = any(not item.committed for item in slices)
+        return OnlineJointPlanDecision(
+            view,
+            (
+                "no_action"
+                if not has_action
+                else "partially_applicable"
+                if partial
+                else "applicable"
+            ),
+            epoch,
+        )
+
+    def _safe_point_seed_decision(
+        self, *, now_ms: float
+    ) -> OnlineJointPlanDecision:
+        runnable = self._policy_runtime_runnable(now_ms)
+        visible_ids = frozenset(item.request_id for item in runnable)
+        current = getattr(self, "_current_online_joint_decision", None)
+        current_epoch = getattr(self, "_current_joint_plan_epoch", None)
+        restore_requirements = tuple(
+            (
+                item.request_id,
+                item.required_extent_ids
+                or (f"obligation:{item.obligation_id}",),
+            )
+            for item in self._restore_obligation_index().active()
+            if item.request_id in visible_ids
+        )
+        if (
+            current is not None
+            and current.view is not None
+            and current_epoch is not None
+            and current_epoch.planner_mode
+            in {JointPlannerMode.BOUNDED_SEED, JointPlannerMode.EMERGENCY}
+            and visible_ids
+            == frozenset(
+                (*current.view.ordered_request_ids, *current.view.deferred_request_ids)
+            )
+            and current.view.restore_requirements == restore_requirements
+        ):
+            return current
+        workflow_ids = {item.workflow_id for item in runnable}
+        fair_order = self.controller.fairness.ordered(
+            workflow_ids,
+            memory_charges=self.controller.workflow_memory_charges(),
+            hbm_capacity_bytes=self.config.hbm_capacity_bytes,
+        )
+        active_workflow_ids = frozenset(
+            fair_order[: self.config.joint_workflow_active_window]
+        )
+        fair_rank = {workflow_id: rank for rank, workflow_id in enumerate(fair_order)}
+        frontier_rank = {
+            workflow_id: {
+                item.invocation_id: rank
+                for rank, item in enumerate(
+                    self.controller.frontier.candidates(workflow_id)
+                )
+            }
+            for workflow_id in workflow_ids
+        }
+        ordered = tuple(
+            item.request_id
+            for item in sorted(
+                (
+                    item
+                    for item in runnable
+                    if item.workflow_id in active_workflow_ids
+                ),
+                key=lambda item: (
+                    fair_rank.get(item.workflow_id, 1 << 30),
+                    frontier_rank.get(item.workflow_id, {}).get(
+                        item.invocation_id, 1 << 30
+                    ),
+                    item.submitted_ts_ms,
+                    item.request_id,
+                ),
+            )
+        )
+        self._online_joint_epoch_sequence += 1
+        decision = compile_bounded_seed_epoch(
+            ordered_request_ids=ordered,
+            visible_request_ids=visible_ids,
+            epoch_sequence=self._online_joint_epoch_sequence,
+            emergency=(
+                self.controller.actual_hbm_used_bytes
+                / self.config.hbm_capacity_bytes
+                >= self.config.joint_emergency_hbm_ratio
+            ),
+            restore_requirements=restore_requirements,
+        )
+        self._current_joint_plan_epoch = decision.epoch
+        self._online_joint_counts["safe_point_seed_epoch"] += 1
+        return decision
+
+    @staticmethod
+    def _online_residency_command_kind(
+        action: ResidencyAction,
+    ) -> CommandKind | None:
+        return {
+            ResidencyAction.KEEP: None,
+            ResidencyAction.PREPARE_HOST: CommandKind.SHADOW_CONTEXT,
+            ResidencyAction.COMMIT_CPU: CommandKind.OFFLOAD_CONTEXT,
+            ResidencyAction.PREFETCH_GPU: CommandKind.PREFETCH_CONTEXT,
+            ResidencyAction.DROP: CommandKind.DROP_CONTEXT,
+            ResidencyAction.RECOMPUTE: CommandKind.DROP_CONTEXT,
+        }[action]
+
+    @staticmethod
+    def _online_residency_expected_page_actions(
+        action: ResidencyAction,
+    ) -> frozenset[PhysicalPageAction]:
+        return {
+            ResidencyAction.KEEP: frozenset(),
+            ResidencyAction.PREPARE_HOST: frozenset(
+                {PhysicalPageAction.START_D2H}
+            ),
+            ResidencyAction.COMMIT_CPU: frozenset(
+                {
+                    PhysicalPageAction.START_D2H,
+                    PhysicalPageAction.COMMIT_CPU,
+                }
+            ),
+            ResidencyAction.PREFETCH_GPU: frozenset(
+                {PhysicalPageAction.START_H2D}
+            ),
+            ResidencyAction.DROP: frozenset({PhysicalPageAction.DROP}),
+            ResidencyAction.RECOMPUTE: frozenset({PhysicalPageAction.DROP}),
+        }[action]
+
+    def _online_residency_intent_order(
+        self,
+        view: OnlineJointPlanView,
+    ) -> tuple[int, ...]:
+        result = self._online_joint_result
+        if result is None or result.plan is None:
+            return ()
+        plan = result.plan
+        dependency_rank: dict[int, int] = {}
+        request_rank = {
+            request_id: rank
+            for rank, request_id in enumerate(view.ordered_request_ids)
+        }
+        for dependency in plan.dependencies:
+            if dependency.before_request_id is None:
+                continue
+            dependency_rank[dependency.residency_intent_index] = min(
+                dependency_rank.get(
+                    dependency.residency_intent_index,
+                    1 << 30,
+                ),
+                request_rank.get(dependency.before_request_id, 1 << 30),
+            )
+        action_rank = {
+            ResidencyAction.PREFETCH_GPU: 0,
+            ResidencyAction.COMMIT_CPU: 1,
+            ResidencyAction.DROP: 2,
+            ResidencyAction.RECOMPUTE: 2,
+            ResidencyAction.PREPARE_HOST: 3,
+            ResidencyAction.KEEP: 4,
+        }
+        if plan.semantic_residency:
+            return tuple(
+                sorted(
+                    view.residency_intent_indices,
+                    key=lambda index: (
+                        action_rank[plan.semantic_residency[index].action],
+                        plan.semantic_residency[index].deadline_ms,
+                        index,
+                    ),
+                )
+            )
+        return tuple(
+            sorted(
+                view.residency_intent_indices,
+                key=lambda index: (
+                    dependency_rank.get(index, 1 << 30),
+                    action_rank[plan.residency[index].action],
+                    plan.residency[index].deadline_ms,
+                    index,
+                ),
+            )
+        )
+
+    def _online_residency_hysteresis_blocks(
+        self,
+        *,
+        plan_id: str,
+        bundle_id: str,
+        action: ResidencyAction,
+        now_ms: float,
+    ) -> bool:
+        if action not in {
+            ResidencyAction.COMMIT_CPU,
+            ResidencyAction.DROP,
+            ResidencyAction.RECOMPUTE,
+        }:
+            return False
+        previous = self._online_joint_last_residency_action.get(bundle_id)
+        if previous is None or previous[0] != ResidencyAction.PREFETCH_GPU:
+            return False
+        age_ms = max(0.0, now_ms - previous[1])
+        if age_ms >= self.config.residency_hysteresis_ms:
+            return False
+        hbm_ratio = (
+            self.controller.actual_hbm_used_bytes
+            / self.config.hbm_capacity_bytes
+        )
+        if hbm_ratio >= self.config.joint_emergency_hbm_ratio:
+            return False
+        self._online_joint_counts["residency_hysteresis_blocked"] += 1
+        audit_key = (plan_id, bundle_id)
+        if audit_key not in self._online_joint_hysteresis_audit:
+            self._online_joint_hysteresis_audit.add(audit_key)
+            self.audit.emit(
+                "online_joint_residency_hysteresis_blocked",
+                now_ms,
+                plan_id=plan_id,
+                bundle_id=bundle_id,
+                requested_action=action.value,
+                previous_action=previous[0].value,
+                age_ms=age_ms,
+                hysteresis_ms=self.config.residency_hysteresis_ms,
+                hbm_ratio=hbm_ratio,
+                emergency_hbm_ratio=(
+                    self.config.joint_emergency_hbm_ratio
+                ),
+            )
+        return True
+
+    def _queue_online_joint_residency(
+        self,
+        view: OnlineJointPlanView,
+        *,
+        now_ms: float,
+    ) -> None:
+        if getattr(self, "_pending_online_joint_residency", None) is not None:
+            return
+        if self.controller.has_pending_transfer_work():
+            self._online_joint_counts["residency_wait_existing_transfer"] += 1
+            return
+        result = self._online_joint_result
+        source = self._online_joint_source
+        if (
+            result is None
+            or source is None
+            or result.plan is None
+            or result.plan.plan_id != view.plan_id
+        ):
+            return
+        source_bundles = {
+            item.bundle_id: item for item in source.physical_kv.bundles
+        }
+        plan = result.plan
+        if plan.semantic_residency:
+            self._queue_semantic_joint_residency(
+                plan,
+                view,
+                now_ms=now_ms,
+            )
+            return
+        for intent_index in self._online_residency_intent_order(view):
+            intent = plan.residency[intent_index]
+            if intent.action == ResidencyAction.KEEP:
+                continue
+            if self._online_residency_hysteresis_blocks(
+                plan_id=plan.plan_id,
+                bundle_id=intent.bundle_id,
+                action=intent.action,
+                now_ms=now_ms,
+            ):
+                continue
+            if intent.action == ResidencyAction.RECOMPUTE:
+                self._invalidate_online_joint_plan(
+                    plan.plan_id,
+                    reason="recompute_not_enabled",
+                    now_ms=now_ms,
+                )
+                return
+            source_bundle = source_bundles.get(intent.bundle_id)
+            if source_bundle is None or len(source_bundle.extent_ids) != 1:
+                self._invalidate_online_joint_plan(
+                    plan.plan_id,
+                    reason="source_extent_missing",
+                    now_ms=now_ms,
+                    bundle_id=intent.bundle_id,
+                )
+                return
+            try:
+                target_handle = page_handle_from_extent_id(
+                    source_bundle.extent_ids[0]
+                )
+            except ValueError:
+                self._invalidate_online_joint_plan(
+                    plan.plan_id,
+                    reason="source_extent_identity_invalid",
+                    now_ms=now_ms,
+                    bundle_id=intent.bundle_id,
+                )
+                return
+            if not source_bundle.owner_context_ids:
+                self._invalidate_online_joint_plan(
+                    plan.plan_id,
+                    reason="unowned_extent_requires_lifecycle_fallback",
+                    now_ms=now_ms,
+                    bundle_id=intent.bundle_id,
+                )
+                return
+            command_kind = self._online_residency_command_kind(intent.action)
+            if command_kind is None:
+                continue
+            if (
+                command_kind == CommandKind.SHADOW_CONTEXT
+                and not self.config.shadow_enabled
+            ):
+                self._invalidate_online_joint_plan(
+                    plan.plan_id,
+                    reason="shadow_not_enabled",
+                    now_ms=now_ms,
+                    bundle_id=intent.bundle_id,
+                )
+                return
+            expected_actions = self._online_residency_expected_page_actions(
+                intent.action
+            )
+            host_available = self.controller.signals.host_free_bytes
+            device_available = max(
+                0,
+                self.config.hbm_capacity_bytes
+                - self.controller.actual_hbm_used_bytes
+                - self.controller.admission.reserved_bytes,
+            )
+            candidates: list[PhysicalBundlePreview] = []
+            observed_blockers: set[str] = set()
+            for context_id in source_bundle.owner_context_ids:
+                context = self.controller.graph.contexts.get(context_id)
+                if context is None:
+                    continue
+                previews = self.controller.arbiter.bundle_builder.previews_for_context(
+                    command_kind,
+                    context_id,
+                    context.epoch,
+                    now_ms=now_ms,
+                    host_available_bytes=host_available,
+                    device_available_bytes=device_available,
+                )
+                for preview in previews:
+                    if target_handle not in preview.bundle.handles:
+                        continue
+                    target_actions = {
+                        item.action
+                        for item in preview.page_actions
+                        if item.handle == target_handle
+                    }
+                    if not target_actions.intersection(expected_actions):
+                        continue
+                    if preview.eligible:
+                        candidates.append(preview)
+                    else:
+                        observed_blockers.update(
+                            item.code.value for item in preview.blockers
+                        )
+            if not candidates:
+                self._invalidate_online_joint_plan(
+                    plan.plan_id,
+                    reason="physical_preview_unavailable",
+                    now_ms=now_ms,
+                    bundle_id=intent.bundle_id,
+                    blocker_codes=tuple(sorted(observed_blockers)),
+                )
+                return
+            preview = min(
+                candidates,
+                key=lambda item: (
+                    item.bundle.closure_bytes,
+                    item.copy_bytes,
+                    item.context_id,
+                    item.bundle.bundle_id,
+                ),
+            )
+            self._online_joint_residency_sequence += 1
+            transaction_id = (
+                f"joint-residency-{self._online_joint_residency_sequence}"
+            )
+            command_id = f"{transaction_id}-command"
+            command = ControlCommand(
+                command_id=command_id,
+                kind=command_kind,
+                created_ts_ms=now_ms,
+                context_id=preview.context_id,
+                context_epoch=preview.context_epoch,
+                target_bytes=preview.bundle.closure_bytes,
+                priority=4.0e9,
+                deadline_ms=intent.deadline_ms,
+                queue_class=(
+                    CommandQueueClass.SHADOW
+                    if command_kind == CommandKind.SHADOW_CONTEXT
+                    else CommandQueueClass.URGENT
+                ),
+                metadata={
+                    "reason": "observed_joint_residency",
+                    "joint_plan_id": plan.plan_id,
+                    "joint_residency_intent_index": intent_index,
+                    "joint_source_bundle_id": intent.bundle_id,
+                    "joint_residency_action": intent.action.value,
+                    "joint_planned_target_bytes": intent.target_bytes,
+                    "joint_physical_closure_bytes": (
+                        preview.bundle.closure_bytes
+                    ),
+                    "physical_bundle_scope": preview.bundle.scope.value,
+                    "physical_exclusive_action_bytes": (
+                        preview.bundle.exclusive_action_bytes
+                    ),
+                    "physical_cross_context_action_bytes": (
+                        preview.bundle.cross_context_action_bytes
+                    ),
+                    "physical_foreign_owner_context_ids": list(
+                        preview.bundle.foreign_owner_context_ids
+                    ),
+                },
+                physical_bundle=preview.intent(),
+            )
+            enqueue_outcome = self.controller.enqueue_control_command(command)
+            if enqueue_outcome.status != EnqueueStatus.ENQUEUED:
+                self._online_joint_counts["residency_queue_conflict"] += 1
+                return
+            transaction = _OnlineJointResidencyTransaction(
+                transaction_id=transaction_id,
+                plan_id=plan.plan_id,
+                intent_index=intent_index,
+                source_bundle_id=intent.bundle_id,
+                action=intent.action,
+                command_id=command_id,
+                command_kind=command_kind,
+                context_id=preview.context_id,
+                physical_bundle_id=preview.bundle.bundle_id,
+                created_ts_ms=now_ms,
+            )
+            self._pending_online_joint_residency = transaction
+            self._online_joint_residency_history.append(transaction)
+            self._online_joint_counts["residency_queued"] += 1
+            self.audit.emit(
+                "online_joint_residency_queued",
+                now_ms,
+                transaction_id=transaction_id,
+                plan_id=plan.plan_id,
+                intent_index=intent_index,
+                action=intent.action.value,
+                command_id=command_id,
+                command_kind=command_kind.value,
+                source_bundle_id=intent.bundle_id,
+                physical_bundle_id=preview.bundle.bundle_id,
+                context_id=preview.context_id,
+                planned_target_bytes=intent.target_bytes,
+                physical_closure_bytes=preview.bundle.closure_bytes,
+                copy_bytes=preview.copy_bytes,
+            )
+            return
+
+    def _queue_semantic_joint_residency(
+        self,
+        plan: Any,
+        view: OnlineJointPlanView,
+        *,
+        now_ms: float,
+    ) -> None:
+        committed = getattr(self, "_current_semantic_residency_commit", None)
+        if committed is None:
+            return
+        plan_id, intent_index, target, preview = committed
+        if (
+            plan_id != plan.plan_id
+            or intent_index not in view.residency_intent_indices
+        ):
+            return
+        if self._online_residency_hysteresis_blocks(
+            plan_id=plan.plan_id,
+            bundle_id=preview.bundle.bundle_id,
+            action=target.action,
+            now_ms=now_ms,
+        ):
+            return
+        if target.action == ResidencyAction.RECOMPUTE:
+            self._online_joint_counts["semantic_recompute_not_enabled"] += 1
+            return
+        command_kind = self._online_residency_command_kind(target.action)
+        if command_kind is None:
+            return
+        self._online_joint_residency_sequence += 1
+        transaction_id = (
+            f"joint-residency-{self._online_joint_residency_sequence}"
+        )
+        command_id = f"{transaction_id}-command"
+        command = ControlCommand(
+            command_id=command_id,
+            kind=command_kind,
+            created_ts_ms=now_ms,
+            context_id=preview.context_id,
+            context_epoch=preview.context_epoch,
+            target_bytes=preview.bundle.closure_bytes,
+            priority=4.0e9,
+            deadline_ms=target.deadline_ms,
+            queue_class=(
+                CommandQueueClass.SHADOW
+                if command_kind == CommandKind.SHADOW_CONTEXT
+                else CommandQueueClass.URGENT
+            ),
+            metadata={
+                "reason": "semantic_joint_residency",
+                "joint_plan_id": plan.plan_id,
+                "joint_residency_intent_index": intent_index,
+                "joint_semantic_context_id": target.context_id,
+                "joint_semantic_context_epoch": target.context_epoch,
+                "joint_residency_action": target.action.value,
+                "joint_planned_target_bytes": target.target_bytes_hint,
+                "joint_physical_closure_bytes": preview.bundle.closure_bytes,
+                "physical_bundle_scope": preview.bundle.scope.value,
+                "physical_exclusive_action_bytes": (
+                    preview.bundle.exclusive_action_bytes
+                ),
+                "physical_cross_context_action_bytes": (
+                    preview.bundle.cross_context_action_bytes
+                ),
+                "physical_foreign_owner_context_ids": list(
+                    preview.bundle.foreign_owner_context_ids
+                ),
+            },
+            physical_bundle=preview.intent(),
+        )
+        enqueue_outcome = self.controller.enqueue_control_command(command)
+        if enqueue_outcome.status != EnqueueStatus.ENQUEUED:
+            self._online_joint_counts["residency_queue_conflict"] += 1
+            return
+        transaction = _OnlineJointResidencyTransaction(
+            transaction_id=transaction_id,
+            plan_id=plan.plan_id,
+            intent_index=intent_index,
+            source_bundle_id=(
+                f"semantic:{target.context_id}:{target.context_epoch}"
+            ),
+            action=target.action,
+            command_id=command_id,
+            command_kind=command_kind,
+            context_id=preview.context_id,
+            physical_bundle_id=preview.bundle.bundle_id,
+            created_ts_ms=now_ms,
+        )
+        self._pending_online_joint_residency = transaction
+        self._online_joint_residency_history.append(transaction)
+        self._online_joint_counts["semantic_residency_queued"] += 1
+        self.audit.emit(
+            "online_joint_residency_queued",
+            now_ms,
+            transaction_id=transaction_id,
+            plan_id=plan.plan_id,
+            intent_index=intent_index,
+            intent_kind="semantic_context_target",
+            action=target.action.value,
+            command_id=command_id,
+            command_kind=command_kind.value,
+            source_context_id=target.context_id,
+            source_context_epoch=target.context_epoch,
+            physical_bundle_id=preview.bundle.bundle_id,
+            context_id=preview.context_id,
+            planned_target_bytes=target.target_bytes_hint,
+            physical_closure_bytes=preview.bundle.closure_bytes,
+            copy_bytes=preview.copy_bytes,
+            source_joint_plan_id=plan.plan_id,
+        )
+
+    def _advance_online_joint_residency(
+        self,
+        acks: tuple[CommandAck, ...] | list[CommandAck],
+        *,
+        now_ms: float,
+    ) -> None:
+        transaction = getattr(self, "_pending_online_joint_residency", None)
+        if transaction is None:
+            return
+        ack = next(
+            (item for item in acks if item.command_id == transaction.command_id),
+            None,
+        )
+        if ack is None:
+            return
+        transaction.completed_ts_ms = now_ms
+        transaction.actual_bytes = ack.actual_bytes
+        if ack.status == CommandStatus.COMPLETED:
+            transaction.stage = "completed"
+            self._online_joint_counts["residency_completed"] += 1
+            self._online_joint_last_residency_action[
+                transaction.source_bundle_id
+            ] = (transaction.action, now_ms)
+        else:
+            transaction.stage = "failed"
+            transaction.failure_reason = (
+                f"{ack.status.value}:{ack.reason or 'unspecified'}"
+            )
+            self._online_joint_counts[
+                f"residency_{ack.status.value}"
+            ] += 1
+        self.audit.emit(
+            "online_joint_residency_terminal",
+            now_ms,
+            transaction_id=transaction.transaction_id,
+            plan_id=transaction.plan_id,
+            intent_index=transaction.intent_index,
+            action=transaction.action.value,
+            command_id=transaction.command_id,
+            command_kind=transaction.command_kind.value,
+            source_bundle_id=transaction.source_bundle_id,
+            physical_bundle_id=transaction.physical_bundle_id,
+            context_id=transaction.context_id,
+            status=ack.status.value,
+            actual_bytes=ack.actual_bytes,
+            reason=ack.reason,
+            blocker_codes=sorted({item.code.value for item in ack.blockers}),
+        )
+        self._pending_online_joint_residency = None
+        self._invalidate_online_joint_plan(
+            transaction.plan_id,
+            reason=f"residency_terminal:{ack.status.value}",
+            now_ms=now_ms,
+            emit=False,
+        )
+
+    def _invalidate_online_joint_plan(
+        self,
+        plan_id: str,
+        *,
+        reason: str,
+        now_ms: float,
+        bundle_id: str | None = None,
+        blocker_codes: tuple[str, ...] = (),
+        emit: bool = True,
+    ) -> None:
+        result = getattr(self, "_online_joint_result", None)
+        if result is None or result.plan is None or result.plan.plan_id != plan_id:
+            return
+        self._online_joint_result = None
+        self._online_joint_source = None
+        self._online_joint_validation = None
+        self._current_online_joint_view = None
+        self._current_online_joint_decision = None
+        self._current_joint_plan_epoch = None
+        self._current_semantic_residency_commit = None
+        self._online_joint_counts[f"invalidated_{reason}"] += 1
+        if emit:
+            self.audit.emit(
+                "online_joint_plan_invalidated",
+                now_ms,
+                plan_id=plan_id,
+                reason=reason,
+                bundle_id=bundle_id,
+                blocker_codes=list(blocker_codes),
+                fallback="bounded_seed_joint_epoch",
+            )
+
+    def _publish_online_joint_candidate(
+        self,
+        result: JointShadowResult,
+        *,
+        source: PolicyInput,
+        validation: JointPlanComponentValidation | None,
+        visible_request_ids: tuple[str, ...],
+        now_ms: float,
+    ) -> None:
+        if not self.config.joint_policy_enabled:
+            return
+        if getattr(self, "_shutdown_state", "running") != "running":
+            self._online_joint_counts["publish_rejected_shutdown"] += 1
+            return
+        if result.plan is None or validation is None:
+            self._online_joint_counts["publish_missing_validation"] += 1
+            return
+        decision = compile_online_joint_view(
+            result.plan,
+            validation,
+            visible_request_ids=visible_request_ids,
+        )
+        if decision.view is None:
+            self._online_joint_counts[f"publish_rejected_{decision.reason}"] += 1
+            return
+        self._online_joint_result = result
+        self._online_joint_source = source
+        self._online_joint_validation = validation
+        self._current_online_joint_view = None
+        self._current_online_joint_decision = None
+        self._online_joint_counts["published"] += 1
+        self.audit.emit(
+            "online_joint_plan_published",
+            now_ms,
+            plan_id=result.plan.plan_id,
+            worker_sequence=result.sequence,
+            execution_request_count=len(decision.view.ordered_request_ids),
+            immediate_request_count=len(decision.view.immediate_request_ids),
+            restore_blocked_request_count=len(
+                decision.view.restore_requirements
+            ),
+            residency_intent_count=len(decision.view.residency_intent_indices),
+        )
+
     def _record_joint_shadow_result(
         self,
         result: JointShadowResult,
@@ -7679,6 +14542,8 @@ class EmbeddedSGLangRuntime:
             "snapshot_materialize_ms": result.snapshot_materialize_ms,
             "plan_queue_wait_ms": result.queue_wait_ms,
             "plan_compute_ms": result.compute_ms,
+            "trigger_interval_ms": result.trigger_interval_ms,
+            "effective_planning_budget_ms": result.planning_budget_ms,
             "plan_publish_to_safe_point_ms": publish_delay_ms,
             "worker_pending_count": (
                 worker_stats.pending_count if worker_stats is not None else 0
@@ -7693,7 +14558,7 @@ class EmbeddedSGLangRuntime:
                 if worker_stats is not None
                 else 0
             ),
-            "application_connected": False,
+            "application_connected": self.config.joint_policy_enabled,
         }
         if result.error is not None or result.plan is None:
             self._joint_shadow_counts["worker_failed"] += 1
@@ -7704,6 +14569,10 @@ class EmbeddedSGLangRuntime:
                 **common,
             )
             return
+        if result.plan.prediction_used:
+            self._joint_predictive_counts["plans_using_predictions"] += 1
+        for name, value in result.plan.prediction_influence:
+            self._joint_predictive_counts[name] += value
 
         validation_started_ns = time.perf_counter_ns()
         component_validation: JointPlanComponentValidation | None = None
@@ -7891,6 +14760,20 @@ class EmbeddedSGLangRuntime:
                     ],
                 }
             )
+        self._publish_online_joint_candidate(
+            result,
+            source=policy_input,
+            validation=component_validation,
+            visible_request_ids=tuple(
+                item.request_id
+                for item in (
+                    current_runnable
+                    if current_runnable is not None
+                    else policy_input.runnable_frontier
+                )
+            ),
+            now_ms=observation.ts_ms,
+        )
         if (
             component_validation is not None
             and component_validation.partially_fresh
@@ -7967,7 +14850,7 @@ class EmbeddedSGLangRuntime:
                 admission_action_counts=dict(sorted(admission_actions.items())),
                 residency_action_counts=dict(sorted(residency_actions.items())),
                 fallback_reason=plan.fallback_reason,
-                application_connected=False,
+                application_connected=self.config.joint_policy_enabled,
             )
             self._joint_shadow_counts["compact_audit_records"] += 1
 
@@ -8038,23 +14921,68 @@ class EmbeddedSGLangRuntime:
             latest_unobserved_result=bool(latest_unobserved),
             superseded_completed_result_count=superseded_completed,
             timing_ms=timing_summary,
-            application_connected=False,
+            application_connected=self.config.joint_policy_enabled,
         )
 
     def _policy_runtime_runnable(
         self, now_ms: float
     ) -> tuple[RunnableInvocation, ...]:
         result: dict[str, RunnableInvocation] = {}
+        frontier_predictions: dict[str, Any] = {}
+        if getattr(self.config, "joint_predictive_enabled", False):
+            predictor = getattr(self.controller, "predictor", None)
+            if (
+                predictor is not None
+                and getattr(predictor, "frontier_model", None) is not None
+            ):
+                active_ids = tuple(
+                    invocation.invocation_id
+                    for invocation in self.controller.graph.invocations.values()
+                    if not invocation.state.terminal
+                )[:64]
+                try:
+                    frontier_predictions = (
+                        build_invocation_frontier_predictions(
+                            self.controller.graph,
+                            predictor,
+                            now_ms=now_ms,
+                            invocation_ids=active_ids,
+                        )
+                    )
+                except Exception:
+                    # A prediction failure must never affect the scheduler
+                    # critical path; fall back to observed-only planning.
+                    frontier_predictions = {}
+        self._last_frontier_predictions = {
+            invocation_id: {
+                "remaining_decode_tokens_p50": prediction.remaining_decode_tokens.quantile(0.5),
+                "remaining_external_wait_ms_p50": prediction.remaining_external_wait.quantile(0.5),
+                "next_output_tokens_p50": prediction.next_output_tokens.quantile(0.5),
+                "support_level": prediction.support_level,
+                "ood_reasons": tuple(prediction.ood_reasons),
+            }
+            for invocation_id, prediction in frontier_predictions.items()
+        }
         raw_waiting_queue = getattr(self.scheduler, "waiting_queue", None)
         waiting_queue = (
             tuple(raw_waiting_queue) if raw_waiting_queue is not None else ()
         )
-        for req in waiting_queue:
+        running_batch = getattr(self.scheduler, "running_batch", None)
+        running_requests = tuple(
+            getattr(running_batch, "reqs", ()) or ()
+        )
+
+        def add_request(req: Any, queue_state: str) -> None:
             metadata = self._metadata(req)
             if metadata is None or self._metadata_scope_is_terminal(metadata):
-                continue
+                return
             max_new_tokens = int(
-                getattr(req.sampling_params, "max_new_tokens", 0) or 0
+                getattr(
+                    getattr(req, "sampling_params", None),
+                    "max_new_tokens",
+                    0,
+                )
+                or 0
             )
             output_ids = getattr(req, "output_ids", None)
             output_tokens = len(output_ids) if output_ids is not None else 0
@@ -8081,6 +15009,7 @@ class EmbeddedSGLangRuntime:
                 if invocation is not None
                 else metadata.relation_type
             )
+            prediction = frontier_predictions.get(metadata.invocation_id)
             result[str(req.rid)] = RunnableInvocation(
                 request_id=str(req.rid),
                 workflow_id=metadata.root_workflow_id,
@@ -8095,17 +15024,44 @@ class EmbeddedSGLangRuntime:
                 )
                 * self.config.kv_bytes_per_token,
                 causal_class=(
-                    f"engine_waiting:{execution_mode}:{relation_type}"
+                    f"{queue_state}:{execution_mode}:{relation_type}"
                 ),
                 program_id=metadata.agent_instance_id,
+                predicted_remaining_decode_tokens=(
+                    prediction.remaining_decode_tokens.quantile(0.5)
+                    if prediction is not None
+                    else None
+                ),
+                predicted_external_wait_ms=(
+                    prediction.remaining_external_wait.quantile(0.5)
+                    if prediction is not None
+                    else None
+                ),
+                predicted_next_output_tokens=(
+                    prediction.next_output_tokens.quantile(0.5)
+                    if prediction is not None
+                    else None
+                ),
+                prediction_support_level=(
+                    prediction.support_level if prediction is not None else ""
+                ),
+                prediction_ood_reasons=(
+                    tuple(prediction.ood_reasons)
+                    if prediction is not None
+                    else ()
+                ),
             )
+
+        for req in waiting_queue:
+            add_request(req, "engine_waiting")
+        for req in running_requests:
+            add_request(req, "engine_running")
         return tuple(sorted(result.values(), key=lambda item: item.request_id))
 
     def _policy_capabilities(self) -> CapabilityReport:
         limitations = [
-            "running decode batch cannot yet be reordered by JointPlan",
             "HiCache 0.5.2rc1 exposes one in-flight physical operation",
-            "reference outputs are shadow-only in P3",
+            "running decode reorder requires a drained selective-retraction barrier",
         ]
         if not self.backend.capabilities.operation_merge:
             limitations.append("native HiCache operation merge is unavailable")

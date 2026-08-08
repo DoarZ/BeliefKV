@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from beliefkv.policy.joint_scheduler import (
+    AsyncSemanticJointPlanner,
     JointPlanCurrentState,
     JointPlannerConfig,
     ObservedJointPlanner,
@@ -112,6 +113,48 @@ def _planner(**overrides) -> ObservedJointPlanner:
     }
     defaults.update(overrides)
     return ObservedJointPlanner(JointPlannerConfig(**defaults))
+
+
+def _semantic_planner(**overrides) -> AsyncSemanticJointPlanner:
+    defaults = {
+        "max_planning_budget_ms": 100.0,
+        "max_workflow_candidates": 8,
+        "max_total_frontier_candidates": 16,
+    }
+    defaults.update(overrides)
+    return AsyncSemanticJointPlanner(JointPlannerConfig(**defaults))
+
+
+def test_async_semantic_planner_never_prepares_physical_extents() -> None:
+    class FailingPhysicalizer:
+        def prepare(self, _policy_input):
+            raise AssertionError("async semantic planning bound a physical extent")
+
+    policy_input = _input(capacity=800, reserved=0)
+    request = policy_input.runnable_frontier[0]
+    policy_input = _with_runtime_state(
+        policy_input,
+        (request,),
+        {
+            request.invocation_id: _invocation(
+                request.workflow_id,
+                request.context_id,
+            )
+        },
+    )
+    planner = AsyncSemanticJointPlanner(
+        JointPlannerConfig(max_planning_budget_ms=100.0),
+        physicalizer=FailingPhysicalizer(),
+    )
+
+    plan = planner.plan(policy_input)
+
+    assert not plan.residency
+    assert not plan.dependencies
+    assert plan.semantic_residency
+    assert plan.semantic_residency[0].context_id == request.context_id
+    assert plan.semantic_residency[0].action == ResidencyAction.PREFETCH_GPU
+    assert plan.planning_termination_reason == "semantic_plan_complete"
 
 
 def _current_state(
@@ -251,15 +294,18 @@ def test_anytime_planner_keeps_a_feasible_prefix_when_budget_expires() -> None:
         },
     )
 
-    plan = _planner(max_planning_budget_ms=1e-9).plan(policy_input)
+    plan = _planner(
+        max_planning_budget_ms=1e-9,
+        min_planning_budget_ms=1e-9,
+    ).plan(policy_input)
 
     assert plan.fallback_reason is None
-    assert plan.execution.ordered_request_ids == ("request-a",)
+    assert plan.execution.ordered_request_ids == ("request-a", "request-b")
     assert not plan.search_complete
     assert plan.planning_termination_reason == (
-        "planning_budget_exceeded_best_feasible_prefix"
+        "planning_budget_exceeded_seed_published"
     )
-    assert plan.evaluated_package_count == 1
+    assert plan.evaluated_package_count == 0
     assert set(dict(plan.planning_phase_ms)) == {
         "candidate_order",
         "materialize",

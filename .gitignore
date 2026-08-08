@@ -20,6 +20,9 @@ experiments/results/*
 !experiments/results/.gitkeep
 experiments/archive/*
 experiments/calibration/*
+experiments/analysis/*
+experiments/models/*
+experiments/shadow/*
 !experiments/archive/README.md
 
 third_party/*
@@ -29,5 +32,6 @@ third_party/*
 workloads/raw/*
 workloads/frozen/*
 workloads/runtime/*
+workloads/sources/*
 !workloads/raw/.gitkeep
 !workloads/frozen/.gitkeep

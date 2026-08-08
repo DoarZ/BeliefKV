@@ -6,6 +6,7 @@ from beliefkv.runtime.action_frontier import (
     JsonActionParser,
     ParserStatus,
     StructuredActionKind,
+    characterize_action_frontier_coverage,
 )
 
 
@@ -132,3 +133,131 @@ def test_observer_records_tool_gap_frontier_delta_kv_transition_and_reentry() ->
         "action_frontier_updated",
         "valid_action_unlocked",
     }
+
+
+def test_p6_coverage_separates_exact_and_runtime_only_boundaries() -> None:
+    observer = ActionFrontierObserver()
+    observer.begin(
+        request_id="exact",
+        workflow_id="workflow",
+        invocation_id="exact-invocation",
+        context_id="exact-context",
+        ts_ms=0.0,
+    )
+    observer.observe_parser_update(
+        "exact",
+        JsonActionParser().feed(
+            '{"action":"tool","name":"search"}', generated_tokens=8
+        ),
+        ts_ms=1.0,
+    )
+    observer.begin(
+        request_id="runtime-only",
+        workflow_id="workflow",
+        invocation_id="runtime-invocation",
+        context_id="runtime-context",
+        ts_ms=2.0,
+    )
+    observer.observe_runtime_event(
+        RuntimeEvent(
+            event_id="runtime-result",
+            ts_ms=3.0,
+            kind=RuntimeEventKind.LLM_RESULT,
+            workflow_id="workflow",
+            invocation_id="runtime-invocation",
+            context_id="runtime-context",
+            attributes={
+                "request_id": "runtime-only",
+                "output_tokens": 12,
+                "parser_status": "valid",
+                "structured_action_kinds": ["function_call"],
+                "structured_action_names": ["read_file"],
+            },
+        )
+    )
+
+    coverage = characterize_action_frontier_coverage(observer.snapshots())
+
+    assert observer.revision == 4
+    assert coverage.action_call_count == 2
+    assert coverage.exact_boundary_call_count == 1
+    assert coverage.runtime_only_boundary_call_count == 1
+    assert coverage.exact_boundary_call_coverage == 0.5
+
+
+def test_internal_summary_is_not_an_agent_action() -> None:
+    observer = ActionFrontierObserver()
+
+    assert observer.observe_runtime_event(
+        _event(
+            1,
+            RuntimeEventKind.LLM_SUBMIT,
+            attributes={"request_id": "summary", "runtime_internal": True},
+        )
+    ) is None
+    assert observer.observe_runtime_event(
+        _event(
+            2,
+            RuntimeEventKind.LLM_RESULT,
+            attributes={
+                "runtime_internal": True,
+                "parser_status": "valid",
+                "structured_action_kinds": ["final_answer"],
+                "output_tokens": 16,
+            },
+        )
+    ) is None
+
+    assert observer.snapshots() == ()
+    assert observer.coverage().call_count == 0
+
+
+def test_join_satisfied_is_attributed_to_the_waiting_parent() -> None:
+    observer = ActionFrontierObserver()
+    observer.observe_runtime_event(
+        _event(
+            1,
+            RuntimeEventKind.LLM_SUBMIT,
+            invocation_id="parent",
+            attributes={"request_id": "spawn-call"},
+        )
+    )
+    observer.observe_runtime_event(
+        _event(
+            2,
+            RuntimeEventKind.LLM_RESULT,
+            invocation_id="parent",
+            attributes={
+                "parser_status": "valid",
+                "structured_action_kinds": ["spawn"],
+                "structured_action_names": ["task"],
+                "output_tokens": 8,
+            },
+        )
+    )
+    observer.observe_runtime_event(
+        RuntimeEvent(
+            event_id="join-wait",
+            ts_ms=30.0,
+            kind=RuntimeEventKind.JOIN_WAIT,
+            workflow_id="workflow",
+            invocation_id="parent",
+            join_id="join",
+        )
+    )
+    state = observer.observe_runtime_event(
+        RuntimeEvent(
+            event_id="join-satisfied",
+            ts_ms=80.0,
+            kind=RuntimeEventKind.JOIN_SATISFIED,
+            workflow_id="workflow",
+            join_id="join",
+        )
+    )
+
+    assert state is not None
+    assert state.reentry_ts_ms == 80.0
+    coverage = observer.coverage()
+    assert coverage.reentry_eligible_call_count == 1
+    assert coverage.reentry_observed_count == 1
+    assert coverage.reentry_cause_coverage == 1.0

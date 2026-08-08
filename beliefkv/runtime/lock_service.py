@@ -390,6 +390,11 @@ class RequestServiceLedger:
     def tracks(self, request_id: str) -> bool:
         return request_id in self._records
 
+    def progress_record(self, request_id: str) -> RequestServiceRecord | None:
+        """Return the latest immutable GPU-service evidence for a request."""
+
+        return self._records.get(request_id)
+
     def service_status(
         self,
         request_id: str,

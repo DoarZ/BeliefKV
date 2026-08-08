@@ -204,6 +204,106 @@ def test_max_turn_guard_terminates_a_noncompleting_graph() -> None:
     assert result.turn_count == 3
 
 
+def test_same_peer_continuation_does_not_create_a_self_handoff() -> None:
+    class ContinuingBackend:
+        calls = 0
+
+        def invoke(self, request: PeerTurnRequest) -> PeerTurnResult:
+            self.calls += 1
+            if self.calls == 1:
+                return PeerTurnResult(
+                    summary="continue local implementation",
+                    next_role=PeerRole.CODER,
+                    complete=False,
+                )
+            return PeerTurnResult(
+                summary="implementation complete",
+                next_role=None,
+                complete=True,
+            )
+
+    sink = CollectingSink()
+    result = LangGraphPeerWorkflow(
+        ContinuingBackend(),
+        sink,
+        workflow_id="workflow-self-continuation",
+        max_turns=4,
+    ).run("Finish a local implementation before review.")
+
+    assert result.completed
+    assert result.turn_count == 2
+    assert not any(event.kind == RuntimeEventKind.HANDOFF for event in sink.events)
+    structured = [
+        event
+        for event in sink.events
+        if event.kind == RuntimeEventKind.LLM_RESULT
+    ]
+    assert structured[0].attributes["structured_action_kinds"] == ["continue"]
+
+
+def test_blocked_terminal_result_ends_outer_graph_without_handoff() -> None:
+    class BlockedBackend:
+        def invoke(self, request: PeerTurnRequest) -> PeerTurnResult:
+            return PeerTurnResult(
+                summary="runtime guard exhausted recovery",
+                next_role=None,
+                complete=True,
+                terminal_outcome="blocked",
+            )
+
+    sink = CollectingSink()
+    result = LangGraphPeerWorkflow(
+        BlockedBackend(),
+        sink,
+        workflow_id="workflow-blocked",
+        max_turns=10,
+    ).run("Exercise blocked terminal propagation.")
+
+    assert not result.completed
+    assert result.termination_reason == "blocked"
+    assert not any(event.kind == RuntimeEventKind.HANDOFF for event in sink.events)
+    assert [
+        event.attributes["outcome"]
+        for event in sink.events
+        if event.kind == RuntimeEventKind.WORKFLOW_END
+    ] == ["blocked"]
+
+
+def test_workflow_deadline_cancels_backend_and_returns_structured_timeout() -> None:
+    class BlockingBackend:
+        def __init__(self) -> None:
+            self.cancelled = threading.Event()
+            self.cancel_reason = None
+
+        def invoke(self, request: PeerTurnRequest) -> PeerTurnResult:
+            assert request.workflow_deadline is not None
+            self.cancelled.wait(timeout=1.0)
+            raise TimeoutError("cancelled by workflow deadline")
+
+        def cancel(self, *, reason: str) -> None:
+            self.cancel_reason = reason
+            self.cancelled.set()
+
+    backend = BlockingBackend()
+    sink = CollectingSink()
+    result = LangGraphPeerWorkflow(
+        backend,
+        sink,
+        workflow_id="workflow-timeout",
+        workflow_timeout_s=0.02,
+    ).run("Exercise workflow deadline propagation.")
+
+    assert not result.completed
+    assert result.termination_reason == "workflow_timeout"
+    assert backend.cancel_reason == "workflow_timeout"
+    assert any(event.kind == RuntimeEventKind.INVOCATION_CANCEL for event in sink.events)
+    assert [
+        event.attributes["outcome"]
+        for event in sink.events
+        if event.kind == RuntimeEventKind.WORKFLOW_END
+    ] == ["workflow_timeout"]
+
+
 def test_model_runtime_mode_does_not_duplicate_llm_boundary_events() -> None:
     sink = CollectingSink()
     ticks = itertools.count(1)

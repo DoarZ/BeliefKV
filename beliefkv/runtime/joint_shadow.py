@@ -3,7 +3,8 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import Mapping, Protocol
 
 from beliefkv.control.causal_graph import RuntimeCausalContextGraph
@@ -14,7 +15,13 @@ from beliefkv.policy.admission import AdmissionController
 from beliefkv.policy.causal_frontier import CausalFrontierScheduler
 from beliefkv.policy.joint_scheduler import JointPlan, ObservedJointPlanner
 from beliefkv.policy.leases import CausalLeaseProjector
-from beliefkv.policy.reference import CapabilityReport, PolicyInput, RunnableInvocation
+from beliefkv.policy.reference import (
+    CapabilityReport,
+    MetadataSource,
+    MetadataValue,
+    PolicyInput,
+    RunnableInvocation,
+)
 from beliefkv.policy.reference.snapshot_builder import (
     PolicyInputSnapshotBuilder,
     SnapshotBuildStats,
@@ -59,6 +66,10 @@ class JointShadowStateStamp:
     runnable_signature: tuple[tuple[object, ...], ...]
     hbm_used_bytes: int
     host_free_bytes: int
+    obligation_revision: int = 0
+    lease_revision: int = 0
+    grace_revision: int = 0
+    parser_frontier_revision: int = 0
 
 
 @dataclass(frozen=True)
@@ -79,6 +90,9 @@ class JointShadowDelta:
     stamp: JointShadowStateStamp
     trigger: str
     captured_monotonic_ms: float
+    frontier_predictions: Mapping[str, Mapping[str, object]] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         if self.event_to_sequence < self.event_from_sequence:
@@ -87,6 +101,18 @@ class JointShadowDelta:
             raise ValueError("shadow delta trigger must be non-empty")
         if self.captured_monotonic_ms < 0:
             raise ValueError("shadow capture time must be non-negative")
+        object.__setattr__(
+            self,
+            "frontier_predictions",
+            MappingProxyType(
+                {
+                    str(invocation_id): dict(prediction)
+                    for invocation_id, prediction in sorted(
+                        self.frontier_predictions.items()
+                    )
+                }
+            ),
+        )
 
 
 def coalesce_joint_shadow_deltas(
@@ -181,6 +207,7 @@ def coalesce_joint_shadow_deltas(
         stamp=last.stamp,
         trigger=last.trigger,
         captured_monotonic_ms=last.captured_monotonic_ms,
+        frontier_predictions=last.frontier_predictions,
     )
 
 
@@ -208,6 +235,8 @@ class JointShadowResult:
     snapshot_materialize_ms: float = 0.0
     state_stamp: JointShadowStateStamp | None = None
     trigger: str = "legacy_policy_input"
+    trigger_interval_ms: float | None = None
+    planning_budget_ms: float | None = None
 
     @property
     def queue_wait_ms(self) -> float:
@@ -226,6 +255,7 @@ class JointShadowWorkerStats:
     failed_count: int
     dropped_pending_count: int
     coalesced_pending_count: int
+    superseded_result_count: int
     pending_count: int
     busy: bool
     latest_published_sequence: int
@@ -336,7 +366,7 @@ class IncrementalPolicyInputAssembler:
             },
             "revision": delta.stamp.fairness_revision,
         }
-        return self.builder.build(
+        policy_input = self.builder.build(
             delta.observation,
             additional_runnable=delta.runnable_frontier,
             workflow_memory_charges=charges,
@@ -345,6 +375,18 @@ class IncrementalPolicyInputAssembler:
             transfer_telemetry=tuple(self._telemetry),
             capabilities=delta.capabilities,
         )
+        if delta.frontier_predictions:
+            metadata = dict(policy_input.optional_metadata)
+            metadata["frontier_predictions"] = MetadataValue(
+                source=MetadataSource.PREDICTED,
+                value=dict(delta.frontier_predictions),
+                producer="frontier_belief_mvp",
+            )
+            policy_input = replace(
+                policy_input,
+                optional_metadata=metadata,
+            )
+        return policy_input
 
 
 class LatestWinsJointPlanWorker:
@@ -376,6 +418,8 @@ class LatestWinsJointPlanWorker:
         self._failed_count = 0
         self._dropped_pending_count = 0
         self._coalesced_pending_count = 0
+        self._superseded_result_count = 0
+        self._last_trigger_capture_ms: float | None = None
         self._thread = threading.Thread(
             target=self._run,
             name=thread_name,
@@ -462,6 +506,7 @@ class LatestWinsJointPlanWorker:
                 failed_count=self._failed_count,
                 dropped_pending_count=self._dropped_pending_count,
                 coalesced_pending_count=self._coalesced_pending_count,
+                superseded_result_count=self._superseded_result_count,
                 pending_count=int(self._pending is not None),
                 busy=self._busy,
                 latest_published_sequence=(
@@ -503,6 +548,8 @@ class LatestWinsJointPlanWorker:
             snapshot_materialize_ms = 0.0
             state_stamp = None
             trigger = "legacy_policy_input"
+            trigger_interval_ms = None
+            planning_budget_ms = None
             try:
                 if item.deltas:
                     assert self.assembler is not None
@@ -522,9 +569,27 @@ class LatestWinsJointPlanWorker:
                     )
                     state_stamp = delta.stamp
                     trigger = delta.trigger
+                    if self._last_trigger_capture_ms is not None:
+                        trigger_interval_ms = max(
+                            0.0,
+                            delta.captured_monotonic_ms
+                            - self._last_trigger_capture_ms,
+                        )
+                    self._last_trigger_capture_ms = delta.captured_monotonic_ms
                 if policy_input is None:
                     raise RuntimeError("joint shadow work item has no policy input")
-                plan = self.planner.plan(policy_input)
+                budget_for_trigger = getattr(
+                    self.planner, "trigger_budget_ms", None
+                )
+                if callable(budget_for_trigger):
+                    planning_budget_ms = budget_for_trigger(trigger_interval_ms)
+                    plan = self.planner.plan(
+                        policy_input,
+                        planning_budget_ms=planning_budget_ms,
+                        cancel_check=lambda: self._has_newer_pending(item.sequence),
+                    )
+                else:
+                    plan = self.planner.plan(policy_input)
             except Exception as caught:
                 error = f"{type(caught).__name__}: {caught}"
             completed_ms = _monotonic_ms()
@@ -546,15 +611,27 @@ class LatestWinsJointPlanWorker:
                 snapshot_materialize_ms=snapshot_materialize_ms,
                 state_stamp=state_stamp,
                 trigger=trigger,
+                trigger_interval_ms=trigger_interval_ms,
+                planning_budget_ms=planning_budget_ms,
             )
             with self._condition:
                 self._busy = False
                 self._completed_count += 1
                 if error is not None:
                     self._failed_count += 1
-                if self._latest is None or result.sequence > self._latest.sequence:
+                superseded = (
+                    self._pending is not None
+                    and self._pending.sequence > result.sequence
+                )
+                if superseded:
+                    self._superseded_result_count += 1
+                elif self._latest is None or result.sequence > self._latest.sequence:
                     self._latest = result
                 self._condition.notify_all()
+
+    def _has_newer_pending(self, sequence: int) -> bool:
+        with self._condition:
+            return self._pending is not None and self._pending.sequence > sequence
 
     def __enter__(self) -> "LatestWinsJointPlanWorker":
         return self

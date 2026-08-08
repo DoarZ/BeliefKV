@@ -1,0 +1,1004 @@
+{
+  "batch_count": 49,
+  "batches": [
+    {
+      "batch_id": "p6-001-calibration-astropy__astropy-v1_3-r0",
+      "concurrency": 3,
+      "docker_image": "swebench/sweb.eval.x86_64.astropy_1776_astropy-7336:latest",
+      "instance_ids": [
+        "astropy__astropy-7336",
+        "astropy__astropy-7606",
+        "astropy__astropy-7671"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "astropy/astropy",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/astropy__astropy",
+      "source_url": "https://github.com/astropy/astropy.git",
+      "split": "calibration",
+      "version": "1.3",
+      "workflow_count": 3,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-001-calibration-astropy__astropy-v1_3-r0.json"
+    },
+    {
+      "batch_id": "p6-002-calibration-astropy__astropy-v1_3-r1",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.astropy_1776_astropy-7336:latest",
+      "instance_ids": [
+        "astropy__astropy-7336"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "astropy/astropy",
+      "rollout_index": 1,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/astropy__astropy",
+      "source_url": "https://github.com/astropy/astropy.git",
+      "split": "calibration",
+      "version": "1.3",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-002-calibration-astropy__astropy-v1_3-r1.json"
+    },
+    {
+      "batch_id": "p6-003-calibration-astropy__astropy-v1_3-r2",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.astropy_1776_astropy-7336:latest",
+      "instance_ids": [
+        "astropy__astropy-7336"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "astropy/astropy",
+      "rollout_index": 2,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/astropy__astropy",
+      "source_url": "https://github.com/astropy/astropy.git",
+      "split": "calibration",
+      "version": "1.3",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-003-calibration-astropy__astropy-v1_3-r2.json"
+    },
+    {
+      "batch_id": "p6-004-calibration-astropy__astropy-v5_0-r0",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.astropy_1776_astropy-13398:latest",
+      "instance_ids": [
+        "astropy__astropy-13398",
+        "astropy__astropy-13579"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "astropy/astropy",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/astropy__astropy",
+      "source_url": "https://github.com/astropy/astropy.git",
+      "split": "calibration",
+      "version": "5.0",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-004-calibration-astropy__astropy-v5_0-r0.json"
+    },
+    {
+      "batch_id": "p6-005-calibration-astropy__astropy-v5_1-r0",
+      "concurrency": 3,
+      "docker_image": "swebench/sweb.eval.x86_64.astropy_1776_astropy-14096:latest",
+      "instance_ids": [
+        "astropy__astropy-14096",
+        "astropy__astropy-14365",
+        "astropy__astropy-14369"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "astropy/astropy",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/astropy__astropy",
+      "source_url": "https://github.com/astropy/astropy.git",
+      "split": "calibration",
+      "version": "5.1",
+      "workflow_count": 3,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-005-calibration-astropy__astropy-v5_1-r0.json"
+    },
+    {
+      "batch_id": "p6-006-calibration-sphinx-doc__sphinx-v3_1-r0",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-7748:latest",
+      "instance_ids": [
+        "sphinx-doc__sphinx-7748",
+        "sphinx-doc__sphinx-7757"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "sphinx-doc/sphinx",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/sphinx-doc__sphinx",
+      "source_url": "https://github.com/sphinx-doc/sphinx.git",
+      "split": "calibration",
+      "version": "3.1",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-006-calibration-sphinx-doc__sphinx-v3_1-r0.json"
+    },
+    {
+      "batch_id": "p6-007-calibration-sphinx-doc__sphinx-v3_2-r0",
+      "concurrency": 3,
+      "docker_image": "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-7985:latest",
+      "instance_ids": [
+        "sphinx-doc__sphinx-7985",
+        "sphinx-doc__sphinx-8035",
+        "sphinx-doc__sphinx-8056"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "sphinx-doc/sphinx",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/sphinx-doc__sphinx",
+      "source_url": "https://github.com/sphinx-doc/sphinx.git",
+      "split": "calibration",
+      "version": "3.2",
+      "workflow_count": 3,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-007-calibration-sphinx-doc__sphinx-v3_2-r0.json"
+    },
+    {
+      "batch_id": "p6-008-calibration-sphinx-doc__sphinx-v3_2-r1",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-7985:latest",
+      "instance_ids": [
+        "sphinx-doc__sphinx-7985"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "sphinx-doc/sphinx",
+      "rollout_index": 1,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/sphinx-doc__sphinx",
+      "source_url": "https://github.com/sphinx-doc/sphinx.git",
+      "split": "calibration",
+      "version": "3.2",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-008-calibration-sphinx-doc__sphinx-v3_2-r1.json"
+    },
+    {
+      "batch_id": "p6-009-calibration-sphinx-doc__sphinx-v3_2-r2",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-7985:latest",
+      "instance_ids": [
+        "sphinx-doc__sphinx-7985"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "sphinx-doc/sphinx",
+      "rollout_index": 2,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/sphinx-doc__sphinx",
+      "source_url": "https://github.com/sphinx-doc/sphinx.git",
+      "split": "calibration",
+      "version": "3.2",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-009-calibration-sphinx-doc__sphinx-v3_2-r2.json"
+    },
+    {
+      "batch_id": "p6-010-calibration-sphinx-doc__sphinx-v4_1-r0",
+      "concurrency": 3,
+      "docker_image": "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-9229:latest",
+      "instance_ids": [
+        "sphinx-doc__sphinx-9229",
+        "sphinx-doc__sphinx-9230",
+        "sphinx-doc__sphinx-9320"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "sphinx-doc/sphinx",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/sphinx-doc__sphinx",
+      "source_url": "https://github.com/sphinx-doc/sphinx.git",
+      "split": "calibration",
+      "version": "4.1",
+      "workflow_count": 3,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-010-calibration-sphinx-doc__sphinx-v4_1-r0.json"
+    },
+    {
+      "batch_id": "p6-011-calibration-sphinx-doc__sphinx-v4_1-r1",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-9230:latest",
+      "instance_ids": [
+        "sphinx-doc__sphinx-9230",
+        "sphinx-doc__sphinx-9320"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "sphinx-doc/sphinx",
+      "rollout_index": 1,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/sphinx-doc__sphinx",
+      "source_url": "https://github.com/sphinx-doc/sphinx.git",
+      "split": "calibration",
+      "version": "4.1",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-011-calibration-sphinx-doc__sphinx-v4_1-r1.json"
+    },
+    {
+      "batch_id": "p6-012-calibration-sphinx-doc__sphinx-v4_1-r2",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-9230:latest",
+      "instance_ids": [
+        "sphinx-doc__sphinx-9230",
+        "sphinx-doc__sphinx-9320"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "sphinx-doc/sphinx",
+      "rollout_index": 2,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/sphinx-doc__sphinx",
+      "source_url": "https://github.com/sphinx-doc/sphinx.git",
+      "split": "calibration",
+      "version": "4.1",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-012-calibration-sphinx-doc__sphinx-v4_1-r2.json"
+    },
+    {
+      "batch_id": "p6-013-test_id-matplotlib__matplotlib-v3_5-r0",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-22865:latest",
+      "instance_ids": [
+        "matplotlib__matplotlib-22865",
+        "matplotlib__matplotlib-22871"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "matplotlib/matplotlib",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/matplotlib__matplotlib",
+      "source_url": "https://github.com/matplotlib/matplotlib.git",
+      "split": "test_id",
+      "version": "3.5",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-013-test_id-matplotlib__matplotlib-v3_5-r0.json"
+    },
+    {
+      "batch_id": "p6-014-test_id-matplotlib__matplotlib-v3_5-r1",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-22871:latest",
+      "instance_ids": [
+        "matplotlib__matplotlib-22871"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "matplotlib/matplotlib",
+      "rollout_index": 1,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/matplotlib__matplotlib",
+      "source_url": "https://github.com/matplotlib/matplotlib.git",
+      "split": "test_id",
+      "version": "3.5",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-014-test_id-matplotlib__matplotlib-v3_5-r1.json"
+    },
+    {
+      "batch_id": "p6-015-test_id-matplotlib__matplotlib-v3_5-r2",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-22871:latest",
+      "instance_ids": [
+        "matplotlib__matplotlib-22871"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "matplotlib/matplotlib",
+      "rollout_index": 2,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/matplotlib__matplotlib",
+      "source_url": "https://github.com/matplotlib/matplotlib.git",
+      "split": "test_id",
+      "version": "3.5",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-015-test_id-matplotlib__matplotlib-v3_5-r2.json"
+    },
+    {
+      "batch_id": "p6-016-test_id-matplotlib__matplotlib-v3_6-r0",
+      "concurrency": 3,
+      "docker_image": "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-24026:latest",
+      "instance_ids": [
+        "matplotlib__matplotlib-24026",
+        "matplotlib__matplotlib-24627",
+        "matplotlib__matplotlib-24637"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "matplotlib/matplotlib",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/matplotlib__matplotlib",
+      "source_url": "https://github.com/matplotlib/matplotlib.git",
+      "split": "test_id",
+      "version": "3.6",
+      "workflow_count": 3,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-016-test_id-matplotlib__matplotlib-v3_6-r0.json"
+    },
+    {
+      "batch_id": "p6-017-test_id-matplotlib__matplotlib-v3_7-r0",
+      "concurrency": 3,
+      "docker_image": "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-25775:latest",
+      "instance_ids": [
+        "matplotlib__matplotlib-25775",
+        "matplotlib__matplotlib-25960",
+        "matplotlib__matplotlib-26342"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "matplotlib/matplotlib",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/matplotlib__matplotlib",
+      "source_url": "https://github.com/matplotlib/matplotlib.git",
+      "split": "test_id",
+      "version": "3.7",
+      "workflow_count": 3,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-017-test_id-matplotlib__matplotlib-v3_7-r0.json"
+    },
+    {
+      "batch_id": "p6-018-test_id-matplotlib__matplotlib-v3_7-r1",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-26342:latest",
+      "instance_ids": [
+        "matplotlib__matplotlib-26342"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "matplotlib/matplotlib",
+      "rollout_index": 1,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/matplotlib__matplotlib",
+      "source_url": "https://github.com/matplotlib/matplotlib.git",
+      "split": "test_id",
+      "version": "3.7",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-018-test_id-matplotlib__matplotlib-v3_7-r1.json"
+    },
+    {
+      "batch_id": "p6-019-test_id-matplotlib__matplotlib-v3_7-r2",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-26342:latest",
+      "instance_ids": [
+        "matplotlib__matplotlib-26342"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "matplotlib/matplotlib",
+      "rollout_index": 2,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/matplotlib__matplotlib",
+      "source_url": "https://github.com/matplotlib/matplotlib.git",
+      "split": "test_id",
+      "version": "3.7",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-019-test_id-matplotlib__matplotlib-v3_7-r2.json"
+    },
+    {
+      "batch_id": "p6-020-test_id-scikit-learn__scikit-learn-v0_21-r0",
+      "concurrency": 3,
+      "docker_image": "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-12973:latest",
+      "instance_ids": [
+        "scikit-learn__scikit-learn-12973",
+        "scikit-learn__scikit-learn-13124",
+        "scikit-learn__scikit-learn-13135"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "scikit-learn/scikit-learn",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/scikit-learn__scikit-learn",
+      "source_url": "https://github.com/scikit-learn/scikit-learn.git",
+      "split": "test_id",
+      "version": "0.21",
+      "workflow_count": 3,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-020-test_id-scikit-learn__scikit-learn-v0_21-r0.json"
+    },
+    {
+      "batch_id": "p6-021-test_id-scikit-learn__scikit-learn-v0_22-r0",
+      "concurrency": 3,
+      "docker_image": "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-14053:latest",
+      "instance_ids": [
+        "scikit-learn__scikit-learn-14053",
+        "scikit-learn__scikit-learn-14629",
+        "scikit-learn__scikit-learn-14894"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "scikit-learn/scikit-learn",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/scikit-learn__scikit-learn",
+      "source_url": "https://github.com/scikit-learn/scikit-learn.git",
+      "split": "test_id",
+      "version": "0.22",
+      "workflow_count": 3,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-021-test_id-scikit-learn__scikit-learn-v0_22-r0.json"
+    },
+    {
+      "batch_id": "p6-022-test_id-scikit-learn__scikit-learn-v1_3-r0",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-25102:latest",
+      "instance_ids": [
+        "scikit-learn__scikit-learn-25102",
+        "scikit-learn__scikit-learn-25747"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "scikit-learn/scikit-learn",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/scikit-learn__scikit-learn",
+      "source_url": "https://github.com/scikit-learn/scikit-learn.git",
+      "split": "test_id",
+      "version": "1.3",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-022-test_id-scikit-learn__scikit-learn-v1_3-r0.json"
+    },
+    {
+      "batch_id": "p6-023-train-django__django-v3_0-r0",
+      "concurrency": 3,
+      "docker_image": "swebench/sweb.eval.x86_64.django_1776_django-10554:latest",
+      "instance_ids": [
+        "django__django-10554",
+        "django__django-11138",
+        "django__django-11400"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "django/django",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/django__django",
+      "source_url": "https://github.com/django/django.git",
+      "split": "train",
+      "version": "3.0",
+      "workflow_count": 3,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-023-train-django__django-v3_0-r0.json"
+    },
+    {
+      "batch_id": "p6-024-train-django__django-v3_0-r1",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.django_1776_django-10554:latest",
+      "instance_ids": [
+        "django__django-10554",
+        "django__django-11138"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "django/django",
+      "rollout_index": 1,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/django__django",
+      "source_url": "https://github.com/django/django.git",
+      "split": "train",
+      "version": "3.0",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-024-train-django__django-v3_0-r1.json"
+    },
+    {
+      "batch_id": "p6-025-train-django__django-v3_0-r2",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.django_1776_django-10554:latest",
+      "instance_ids": [
+        "django__django-10554",
+        "django__django-11138"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "django/django",
+      "rollout_index": 2,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/django__django",
+      "source_url": "https://github.com/django/django.git",
+      "split": "train",
+      "version": "3.0",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-025-train-django__django-v3_0-r2.json"
+    },
+    {
+      "batch_id": "p6-026-train-django__django-v3_2-r0",
+      "concurrency": 3,
+      "docker_image": "swebench/sweb.eval.x86_64.django_1776_django-13344:latest",
+      "instance_ids": [
+        "django__django-13344",
+        "django__django-13449",
+        "django__django-13837"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "django/django",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/django__django",
+      "source_url": "https://github.com/django/django.git",
+      "split": "train",
+      "version": "3.2",
+      "workflow_count": 3,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-026-train-django__django-v3_2-r0.json"
+    },
+    {
+      "batch_id": "p6-027-train-django__django-v3_2-r1",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.django_1776_django-13344:latest",
+      "instance_ids": [
+        "django__django-13344",
+        "django__django-13837"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "django/django",
+      "rollout_index": 1,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/django__django",
+      "source_url": "https://github.com/django/django.git",
+      "split": "train",
+      "version": "3.2",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-027-train-django__django-v3_2-r1.json"
+    },
+    {
+      "batch_id": "p6-028-train-django__django-v3_2-r2",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.django_1776_django-13344:latest",
+      "instance_ids": [
+        "django__django-13344",
+        "django__django-13837"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "django/django",
+      "rollout_index": 2,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/django__django",
+      "source_url": "https://github.com/django/django.git",
+      "split": "train",
+      "version": "3.2",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-028-train-django__django-v3_2-r2.json"
+    },
+    {
+      "batch_id": "p6-029-train-django__django-v4_0-r0",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.django_1776_django-14011:latest",
+      "instance_ids": [
+        "django__django-14011",
+        "django__django-14631"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "django/django",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/django__django",
+      "source_url": "https://github.com/django/django.git",
+      "split": "train",
+      "version": "4.0",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-029-train-django__django-v4_0-r0.json"
+    },
+    {
+      "batch_id": "p6-030-train-mwaskom__seaborn-v0_12-r0",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.mwaskom_1776_seaborn-3187:latest",
+      "instance_ids": [
+        "mwaskom__seaborn-3187"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "mwaskom/seaborn",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/mwaskom__seaborn",
+      "source_url": "https://github.com/mwaskom/seaborn.git",
+      "split": "train",
+      "version": "0.12",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-030-train-mwaskom__seaborn-v0_12-r0.json"
+    },
+    {
+      "batch_id": "p6-031-train-pallets__flask-v2_3-r0",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.pallets_1776_flask-5014:latest",
+      "instance_ids": [
+        "pallets__flask-5014"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "pallets/flask",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pallets__flask",
+      "source_url": "https://github.com/pallets/flask.git",
+      "split": "train",
+      "version": "2.3",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-031-train-pallets__flask-v2_3-r0.json"
+    },
+    {
+      "batch_id": "p6-032-train-psf__requests-v1_1-r0",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.psf_1776_requests-1142:latest",
+      "instance_ids": [
+        "psf__requests-1142"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "psf/requests",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/psf__requests",
+      "source_url": "https://github.com/psf/requests.git",
+      "split": "train",
+      "version": "1.1",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-032-train-psf__requests-v1_1-r0.json"
+    },
+    {
+      "batch_id": "p6-033-train-psf__requests-v2_0-r0",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.psf_1776_requests-1766:latest",
+      "instance_ids": [
+        "psf__requests-1766"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "psf/requests",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/psf__requests",
+      "source_url": "https://github.com/psf/requests.git",
+      "split": "train",
+      "version": "2.0",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-033-train-psf__requests-v2_0-r0.json"
+    },
+    {
+      "batch_id": "p6-034-train-psf__requests-v2_26-r0",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.psf_1776_requests-5414:latest",
+      "instance_ids": [
+        "psf__requests-5414"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "psf/requests",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/psf__requests",
+      "source_url": "https://github.com/psf/requests.git",
+      "split": "train",
+      "version": "2.26",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-034-train-psf__requests-v2_26-r0.json"
+    },
+    {
+      "batch_id": "p6-035-train-pydata__xarray-v0_12-r0",
+      "concurrency": 3,
+      "docker_image": "swebench/sweb.eval.x86_64.pydata_1776_xarray-3095:latest",
+      "instance_ids": [
+        "pydata__xarray-3095",
+        "pydata__xarray-3677",
+        "pydata__xarray-3993"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "pydata/xarray",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pydata__xarray",
+      "source_url": "https://github.com/pydata/xarray.git",
+      "split": "train",
+      "version": "0.12",
+      "workflow_count": 3,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-035-train-pydata__xarray-v0_12-r0.json"
+    },
+    {
+      "batch_id": "p6-036-train-pydata__xarray-v2022_06-r0",
+      "concurrency": 3,
+      "docker_image": "swebench/sweb.eval.x86_64.pydata_1776_xarray-6721:latest",
+      "instance_ids": [
+        "pydata__xarray-6721",
+        "pydata__xarray-6744",
+        "pydata__xarray-6938"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "pydata/xarray",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pydata__xarray",
+      "source_url": "https://github.com/pydata/xarray.git",
+      "split": "train",
+      "version": "2022.06",
+      "workflow_count": 3,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-036-train-pydata__xarray-v2022_06-r0.json"
+    },
+    {
+      "batch_id": "p6-037-train-pydata__xarray-v2022_09-r0",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.pydata_1776_xarray-7229:latest",
+      "instance_ids": [
+        "pydata__xarray-7229",
+        "pydata__xarray-7233"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "pydata/xarray",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pydata__xarray",
+      "source_url": "https://github.com/pydata/xarray.git",
+      "split": "train",
+      "version": "2022.09",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-037-train-pydata__xarray-v2022_09-r0.json"
+    },
+    {
+      "batch_id": "p6-038-train-pydata__xarray-v2022_09-r1",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.pydata_1776_xarray-7229:latest",
+      "instance_ids": [
+        "pydata__xarray-7229"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "pydata/xarray",
+      "rollout_index": 1,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pydata__xarray",
+      "source_url": "https://github.com/pydata/xarray.git",
+      "split": "train",
+      "version": "2022.09",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-038-train-pydata__xarray-v2022_09-r1.json"
+    },
+    {
+      "batch_id": "p6-039-train-pydata__xarray-v2022_09-r2",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.pydata_1776_xarray-7229:latest",
+      "instance_ids": [
+        "pydata__xarray-7229"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "pydata/xarray",
+      "rollout_index": 2,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pydata__xarray",
+      "source_url": "https://github.com/pydata/xarray.git",
+      "split": "train",
+      "version": "2022.09",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-039-train-pydata__xarray-v2022_09-r2.json"
+    },
+    {
+      "batch_id": "p6-040-train-pylint-dev__pylint-v2_10-r0",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.pylint-dev_1776_pylint-4661:latest",
+      "instance_ids": [
+        "pylint-dev__pylint-4661",
+        "pylint-dev__pylint-4970"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "pylint-dev/pylint",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pylint-dev__pylint",
+      "source_url": "https://github.com/pylint-dev/pylint.git",
+      "split": "train",
+      "version": "2.10",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-040-train-pylint-dev__pylint-v2_10-r0.json"
+    },
+    {
+      "batch_id": "p6-041-train-pylint-dev__pylint-v2_10-r1",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.pylint-dev_1776_pylint-4970:latest",
+      "instance_ids": [
+        "pylint-dev__pylint-4970"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "pylint-dev/pylint",
+      "rollout_index": 1,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pylint-dev__pylint",
+      "source_url": "https://github.com/pylint-dev/pylint.git",
+      "split": "train",
+      "version": "2.10",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-041-train-pylint-dev__pylint-v2_10-r1.json"
+    },
+    {
+      "batch_id": "p6-042-train-pylint-dev__pylint-v2_10-r2",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.pylint-dev_1776_pylint-4970:latest",
+      "instance_ids": [
+        "pylint-dev__pylint-4970"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "pylint-dev/pylint",
+      "rollout_index": 2,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pylint-dev__pylint",
+      "source_url": "https://github.com/pylint-dev/pylint.git",
+      "split": "train",
+      "version": "2.10",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-042-train-pylint-dev__pylint-v2_10-r2.json"
+    },
+    {
+      "batch_id": "p6-043-train-pylint-dev__pylint-v2_14-r0",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.pylint-dev_1776_pylint-6386:latest",
+      "instance_ids": [
+        "pylint-dev__pylint-6386",
+        "pylint-dev__pylint-6528"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "pylint-dev/pylint",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pylint-dev__pylint",
+      "source_url": "https://github.com/pylint-dev/pylint.git",
+      "split": "train",
+      "version": "2.14",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-043-train-pylint-dev__pylint-v2_14-r0.json"
+    },
+    {
+      "batch_id": "p6-044-train-pylint-dev__pylint-v2_14-r1",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.pylint-dev_1776_pylint-6528:latest",
+      "instance_ids": [
+        "pylint-dev__pylint-6528"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "pylint-dev/pylint",
+      "rollout_index": 1,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pylint-dev__pylint",
+      "source_url": "https://github.com/pylint-dev/pylint.git",
+      "split": "train",
+      "version": "2.14",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-044-train-pylint-dev__pylint-v2_14-r1.json"
+    },
+    {
+      "batch_id": "p6-045-train-pylint-dev__pylint-v2_14-r2",
+      "concurrency": 1,
+      "docker_image": "swebench/sweb.eval.x86_64.pylint-dev_1776_pylint-6528:latest",
+      "instance_ids": [
+        "pylint-dev__pylint-6528"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "pylint-dev/pylint",
+      "rollout_index": 2,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pylint-dev__pylint",
+      "source_url": "https://github.com/pylint-dev/pylint.git",
+      "split": "train",
+      "version": "2.14",
+      "workflow_count": 1,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-045-train-pylint-dev__pylint-v2_14-r2.json"
+    },
+    {
+      "batch_id": "p6-046-train-pylint-dev__pylint-v2_15-r0",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.pylint-dev_1776_pylint-6903:latest",
+      "instance_ids": [
+        "pylint-dev__pylint-6903",
+        "pylint-dev__pylint-7080"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "pylint-dev/pylint",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pylint-dev__pylint",
+      "source_url": "https://github.com/pylint-dev/pylint.git",
+      "split": "train",
+      "version": "2.15",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-046-train-pylint-dev__pylint-v2_15-r0.json"
+    },
+    {
+      "batch_id": "p6-047-train-pytest-dev__pytest-v5_4-r0",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-7236:latest",
+      "instance_ids": [
+        "pytest-dev__pytest-7236",
+        "pytest-dev__pytest-7324"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "pytest-dev/pytest",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pytest-dev__pytest",
+      "source_url": "https://github.com/pytest-dev/pytest.git",
+      "split": "train",
+      "version": "5.4",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-047-train-pytest-dev__pytest-v5_4-r0.json"
+    },
+    {
+      "batch_id": "p6-048-train-pytest-dev__pytest-v6_0-r0",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-7490:latest",
+      "instance_ids": [
+        "pytest-dev__pytest-7490",
+        "pytest-dev__pytest-7571"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "pytest-dev/pytest",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pytest-dev__pytest",
+      "source_url": "https://github.com/pytest-dev/pytest.git",
+      "split": "train",
+      "version": "6.0",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-048-train-pytest-dev__pytest-v6_0-r0.json"
+    },
+    {
+      "batch_id": "p6-049-train-pytest-dev__pytest-v7_2-r0",
+      "concurrency": 2,
+      "docker_image": "swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-10051:latest",
+      "instance_ids": [
+        "pytest-dev__pytest-10051",
+        "pytest-dev__pytest-10356"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "project": "pytest-dev/pytest",
+      "rollout_index": 0,
+      "source_repo": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pytest-dev__pytest",
+      "source_url": "https://github.com/pytest-dev/pytest.git",
+      "split": "train",
+      "version": "7.2",
+      "workflow_count": 2,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v1/workload_manifests/p6-049-train-pytest-dev__pytest-v7_2-r0.json"
+    }
+  ],
+  "dataset": "princeton-nlp/SWE-bench_Verified",
+  "dataset_revision": "91aa3ed51b709be6457e12d00300a6a596d4c6a3",
+  "frozen": true,
+  "plan_id": "p6-agent-semantics-v1",
+  "predictive_actions_enabled": false,
+  "predictor_enabled": false,
+  "repeat_fraction": 0.2,
+  "repeat_rollouts": 3,
+  "repository_count": 11,
+  "runtime_policy": "frozen_p5_observed",
+  "schema_version": 1,
+  "source_root": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified",
+  "split_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/swebench_verified_split_v1.json",
+  "tasks_per_project_cap": 8,
+  "unique_task_count": 65,
+  "unique_task_counts_by_split": {
+    "calibration": 16,
+    "test_id": 16,
+    "train": 33
+  },
+  "workflow_count": 91,
+  "workflow_counts_by_split": {
+    "calibration": 24,
+    "test_id": 20,
+    "train": 47
+  }
+}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 
 from beliefkv.control.controller import BeliefKVController
 from beliefkv.core.config import BeliefKVConfig
@@ -9,6 +10,7 @@ from beliefkv.policy.joint_scheduler import (
     JointPlannerConfig,
     ObservedJointPlanner,
 )
+from beliefkv.policy.reference import MetadataSource, RunnableInvocation
 from beliefkv.policy.resource_snapshot import RuntimeResourceObservation
 from beliefkv.runtime.joint_shadow import (
     IncrementalPolicyInputAssembler,
@@ -231,6 +233,74 @@ def test_worker_replaces_only_the_pending_snapshot() -> None:
     assert stats.completed_count == 2
     assert stats.dropped_pending_count == 1
     assert worker.close()
+
+
+def test_assembler_attaches_frontier_predictions_to_policy_input() -> None:
+    config = BeliefKVConfig(
+        hbm_capacity_bytes=1_000,
+        host_capacity_bytes=1_000,
+        reserve_hbm_bytes=0,
+        predictor_enabled=False,
+        shadow_enabled=False,
+    )
+    controller = BeliefKVController(config)
+    controller.process_runtime_events(
+        (
+            _event(1, RuntimeEventKind.WORKFLOW_START),
+            _event(
+                2,
+                RuntimeEventKind.INVOCATION_CREATE,
+                invocation_id="root",
+                context_id="ctx",
+                context_epoch=0,
+            ),
+        )
+    )
+    handle = PageHandle(1, 0)
+    controller.page_index.register_page(handle, size_bytes=100)
+    controller.page_index.bind_pages("ctx", 0, (handle,))
+    delta = _delta(
+        controller,
+        event_sequence=0,
+        page_revision=0,
+        ts_ms=2,
+    )
+    request = RunnableInvocation(
+        request_id="request-root",
+        workflow_id="wf",
+        invocation_id="root",
+        context_id="ctx",
+        context_epoch=0,
+        submitted_ts_ms=1.0,
+        startup_bytes=100,
+        predicted_remaining_decode_tokens=64.0,
+        predicted_external_wait_ms=512.0,
+        prediction_support_level="backoff",
+        prediction_ood_reasons=("ood_unknown_project",),
+    )
+    delta = replace(
+        delta,
+        runnable_frontier=(request,),
+        frontier_predictions={
+            "root": {
+                "remaining_decode_tokens_p50": 64.0,
+                "remaining_external_wait_ms_p50": 512.0,
+                "next_output_tokens_p50": 53.0,
+                "support_level": "backoff",
+                "ood_reasons": ["ood_unknown_project"],
+            }
+        },
+    )
+
+    assembler = IncrementalPolicyInputAssembler(config)
+    assembler.apply(delta)
+    policy_input = assembler.build()
+
+    metadata = policy_input.optional_metadata.get("frontier_predictions")
+    assert metadata is not None
+    assert metadata.source == MetadataSource.PREDICTED
+    assert metadata.value["root"]["remaining_decode_tokens_p50"] == 64.0
+    assert policy_input.runnable_frontier[0].predicted_remaining_decode_tokens == 64.0
 
 
 def test_worker_contains_planner_failure_and_remains_closeable() -> None:

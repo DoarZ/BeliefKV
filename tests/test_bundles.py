@@ -119,6 +119,50 @@ def test_locked_large_extent_does_not_hide_independent_reclaimable_bundle() -> N
     assert by_handles[(free,)].bundle.marginal_reclaimable_bytes == 500
 
 
+def test_bundle_preview_audit_is_bounded_and_summarizes_omitted_extents() -> None:
+    controller = BeliefKVController(
+        BeliefKVConfig(
+            hbm_capacity_bytes=2000,
+            host_capacity_bytes=10_000,
+            reserve_hbm_bytes=1500,
+            urgent_chunk_bytes=2000,
+            predictor_enabled=False,
+            shadow_enabled=False,
+            bundle_preview_audit_max_detailed_per_cycle=1,
+        )
+    )
+    controller.process_runtime_events(
+        (
+            _event(0, RuntimeEventKind.WORKFLOW_START),
+            _event(
+                1,
+                RuntimeEventKind.INVOCATION_CREATE,
+                invocation_id="parked",
+                context_id="ctx",
+            ),
+            _event(2, RuntimeEventKind.TOOL_START, invocation_id="parked"),
+        )
+    )
+    handles = (PageHandle(101, 0), PageHandle(102, 0), PageHandle(103, 0))
+    for handle in handles:
+        controller.page_index.register_page(handle, size_bytes=400)
+    controller.page_index.bind_pages("ctx", 0, handles)
+
+    tick = controller.tick(3)
+
+    detailed = [
+        item for item in tick.bundle_preview_events
+        if item.kind == "physical_bundle_preview"
+    ]
+    summaries = [
+        item for item in tick.bundle_preview_events
+        if item.kind == "physical_bundle_preview_summary"
+    ]
+    assert len(detailed) == 1
+    assert len(summaries) == 1
+    assert summaries[0].fields["omitted_count"] >= 1
+
+
 def test_retraction_owner_bypass_is_scoped_to_selected_contexts() -> None:
     graph, index = _runtime(
         ("victim", "ctx-victim", "wf"),

@@ -1,0 +1,215 @@
+digraph BeliefKVJointPlanEpoch {
+  graph [
+    rankdir=TB,
+    ordering=out,
+    newrank=true,
+    compound=true,
+    splines=polyline,
+    nodesep=0.42,
+    ranksep=0.58,
+    pad=0.28,
+    bgcolor="#FFFFFF",
+    fontname="Noto Sans CJK SC",
+    fontsize=21,
+    fontcolor="#17212B",
+    labelloc=t,
+    label="BeliefKV JointPlan：一个 Scheduler Epoch 内的 Agent / KV 联合控制"
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Noto Sans CJK SC",
+    fontsize=10.5,
+    margin="0.16,0.11",
+    penwidth=1.4,
+    color="#52606D",
+    fillcolor="#FFFFFF",
+    fontcolor="#17212B"
+  ];
+
+  edge [
+    fontname="Noto Sans CJK SC",
+    fontsize=9,
+    color="#52606D",
+    fontcolor="#3C4855",
+    penwidth=1.25,
+    arrowsize=0.72
+  ];
+
+  subgraph cluster_observed {
+    label="1. 当前事实（增量维护）";
+    color="#8CA0B3";
+    style="rounded";
+    margin=15;
+
+    events [
+      label="Runtime 因果事件\nSPAWN / WAIT / RETURN\nMESSAGE / HANDOFF / TOOL",
+      fillcolor="#E8F0FA",
+      color="#34699A"
+    ];
+    queue [
+      label="SGLang Visible Waiting Queue\nr1  r2  r3  r4 ...\n请求始终归 SGLang 所有",
+      fillcolor="#E8F0FA",
+      color="#34699A",
+      penwidth=2.0
+    ];
+    physical [
+      label="物理 KV / 资源事实\nRadix ownership + closure\nHBM / Host / lock / PCIe",
+      fillcolor="#E8F0FA",
+      color="#34699A"
+    ];
+    service [
+      label="执行与公平记账\n实际 GPU service\nwait age / virtual runtime",
+      fillcolor="#F1F4F7",
+      color="#657786"
+    ];
+
+    { rank=same; events; queue; physical; service; }
+    events -> queue [style=invis, weight=20];
+    queue -> physical [style=invis, weight=20];
+    physical -> service [style=invis, weight=20];
+  }
+
+  subgraph cluster_planner {
+    label="2. JointPlan 生成与当前状态提交";
+    color="#5E8C6A";
+    style="rounded";
+    margin=15;
+
+    rccg [
+      label="Observed RCCG Frontier\n只包含已经创建且 READY 的 invocation\nWAIT 状态只贡献 KV obligation",
+      fillcolor="#E5F4EA",
+      color="#2D7A4B"
+    ];
+    semantic [
+      label="Async Semantic JointPlanner\n联合选择 execution / admission\nsemantic residency / retraction",
+      fillcolor="#E5F4EA",
+      color="#2D7A4B",
+      penwidth=2.0
+    ];
+    validate [
+      label="Safe-point Scoped Validation\n只提交仍新鲜的 action slice\n语义 target 解析为当前 physical bundle",
+      fillcolor="#FFF3D6",
+      color="#A66A00"
+    ];
+    mode [
+      label="JointPlanEpoch\nOPTIMIZED / BOUNDED_SEED\nEMERGENCY / NO_ACTION",
+      fillcolor="#FFF3D6",
+      color="#A66A00"
+    ];
+
+    { rank=same; rccg; semantic; }
+    { rank=same; validate; mode; }
+    rccg -> semantic [label="候选 agent + causal value"];
+    semantic -> validate [label="版本化 JointPlan"];
+    validate -> mode [label="最大有效依赖闭包"];
+  }
+
+  subgraph cluster_intents {
+    label="3. 同一个计划中的四类动作";
+    color="#A88339";
+    style="rounded";
+    margin=15;
+
+    execution [
+      label="ExecutionIntent\n本 epoch 候选顺序\n[r3, r1, r4, ...]",
+      fillcolor="#FFF7E6",
+      color="#A66A00"
+    ];
+    admission [
+      label="AdmissionIntent\nr3: ADMIT\nr1: RESTORE_THEN_ADMIT\nr2: DEFER",
+      fillcolor="#FFF7E6",
+      color="#A66A00",
+      penwidth=2.0
+    ];
+    residency [
+      label="SemanticResidencyTarget\nPREFETCH_GPU / COMMIT_CPU\n无 target 即保持当前驻留",
+      fillcolor="#FFF7E6",
+      color="#A66A00"
+    ];
+    retraction [
+      label="RetractionIntent\nPAUSE 指定 running request\n释放 private KV / lock owner",
+      fillcolor="#FFF7E6",
+      color="#A66A00"
+    ];
+
+    { rank=same; execution; admission; residency; retraction; }
+    execution -> admission [style=invis, weight=20];
+    admission -> residency [style=invis, weight=20];
+    residency -> retraction [style=invis, weight=20];
+  }
+
+  subgraph cluster_commit {
+    label="4. SGLang 最终提交（BeliefKV 不替代 allocator）";
+    color="#8CA0B3";
+    style="rounded";
+    margin=15;
+
+    ticket [
+      label="Batch-epoch Ticket Compiler\n只发短期资格，不预留长期 HBM\n无 ticket 请求本轮跳过",
+      fillcolor="#E8F0FA",
+      color="#34699A"
+    ];
+    prefill [
+      label="SGLang PrefillAdder + Allocator\nprefix rematch / token budget / page allocation\n决定真正进入 batch 的请求",
+      fillcolor="#E8F0FA",
+      color="#34699A",
+      penwidth=2.0
+    ];
+    arbiter [
+      label="Physical Solver + RadixArbiter\nblocker closure / generation / lock 校验\n每次至多提交一个 residency command",
+      fillcolor="#FDEBEC",
+      color="#B23A48"
+    ];
+    hardware [
+      label="GPU HBM  <--- PCIe --->  CPU DRAM\nPrefill / Decode / H2D / D2H / Drop",
+      fillcolor="#FDEBEC",
+      color="#B23A48"
+    ];
+    ack [
+      label="ACK + Actual Bytes + Batch Result\n完成后才更新 residency / service\n并使相关旧 plan 失效",
+      fillcolor="#E5F4EA",
+      color="#2D7A4B"
+    ];
+
+    ticket -> prefill [label="eligible request view"];
+    arbiter -> hardware [label="physical command"];
+    prefill -> hardware [label="selected batch"];
+    hardware -> ack [label="真实结果"];
+  }
+
+  events -> rccg [label="更新因果状态"];
+  queue -> semantic [label="visible requests"];
+  physical -> semantic [label="HBM / bundle obligations"];
+  service -> semantic [label="soft fairness / progress"];
+
+  mode -> execution;
+  mode -> admission;
+  mode -> residency;
+  mode -> retraction;
+
+  execution -> ticket [label="顺序"];
+  admission -> ticket [label="ADMIT / DEFER"];
+  residency -> arbiter [label="context-tier target"];
+  retraction -> arbiter [label="victim + blocker set"];
+  residency -> ticket [label="restore ACK dependency", style=dashed, color="#A66A00"];
+  retraction -> ticket [label="reclaim ACK dependency", style=dashed, color="#A66A00"];
+
+  next_epoch [
+    label="下一 epoch 的增量状态\nRCCG progress + request result\nactual residency / bytes + GPU service",
+    fillcolor="#E5F4EA",
+    color="#2D7A4B",
+    penwidth=1.8
+  ];
+  ack -> next_epoch [label="commit observed result", color="#2D7A4B"];
+  next_epoch -> events [label="反馈到下一轮", color="#2D7A4B", constraint=false];
+
+  legend [
+    label="蓝色：SGLang/物理真相源    绿色：因果与联合策略    黄色：JointPlan intents    红色：物理执行\n虚线：ACK 前不能越过的依赖；任一物理动作都可被 SGLang/RadixArbiter 拒绝",
+    fillcolor="#F7F9FB",
+    color="#7C8B99",
+    fontsize=9.5
+  ];
+  next_epoch -> legend [style=invis, weight=10];
+}

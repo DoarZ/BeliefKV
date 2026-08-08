@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 
 from beliefkv.control.causal_graph import InvocationState, RuntimeCausalContextGraph
 from beliefkv.policy.causal_frontier import CausalFrontierScheduler
@@ -31,6 +32,11 @@ class TransferPlannerConfig:
     prefetch_chunk_bytes: int = 256 * 1024 * 1024
     prefetch_horizon_ms: float = 50.0
     prefetch_enabled: bool = True
+    bundle_preview_audit_max_detailed_per_cycle: int = 8
+
+    def __post_init__(self) -> None:
+        if self.bundle_preview_audit_max_detailed_per_cycle <= 0:
+            raise ValueError("bundle preview audit limit must be positive")
 
 
 class ReactiveTransferPlanner:
@@ -481,6 +487,11 @@ class ReactiveTransferPlanner:
         previews: tuple[PhysicalBundlePreview, ...],
         now_ms: float,
     ) -> None:
+        detailed_count = 0
+        omitted_count = 0
+        omitted_closure_bytes = 0
+        omitted_reclaimable_bytes = 0
+        omitted_blockers: dict[str, int] = {}
         for preview in previews:
             bundle = preview.bundle
             identity = (
@@ -505,6 +516,18 @@ class ReactiveTransferPlanner:
             if self._last_bundle_fingerprints.get(identity) == preview_state:
                 continue
             self._last_bundle_fingerprints[identity] = preview_state
+            if (
+                detailed_count
+                >= self.config.bundle_preview_audit_max_detailed_per_cycle
+            ):
+                omitted_count += 1
+                omitted_closure_bytes += bundle.closure_bytes
+                omitted_reclaimable_bytes += bundle.marginal_reclaimable_bytes
+                for blocker in preview.blockers:
+                    code = blocker.code.value
+                    omitted_blockers[code] = omitted_blockers.get(code, 0) + 1
+                continue
+            detailed_count += 1
             for owner_context_id in bundle.owner_context_ids:
                 lease = self.bundle_builder.leases.context(
                     owner_context_id, now_ms=now_ms
@@ -557,26 +580,35 @@ class ReactiveTransferPlanner:
                         "context_epoch": preview.context_epoch,
                         "command_kind": preview.command_kind.value,
                         "bundle_id": bundle.bundle_id,
-                        "owner_context_ids": list(bundle.owner_context_ids),
+                        "owner_context_count": len(bundle.owner_context_ids),
+                        "owner_context_digest": self._string_digest(
+                            bundle.owner_context_ids,
+                            person=b"bkv-owner-set",
+                        ),
                         "bundle_scope": bundle.scope.value,
                         "exclusive_action_bytes": bundle.exclusive_action_bytes,
                         "cross_context_action_bytes": (
                             bundle.cross_context_action_bytes
                         ),
-                        "foreign_owner_context_ids": list(
+                        "foreign_owner_context_count": len(
                             bundle.foreign_owner_context_ids
+                        ),
+                        "foreign_owner_context_digest": self._string_digest(
+                            bundle.foreign_owner_context_ids,
+                            person=b"bkv-foreign-set",
                         ),
                         "strongest_lease_kind": (
                             bundle.lease.strongest_kind.value
                         ),
-                        "conditions": [
-                            {
-                                "event_kind": condition.event_kind,
-                                "subject_id": condition.subject_id,
-                                "condition_id": condition.condition_id,
-                            }
-                            for condition in bundle.lease.conditions
-                        ],
+                        "condition_count": len(bundle.lease.conditions),
+                        "condition_digest": self._string_digest(
+                            tuple(
+                                f"{item.event_kind}:{item.subject_id}:"
+                                f"{item.condition_id}"
+                                for item in bundle.lease.conditions
+                            ),
+                            person=b"bkv-condition",
+                        ),
                     },
                 )
             )
@@ -590,24 +622,27 @@ class ReactiveTransferPlanner:
                         "command_kind": preview.command_kind.value,
                         "bundle_id": bundle.bundle_id,
                         "generation_fingerprint": bundle.generation_fingerprint,
-                        "owner_context_ids": list(bundle.owner_context_ids),
+                        "owner_context_count": len(bundle.owner_context_ids),
+                        "owner_context_digest": self._string_digest(
+                            bundle.owner_context_ids,
+                            person=b"bkv-owner-set",
+                        ),
                         "bundle_scope": bundle.scope.value,
                         "exclusive_action_bytes": bundle.exclusive_action_bytes,
                         "cross_context_action_bytes": (
                             bundle.cross_context_action_bytes
                         ),
-                        "foreign_owner_context_ids": list(
+                        "foreign_owner_context_count": len(
                             bundle.foreign_owner_context_ids
                         ),
-                        "closure_handles": [
-                            {
-                                "page_id": handle.page_id,
-                                "allocation_generation": (
-                                    handle.allocation_generation
-                                ),
-                            }
-                            for handle in bundle.handles
-                        ],
+                        "foreign_owner_context_digest": self._string_digest(
+                            bundle.foreign_owner_context_ids,
+                            person=b"bkv-foreign-set",
+                        ),
+                        "closure_handle_count": len(bundle.handles),
+                        "closure_handle_digest": self._handle_digest(
+                            bundle.handles
+                        ),
                         "physical_unique_bytes": bundle.physical_unique_bytes,
                         "gpu_bytes": bundle.gpu_bytes,
                         "cpu_bytes": bundle.cpu_bytes,
@@ -622,27 +657,59 @@ class ReactiveTransferPlanner:
                         "blocker_codes": sorted(
                             {item.code.value for item in preview.blockers}
                         ),
-                        "blockers": [
-                            {
-                                "code": item.code.value,
-                                "page_id": (
-                                    item.page_handle.page_id
-                                    if item.page_handle is not None
-                                    else None
-                                ),
-                                "allocation_generation": (
-                                    item.page_handle.allocation_generation
-                                    if item.page_handle is not None
-                                    else None
-                                ),
-                                "required_bytes": item.required_bytes,
-                                "detail": item.detail,
-                            }
-                            for item in preview.blockers
-                        ],
+                        "blocker_count": len(preview.blockers),
+                        "blocker_histogram": {
+                            code: sum(
+                                item.code.value == code
+                                for item in preview.blockers
+                            )
+                            for code in sorted(
+                                {item.code.value for item in preview.blockers}
+                            )
+                        },
+                        "blocker_required_bytes": sum(
+                            item.required_bytes for item in preview.blockers
+                        ),
                     },
                 )
             )
+        if omitted_count:
+            self._bundle_events.append(
+                BundlePreviewEvent(
+                    kind="physical_bundle_preview_summary",
+                    ts_ms=now_ms,
+                    fields={
+                        "detailed_count": detailed_count,
+                        "omitted_count": omitted_count,
+                        "omitted_closure_bytes": omitted_closure_bytes,
+                        "omitted_reclaimable_bytes": omitted_reclaimable_bytes,
+                        "omitted_blocker_counts": dict(
+                            sorted(omitted_blockers.items())
+                        ),
+                    },
+                )
+            )
+
+    @staticmethod
+    def _string_digest(values: tuple[str, ...], *, person: bytes) -> str:
+        digest = hashlib.blake2b(digest_size=16, person=person)
+        for value in sorted(values):
+            digest.update(value.encode("utf-8"))
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    @staticmethod
+    def _handle_digest(handles: tuple[PageHandle, ...]) -> str:
+        digest = hashlib.blake2b(digest_size=16, person=b"bkv-handle-set")
+        for handle in sorted(
+            handles,
+            key=lambda item: (item.page_id, item.allocation_generation),
+        ):
+            digest.update(str(handle.page_id).encode("ascii"))
+            digest.update(b":")
+            digest.update(str(handle.allocation_generation).encode("ascii"))
+            digest.update(b"\0")
+        return digest.hexdigest()
 
     @staticmethod
     def _bundle_metadata(preview: PhysicalBundlePreview) -> dict[str, object]:

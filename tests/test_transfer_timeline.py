@@ -127,6 +127,12 @@ class TransferTimelineTest(unittest.TestCase):
             self.assertIn("runtime_resource_snapshot", html)
             self.assertIn('class="allocator-hbm-series"', html)
             self.assertNotIn('class="untracked-allocator-series"', html)
+            self.assertIn("Tier occupancy (% of each tier capacity)", html)
+            self.assertIn("HBM physical state (% of HBM capacity)", html)
+            self.assertIn("Physical DMA observations", html)
+            self.assertIn('id="timeline-zoom"', html)
+            self.assertIn('data-series-toggle="allocator-hbm-series"', html)
+            self.assertIn('class="transfer-d2h-series"', html)
             self.assertEqual(json.loads(data_path.read_text())["run_id"], "run-a")
 
     def test_legacy_dispatch_ack_is_marked_as_aggregate_measurement(self):
@@ -460,6 +466,9 @@ class TransferTimelineTest(unittest.TestCase):
             assert 'class="closure-blocked-series"' in html
             assert 'class="migratable-series"' in html
             assert 'class="dual-resident-series"' in html
+            assert 'data-series-toggle="engine-locked-series"' in html
+            assert 'data-series-toggle="locked-not-served-100ms-series"' in html
+            assert "Service pressure" in html
             assert "max(allocator HBM - indexed GPU KV, 0)" in html
             assert "this is not classified as protected KV" in html
             assert "a conservative physical-byte lower bound" in html

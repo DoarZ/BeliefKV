@@ -203,6 +203,11 @@ class RunnableInvocation:
     startup_bytes: int
     causal_class: str = "foreground"
     program_id: str | None = None
+    predicted_remaining_decode_tokens: float | None = None
+    predicted_external_wait_ms: float | None = None
+    predicted_next_output_tokens: float | None = None
+    prediction_support_level: str = ""
+    prediction_ood_reasons: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -218,6 +223,31 @@ class RunnableInvocation:
         _require_nonnegative(self.submitted_ts_ms, "submitted_ts_ms")
         if self.startup_bytes < 0:
             raise ValueError("startup_bytes must be non-negative")
+        for field_name in (
+            "predicted_remaining_decode_tokens",
+            "predicted_external_wait_ms",
+            "predicted_next_output_tokens",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and value < 0:
+                raise ValueError(f"{field_name} must be non-negative")
+        if self.prediction_support_level not in {
+            "",
+            "exact",
+            "backoff",
+            "unavailable",
+        }:
+            raise ValueError(
+                "prediction_support_level must be one of "
+                "{'', 'exact', 'backoff', 'unavailable'}"
+            )
+        object.__setattr__(
+            self,
+            "prediction_ood_reasons",
+            tuple(sorted(set(self.prediction_ood_reasons))),
+        )
+        if any(not reason for reason in self.prediction_ood_reasons):
+            raise ValueError("prediction OOD reasons must be non-empty")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -230,10 +260,18 @@ class RunnableInvocation:
             "startup_bytes": self.startup_bytes,
             "causal_class": self.causal_class,
             "program_id": self.program_id,
+            "predicted_remaining_decode_tokens": (
+                self.predicted_remaining_decode_tokens
+            ),
+            "predicted_external_wait_ms": self.predicted_external_wait_ms,
+            "predicted_next_output_tokens": self.predicted_next_output_tokens,
+            "prediction_support_level": self.prediction_support_level,
+            "prediction_ood_reasons": list(self.prediction_ood_reasons),
         }
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, object]) -> "RunnableInvocation":
+        ood = raw.get("prediction_ood_reasons", ())
         return cls(
             request_id=str(raw["request_id"]),
             workflow_id=str(raw["workflow_id"]),
@@ -246,6 +284,25 @@ class RunnableInvocation:
             program_id=(
                 str(raw["program_id"]) if raw.get("program_id") is not None else None
             ),
+            predicted_remaining_decode_tokens=(
+                float(raw["predicted_remaining_decode_tokens"])
+                if raw.get("predicted_remaining_decode_tokens") is not None
+                else None
+            ),
+            predicted_external_wait_ms=(
+                float(raw["predicted_external_wait_ms"])
+                if raw.get("predicted_external_wait_ms") is not None
+                else None
+            ),
+            predicted_next_output_tokens=(
+                float(raw["predicted_next_output_tokens"])
+                if raw.get("predicted_next_output_tokens") is not None
+                else None
+            ),
+            prediction_support_level=str(
+                raw.get("prediction_support_level", "")
+            ),
+            prediction_ood_reasons=tuple(str(item) for item in ood),
         )
 
 

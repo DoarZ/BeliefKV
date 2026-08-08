@@ -21,34 +21,64 @@ from beliefkv.predictor.tool_survival import HierarchicalToolSurvivalModel
 from beliefkv.predictor.types import RemainingTimePrediction
 
 
+def observed_boundary_action(event: RuntimeEvent) -> str | None:
+    """Return the training-time boundary history label for one runtime event.
+
+    This is the single source of truth shared by the offline decision-point
+    exporter and the online frontier shadow adapter, so their feature keys
+    stay aligned. ``LLM_RESULT`` carries parsed structured-action kinds;
+    tool/spawn/handoff/return/message transitions use their event kind.
+    """
+
+    if event.kind == RuntimeEventKind.LLM_RESULT:
+        actions = [
+            str(item)
+            for item in event.attributes.get("structured_action_kinds", ())
+        ]
+        return actions[0] if actions else "final"
+    if event.kind in {
+        RuntimeEventKind.TOOL_END,
+        RuntimeEventKind.SPAWN,
+        RuntimeEventKind.HANDOFF,
+        RuntimeEventKind.RETURN,
+        RuntimeEventKind.MESSAGE,
+    }:
+        return event.kind.value
+    return None
+
+
 @dataclass
 class InvocationPredictionFeatures:
     tool_backend_class: str = "unknown"
     action_history: list[ActionKind] = field(default_factory=list)
+    boundary_history: list[str] = field(default_factory=list)
     model: str = "unknown"
     prompt_tokens: int = 0
     cache_hit_tokens: int = 0
     expected_output_tokens: int = 0
     batch_size: int = 1
     context_tokens: int = 0
+    generated_tokens: int = 0
 
 
 class RemainingTimePredictor:
     """Compose tool, action and service models over the observed RCCG."""
 
-    ARTIFACT_SCHEMA_VERSION = 1
+    ARTIFACT_SCHEMA_VERSION = 2
 
     def __init__(
         self,
         tool_model: HierarchicalToolSurvivalModel | None = None,
         action_model: SemiMarkovContextTree | None = None,
         service_model: LLMServiceCostModel | None = None,
+        _frontier: Any = None,
         calibrator: RollingIntervalCalibrator | None = None,
     ) -> None:
         self.tool_model = tool_model or HierarchicalToolSurvivalModel()
         self.action_model = action_model or SemiMarkovContextTree()
         self.service_model = service_model or LLMServiceCostModel()
         self.calibrator = calibrator or RollingIntervalCalibrator()
+        self._frontier = _frontier
         self.features: dict[str, InvocationPredictionFeatures] = {}
 
     def set_features(
@@ -86,6 +116,13 @@ class RemainingTimePredictor:
                 event.attributes.get("context_tokens", features.context_tokens)
             )
             action = ActionKind.LLM_TEXT
+        elif event.kind == RuntimeEventKind.LLM_RESULT:
+            features.generated_tokens = int(
+                event.attributes.get(
+                    "output_tokens", features.generated_tokens
+                )
+                or features.generated_tokens
+            )
         elif event.kind == RuntimeEventKind.TOOL_START:
             family = str(event.attributes.get("tool_family", "other"))
             features.tool_backend_class = str(
@@ -108,6 +145,10 @@ class RemainingTimePredictor:
         if action is not None:
             features.action_history.append(action)
             del features.action_history[:-32]
+        boundary = observed_boundary_action(event)
+        if boundary is not None:
+            features.boundary_history.append(boundary)
+            del features.boundary_history[:-32]
 
     def to_dict(self, *, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
         return {
@@ -123,12 +164,24 @@ class RemainingTimePredictor:
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "RemainingTimePredictor":
         version = int(raw.get("schema_version", -1))
-        if version != cls.ARTIFACT_SCHEMA_VERSION:
+        if version == 2:
+            if "models" in raw and isinstance(raw["models"], Mapping):
+                # Legacy composite artifact saved after the schema bump.
+                models = raw["models"]
+            else:
+                from beliefkv.predictor.structured_frontier import (
+                    FrontierBeliefModel,
+                )
+
+                frontier = FrontierBeliefModel.from_dict(raw)
+                return cls.from_frontier_model(frontier)
+        elif version == 1:
+            models = raw.get("models")
+        else:
             raise ValueError(
                 f"unsupported predictor artifact schema {version}; "
-                f"expected {cls.ARTIFACT_SCHEMA_VERSION}"
+                f"expected 1 or 2"
             )
-        models = raw.get("models")
         if not isinstance(models, Mapping):
             raise ValueError("predictor artifact has no models object")
         return cls(
@@ -142,6 +195,21 @@ class RemainingTimePredictor:
                 models.get("service_cost", {})
             ),
         )
+
+    @classmethod
+    def from_frontier_model(cls, frontier: Any) -> "RemainingTimePredictor":
+        return cls(
+            tool_model=HierarchicalToolSurvivalModel(),
+            action_model=SemiMarkovContextTree(),
+            service_model=LLMServiceCostModel(),
+            _frontier=frontier,
+        )
+
+    @property
+    def frontier_model(self) -> Any | None:
+        """Return the P6 frontier model, if this predictor wraps one."""
+
+        return self._frontier
 
     def save(
         self, path: Path, *, metadata: Mapping[str, Any] | None = None
@@ -209,7 +277,19 @@ class RemainingTimePredictor:
         if not estimates:
             return RemainingTimePrediction(context_id=context_id, generated_ts_ms=now_ms)
         estimate = min(estimates, key=lambda item: item.p50_ms)
-        return self.calibrator.adjust(replace(estimate, context_id=context_id))
+        estimate = self.calibrator.adjust(replace(estimate, context_id=context_id))
+        if self._frontier is not None:
+            # Frontier shadow mode: the legacy time model is not fitted, so its
+            # predictions must never be treated as usable by the scheduler.
+            # The P6 frontier beliefs are published through the separate
+            # ``frontier_shadow`` audit path and never alter decisions.
+            return replace(
+                estimate,
+                confidence=0.0,
+                ood_score=1.0,
+                backoff_level="frontier_shadow",
+            )
+        return estimate
 
     def _predict_invocation(
         self,

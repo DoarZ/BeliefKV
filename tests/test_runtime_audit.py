@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from beliefkv.runtime.audit import (
+    AuditLevel,
     PolicySnapshotLog,
     RequestTokenTraceLog,
     RuntimeAuditLog,
@@ -43,6 +44,43 @@ class RuntimeAuditLogTest(unittest.TestCase):
             with RuntimeAuditLog(Path(temporary) / "audit.jsonl") as audit:
                 with self.assertRaises(ValueError):
                     audit.emit("bad", float("nan"))
+
+    def test_debug_events_are_sampled_and_oversize_payloads_are_compacted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "audit.jsonl"
+            with RuntimeAuditLog(
+                path,
+                run_id="bounded",
+                debug_sample_rate=0.5,
+                max_debug_event_bytes=256,
+            ) as audit:
+                for sequence in range(4):
+                    audit.emit(
+                        "physical_bundle_preview",
+                        float(sequence),
+                        payload="x" * 2048,
+                    )
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual(len(records), 2)
+            self.assertTrue(
+                all(item["event"] == "audit_debug_event_oversize" for item in records)
+            )
+            self.assertEqual(audit.summary()["sampled_debug_count"], 2)
+            self.assertEqual(audit.summary()["oversize_debug_count"], 2)
+
+    def test_correctness_event_applies_backpressure_instead_of_dropping(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = RuntimeAuditLog(Path(temporary) / "audit.jsonl")
+            with mock.patch.object(audit._queue, "put", wraps=audit._queue.put) as put:
+                audit.emit(
+                    "transfer_acknowledged",
+                    1.0,
+                    audit_level=AuditLevel.CORRECTNESS,
+                )
+            audit.close()
+            self.assertGreaterEqual(put.call_count, 1)
+            self.assertEqual(audit.summary()["dropped_debug_count"], 0)
+            self.assertEqual(audit.summary()["written_count"], 1)
 
     def test_policy_snapshot_log_is_exclusive_and_gzip_compressed(self):
         class _Input:

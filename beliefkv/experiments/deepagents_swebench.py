@@ -16,13 +16,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence, TextIO
+from typing import Any, Iterable, Mapping, Sequence, TextIO
 
-from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
 from deepagents.backends.protocol import ExecuteResponse, SandboxBackendProtocol
+from deepagents.graph import BASE_AGENT_PROMPT
 from deepagents.middleware.filesystem import FilesystemMiddleware
+from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
+from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
 from langchain.agents import create_agent
+from langchain.agents.middleware import TodoListMiddleware
 from langchain.agents.structured_output import ToolStrategy
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langchain_core.tools import BaseTool, tool
@@ -44,7 +47,20 @@ from beliefkv.runtime.event_channel import (
     JsonlRuntimeEventSink,
     UnixDatagramRuntimeEventSink,
 )
+from beliefkv.runtime.langchain_tool_safety import (
+    ToolCircuitBreakerMiddleware,
+    ToolObservationBudgetMiddleware,
+    ToolObservationBudgetPolicy,
+    ToolOutcomeStatusMiddleware,
+)
+from beliefkv.runtime.context_lifecycle import (
+    CONTEXT_LIFECYCLE_PRIVATE_STATE_KEYS,
+    CompletionBudgetMiddleware,
+    ContextLifecycleMiddleware,
+    ContextLifecyclePolicy,
+)
 from beliefkv.runtime.sglang_adapter import BeliefKVRequestMetadata
+from beliefkv.runtime.subagent_state import PrivateStateIsolatingSubAgentMiddleware
 
 
 SERVER_ARTIFACT_FILENAMES = {
@@ -57,19 +73,19 @@ DEFAULT_SANDBOX_TEST_ENV = "/opt/miniconda3/envs/testbed"
 DEFAULT_SANDBOX_SUPPORT_DIR = Path(__file__).with_name("sandbox_support")
 SANDBOX_PATH_CONTRACT = """
 Sandbox path and environment contract:
-- Filesystem tools and the execute tool share the same `/workspace` namespace. A path
-  returned as `/workspace/sympy/core/basic.py` is valid unchanged in shell commands.
-- The execute tool starts in `/workspace`; prefer repository-relative shell paths and do
-  not change to `/sympy` or another virtual root.
+- The repository checkout root is exactly `/workspace`. Filesystem tools and execute
+  share this namespace, and execute starts in `/workspace`.
+- Repository paths are relative to `/workspace`. Do not prepend the repository owner,
+  repository name, or package name unless that directory actually appears in the
+  checkout. Never invent another virtual repository root.
+- Before retrying a missing path, inspect `/workspace` or run `pwd` and
+  `git rev-parse --show-toplevel`; do not repeatedly guess path prefixes.
 - `python`, `pytest`, and other Python entry points already resolve to the image's
   prebuilt test environment. Do not install or upgrade packages and do not use network
   package managers.
-- Diagnostic `python -c` probes do not count as tests. Run a focused repository-native
-  test command, such as `python bin/test <test-path>` for SymPy, before reporting
-  success. This SymPy revision accepts `-k <test-name>` or a complete test-file path;
-  do not append a pytest-style `::test_name` selector because `bin/test` silently runs
-  zero tests for it. Treat both the exit status and the executed-test count as
-  authoritative.
+- Diagnostic `python -c` probes do not count as tests. Discover and run the focused
+  repository-native test command described by the workload-specific contract. Treat
+  both the exit status and the executed-test count as authoritative.
 """
 TEST_COMMAND_PATTERN = re.compile(
     r"(?:^|[;&|]\s*)(?:python\s+(?:-m\s+pytest|bin/test)\b|pytest\b|"
@@ -199,6 +215,36 @@ class SweBenchWorkload:
     base_commit: str
     problem_statement: str
     difficulty: str
+    source_repo: Path | None = None
+    docker_image: str | None = None
+    preflight_command: str | None = None
+
+
+def repository_sandbox_contract(workload: SweBenchWorkload) -> str:
+    """Describe the mounted checkout without leaking another repository's layout."""
+
+    common = f"""
+Workload-specific repository contract:
+- Repository identity is `{workload.repo}`, but its checkout root is still exactly
+  `/workspace`. Do not append `{workload.repo}` to `/workspace`.
+"""
+    if workload.repo == "django/django":
+        return common + """- Django source paths such as `django/db/backends/base/base.py` map to
+  `/workspace/django/db/backends/base/base.py`, not
+  `/workspace/django/django/db/backends/base/base.py`.
+- Run focused Django tests from `/workspace` with the repository test runner, for
+  example `python tests/runtests.py <test_label>`.
+"""
+    if workload.repo == "sympy/sympy":
+        return common + """- SymPy source paths such as `sympy/core/basic.py` map to
+  `/workspace/sympy/core/basic.py`, not `/workspace/sympy/sympy/core/basic.py`.
+- Run focused SymPy tests with `python bin/test <test-path>`. This runner accepts
+  `-k <test-name>` or a complete test-file path; do not use a pytest-style `::` selector.
+"""
+    return common + """- Inspect the checkout's top-level files before choosing a package path or test
+  command. Prefer paths returned by repository search tools over paths inferred from
+  the repository slug.
+"""
 
 
 @dataclass(frozen=True)
@@ -207,7 +253,7 @@ class WorkloadBundle:
     manifest_sha256: str
     dataset: str
     dataset_revision: str
-    source_repo: Path
+    source_repo: Path | None
     workloads: tuple[SweBenchWorkload, ...]
 
 
@@ -216,8 +262,12 @@ def load_workload_bundle(path: Path) -> WorkloadBundle:
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict) or not isinstance(raw.get("workloads"), list):
         raise ValueError("workload manifest must contain a workloads list")
-    source_repo = Path(str(raw["source_repo"])).expanduser().resolve()
-    if not (source_repo / ".git").exists():
+    source_repo = (
+        Path(str(raw["source_repo"])).expanduser().resolve()
+        if raw.get("source_repo")
+        else None
+    )
+    if source_repo is not None and not (source_repo / ".git").exists():
         raise FileNotFoundError(f"source repository is absent: {source_repo}")
     workloads = tuple(
         SweBenchWorkload(
@@ -226,11 +276,33 @@ def load_workload_bundle(path: Path) -> WorkloadBundle:
             base_commit=str(item["base_commit"]),
             problem_statement=str(item["problem_statement"]),
             difficulty=str(item.get("difficulty", "unknown")),
+            source_repo=(
+                Path(str(item["source_repo"])).expanduser().resolve()
+                if item.get("source_repo")
+                else source_repo
+            ),
+            docker_image=(
+                str(item["docker_image"]) if item.get("docker_image") else None
+            ),
+            preflight_command=(
+                str(item["preflight_command"])
+                if item.get("preflight_command")
+                else None
+            ),
         )
         for item in raw["workloads"]
     )
     if len({item.instance_id for item in workloads}) != len(workloads):
         raise ValueError("workload instance IDs must be unique")
+    missing_sources = [
+        item.instance_id
+        for item in workloads
+        if item.source_repo is None or not (item.source_repo / ".git").exists()
+    ]
+    if missing_sources:
+        raise FileNotFoundError(
+            f"workload source repositories are absent: {missing_sources}"
+        )
     return WorkloadBundle(
         manifest_path=path,
         manifest_sha256=sha256(path),
@@ -355,6 +427,10 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         self._started = False
         self._closed = False
         self._execute_lock = threading.Lock()
+        self._workspace_digest_lock = threading.Lock()
+        self._workspace_epoch_lock = threading.Lock()
+        self._workspace_epoch = 0
+        self._cancel_lock = threading.Lock()
 
     @property
     def id(self) -> str:
@@ -416,6 +492,8 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
     def _preflight(self) -> None:
         expected_python = f"{self.test_env_path}/bin/python"
         checks = [
+            'test "$(pwd -P)" = /workspace',
+            'test "$(git rev-parse --show-toplevel)" = /workspace',
             f'test "$(command -v python)" = {shlex.quote(expected_python)}',
             (
                 "python -c "
@@ -443,6 +521,7 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             duration_ms=(time.monotonic() - started) * 1000.0,
             returncode=result.returncode,
             expected_python=expected_python,
+            expected_workdir=self.shell_workdir,
             output_chars=len(output),
             output_sha256=hashlib.sha256(output.encode("utf-8")).hexdigest(),
         )
@@ -582,6 +661,118 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             truncated=truncated,
         )
 
+    def workspace_epoch(self) -> int:
+        with self._workspace_epoch_lock:
+            return self._workspace_epoch
+
+    def _advance_workspace_epoch(self) -> int:
+        with self._workspace_epoch_lock:
+            self._workspace_epoch += 1
+            return self._workspace_epoch
+
+    def write(self, file_path: str, content: str) -> Any:
+        result = super().write(file_path, content)
+        if getattr(result, "error", None) is None:
+            self._advance_workspace_epoch()
+        return result
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> Any:
+        result = super().edit(
+            file_path,
+            old_string,
+            new_string,
+            replace_all=replace_all,
+        )
+        if getattr(result, "error", None) is None:
+            self._advance_workspace_epoch()
+        return result
+
+    def tool_state_digest(
+        self,
+        tool_name: str,
+        payload: Mapping[str, Any],
+    ) -> str | None:
+        del payload
+        if tool_name not in {"apply_patch", "edit_file", "write_file"}:
+            return None
+        return self.workspace_digest()
+
+    def workspace_digest(self) -> str:
+        """Hash tracked changes and untracked contents without changing the tree."""
+
+        with self._workspace_digest_lock:
+            diff = subprocess.run(
+                ["git", "diff", "--no-ext-diff", "--binary", "HEAD", "--"],
+                cwd=self.workspace,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=15.0,
+            )
+            untracked = subprocess.run(
+                ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+                cwd=self.workspace,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=15.0,
+            )
+            if diff.returncode != 0 or untracked.returncode != 0:
+                detail = (diff.stderr + untracked.stderr).decode(
+                    "utf-8", errors="replace"
+                )
+                raise RuntimeError("workspace digest failed: " + detail[-1000:])
+            digest = hashlib.sha256()
+            digest.update(diff.stdout)
+            for encoded_path in sorted(
+                item for item in untracked.stdout.split(b"\0") if item
+            ):
+                digest.update(b"\0untracked\0")
+                digest.update(encoded_path)
+                path = self.workspace / os.fsdecode(encoded_path)
+                if not path.is_file() or path.is_symlink():
+                    digest.update(b"\0non-regular")
+                    continue
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            return digest.hexdigest()
+
+    def cancel_active_commands(self, *, reason: str) -> int:
+        """Stop the per-workflow container to unblock any active sandbox command."""
+
+        with self._cancel_lock:
+            if not self._started or self._closed:
+                return 0
+            started = time.monotonic()
+            result = subprocess.run(
+                ["docker", "kill", self._container_name],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30.0,
+            )
+            self.audit.emit(
+                "sandbox_cancel",
+                reason=reason,
+                duration_ms=(time.monotonic() - started) * 1000.0,
+                returncode=result.returncode,
+                stderr=(result.stderr or "")[-2000:],
+            )
+            if result.returncode == 0:
+                # The container was started with --rm, so a successful kill also
+                # removes it and makes all subsequent tool calls terminal errors.
+                self._started = False
+                self._closed = True
+                return 1
+            return 0
+
     def apply_unified_patch(self, patch: str) -> str:
         encoded = patch.encode("utf-8")
         if not encoded or len(encoded) > 200_000:
@@ -604,6 +795,7 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             )
             if applied.exit_code != 0:
                 return "Error: git apply failed\n" + applied.output
+            self._advance_workspace_epoch()
             return "Patch applied successfully."
         finally:
             patch_path.unlink(missing_ok=True)
@@ -812,12 +1004,23 @@ class DeepAgentsExperimentConfig:
     gpu_index: int = 0
     pool_tokens: int = 163_840
     max_completion_tokens: int = 2048
-    recursion_limit: int = 200
+    sampling_seed: int | None = None
+    recursion_limit: int = 512
     request_timeout_s: float = 600.0
+    sandbox_command_timeout_s: int = 600
     sandbox_test_env_path: str = DEFAULT_SANDBOX_TEST_ENV
-    sandbox_preflight_command: str | None = SYMPY_SANDBOX_PREFLIGHT
+    sandbox_preflight_command: str | None = None
+    completion_gate_enabled: bool = True
     completion_repair_attempts: int = 2
+    runtime_event_ack_timeout_s: float = 10.0
+    runtime_event_ack_retries: int = 3
+    context_lifecycle: ContextLifecyclePolicy = field(
+        default_factory=ContextLifecyclePolicy
+    )
     loop_guard: LoopGuardPolicy = field(default_factory=LoopGuardPolicy)
+    tool_observation_budget: ToolObservationBudgetPolicy = field(
+        default_factory=ToolObservationBudgetPolicy
+    )
 
     def __post_init__(self) -> None:
         if self.mode not in {"autonomous", "planned"}:
@@ -828,10 +1031,19 @@ class DeepAgentsExperimentConfig:
             self.pool_tokens,
             self.max_completion_tokens,
             self.recursion_limit,
+            self.sandbox_command_timeout_s,
         ) <= 0:
             raise ValueError("experiment limits must be positive")
         if self.completion_repair_attempts < 0:
             raise ValueError("completion_repair_attempts must be non-negative")
+        if self.sampling_seed is not None and self.sampling_seed < 0:
+            raise ValueError("sampling_seed must be non-negative when configured")
+        if self.runtime_event_ack_timeout_s <= 0 or self.runtime_event_ack_retries <= 0:
+            raise ValueError("runtime-event ACK policy must be positive")
+        if self.context_lifecycle.intermediate_output_tokens > self.max_completion_tokens:
+            raise ValueError(
+                "context lifecycle intermediate output budget exceeds the model budget"
+            )
         if not self.sandbox_test_env_path.startswith("/"):
             raise ValueError("sandbox_test_env_path must be absolute")
 
@@ -942,6 +1154,33 @@ def _loop_guard(
     )
 
 
+def _tool_circuit(
+    backend: DockerWorkspaceBackend,
+    *,
+    scope: str,
+    adapter: DeepAgentsRuntimeAdapter | None = None,
+) -> ToolCircuitBreakerMiddleware:
+    return ToolCircuitBreakerMiddleware(
+        state_epoch=backend.workspace_epoch,
+        audit=backend.audit,
+        scope=scope,
+        censor_observer=(adapter.record_call_censor if adapter is not None else None),
+    )
+
+
+def _tool_observation_budget(
+    config: DeepAgentsExperimentConfig,
+    *,
+    audit: JsonlAudit,
+    scope: str,
+) -> ToolObservationBudgetMiddleware:
+    return ToolObservationBudgetMiddleware(
+        policy=config.tool_observation_budget,
+        audit=audit,
+        scope=scope,
+    )
+
+
 def _planned_child_loop_guard_policy(
     config: DeepAgentsExperimentConfig,
 ) -> LoopGuardPolicy:
@@ -995,6 +1234,7 @@ def _model(
         base_url=config.base_url,
         api_key="EMPTY",
         temperature=0.0,
+        seed=config.sampling_seed,
         max_completion_tokens=config.max_completion_tokens,
         timeout=config.request_timeout_s,
         max_retries=0,
@@ -1009,6 +1249,7 @@ def _task_prompt(workload: SweBenchWorkload) -> str:
         f"Repository: {workload.repo}\n"
         f"Base commit: {workload.base_commit}\n\n"
         f"Problem statement:\n{workload.problem_statement}\n\n"
+        f"{repository_sandbox_contract(workload)}\n"
         "Produce a complete working patch for every stated requirement and run a "
         "focused repository test command before reporting success."
     )
@@ -1124,90 +1365,188 @@ def _invoke_with_partial_state(
     return latest
 
 
+AUTONOMOUS_SUBAGENT_SPECS = (
+    (
+        "repository-explorer",
+        "Trace implementation paths and report concrete code evidence.",
+        "Investigate the assigned repository question deeply. Use filesystem and "
+        "execute tools, avoid broad unrelated edits, and finish with the required "
+        "ChildCompletion structured response.",
+    ),
+    (
+        "test-analyst",
+        "Reproduce failures and identify focused regression tests.",
+        "Analyze or reproduce the assigned failure in the sandbox. Report exact "
+        "commands, relevant tests, and likely regression coverage through the "
+        "required ChildCompletion structured response.",
+    ),
+    (
+        "implementation-agent",
+        "Implement and validate a self-contained part of the fix.",
+        "Implement the delegated part in the shared workspace and run focused "
+        "tests. Finish with the required ChildCompletion structured response, "
+        "including files changed, test results, and unresolved risks.",
+    ),
+    (
+        str(GENERAL_PURPOSE_SUBAGENT["name"]),
+        str(GENERAL_PURPOSE_SUBAGENT["description"]),
+        str(GENERAL_PURPOSE_SUBAGENT["system_prompt"])
+        + "\n\nFinish with the required ChildCompletion structured response.",
+    ),
+)
+
+
+def _context_lifecycle_middleware(
+    config: DeepAgentsExperimentConfig,
+    backend: DockerWorkspaceBackend,
+    adapter: DeepAgentsRuntimeAdapter,
+    summary_model: Any,
+    *,
+    persist_cursor_across_invocations: bool = False,
+) -> ContextLifecycleMiddleware:
+    return ContextLifecycleMiddleware(
+        summary_model,
+        backend=backend,
+        policy=config.context_lifecycle,
+        compaction_sink=adapter,
+        summary_callbacks=(adapter,),
+        persist_cursor_across_invocations=persist_cursor_across_invocations,
+    )
+
+
+def _autonomous_subagents(
+    config: DeepAgentsExperimentConfig,
+    workload: SweBenchWorkload,
+    backend: DockerWorkspaceBackend,
+    adapter: DeepAgentsRuntimeAdapter,
+    model: Any,
+    summary_model: Any,
+) -> list[dict[str, Any]]:
+    subagents: list[dict[str, Any]] = []
+    for name, description, system_prompt in AUTONOMOUS_SUBAGENT_SPECS:
+        scope = f"autonomous:{name}"
+        subagents.append(
+            {
+                "name": name,
+                "description": description,
+                "system_prompt": (
+                    system_prompt
+                    + SANDBOX_PATH_CONTRACT
+                    + repository_sandbox_contract(workload)
+                ),
+                "model": model,
+                "tools": [_workspace_patch_tool(backend)],
+                "response_format": ToolStrategy(ChildCompletion),
+                "middleware": [
+                    TodoListMiddleware(),
+                    _filesystem_middleware(backend, allow_direct_edits=True),
+                    _context_lifecycle_middleware(
+                        config,
+                        backend,
+                        adapter,
+                        summary_model,
+                    ),
+                    CompletionBudgetMiddleware(
+                        intermediate_tokens=(
+                            config.context_lifecycle.intermediate_output_tokens
+                        ),
+                        final_tokens=config.max_completion_tokens,
+                    ),
+                    PatchToolCallsMiddleware(),
+                    _tool_circuit(backend, scope=scope, adapter=adapter),
+                    ToolOutcomeStatusMiddleware(),
+                    _tool_observation_budget(
+                        config,
+                        audit=backend.audit,
+                        scope=scope,
+                    ),
+                    _loop_guard(
+                        config,
+                        completion_schema=ChildCompletion,
+                        completion_instruction=CHILD_COMPLETION_INSTRUCTION,
+                        audit=backend.audit,
+                        scope=scope,
+                    ),
+                ],
+            }
+        )
+    return subagents
+
+
+def _build_autonomous_agent(
+    config: DeepAgentsExperimentConfig,
+    workload: SweBenchWorkload,
+    backend: DockerWorkspaceBackend,
+    adapter: DeepAgentsRuntimeAdapter,
+) -> Any:
+    model = _model(config, adapter)
+    summary_model = model.model_copy(
+        update={"max_tokens": config.context_lifecycle.summary_output_tokens}
+    )
+    task_middleware = PrivateStateIsolatingSubAgentMiddleware(
+        backend=backend,
+        private_state_keys=CONTEXT_LIFECYCLE_PRIVATE_STATE_KEYS,
+        subagents=_autonomous_subagents(
+            config,
+            workload,
+            backend,
+            adapter,
+            model,
+            summary_model,
+        ),
+    )
+    middleware: list[Any] = [
+        TodoListMiddleware(),
+        _filesystem_middleware(backend, allow_direct_edits=True),
+        task_middleware,
+        _context_lifecycle_middleware(
+            config,
+            backend,
+            adapter,
+            summary_model,
+        ),
+        CompletionBudgetMiddleware(
+            intermediate_tokens=config.context_lifecycle.intermediate_output_tokens,
+            final_tokens=config.max_completion_tokens,
+        ),
+        PatchToolCallsMiddleware(),
+        _tool_circuit(backend, scope="autonomous:supervisor", adapter=adapter),
+        ToolOutcomeStatusMiddleware(),
+        _tool_observation_budget(
+            config,
+            audit=backend.audit,
+            scope="autonomous:supervisor",
+        ),
+        _loop_guard(
+            config,
+            completion_schema=WorkflowCompletion,
+            completion_instruction=WORKFLOW_COMPLETION_INSTRUCTION,
+            audit=backend.audit,
+            scope="autonomous:supervisor",
+        ),
+    ]
+    return create_agent(
+        model=model,
+        tools=[_workspace_patch_tool(backend)],
+        system_prompt=(
+            AUTONOMOUS_SYSTEM_PROMPT
+            + repository_sandbox_contract(workload)
+            + "\n\n"
+            + BASE_AGENT_PROMPT
+        ),
+        middleware=middleware,
+        response_format=ToolStrategy(WorkflowCompletion),
+        name="beliefkv-swebench-supervisor",
+    )
+
+
 def _run_autonomous(
     config: DeepAgentsExperimentConfig,
     workload: SweBenchWorkload,
     backend: DockerWorkspaceBackend,
     adapter: DeepAgentsRuntimeAdapter,
 ) -> dict[str, Any]:
-    model = _model(config, adapter)
-    subagents = [
-        {
-            "name": "repository-explorer",
-            "description": "Trace implementation paths and report concrete code evidence.",
-            "system_prompt": (
-                "Investigate the assigned repository question deeply. Use filesystem and "
-                "execute tools, avoid broad unrelated edits, and finish with the required "
-                "ChildCompletion structured response."
-            ) + SANDBOX_PATH_CONTRACT,
-            "response_format": ToolStrategy(ChildCompletion),
-            "middleware": [
-                _loop_guard(
-                    config,
-                    completion_schema=ChildCompletion,
-                    completion_instruction=CHILD_COMPLETION_INSTRUCTION,
-                    audit=backend.audit,
-                    scope="autonomous:repository-explorer",
-                )
-            ],
-        },
-        {
-            "name": "test-analyst",
-            "description": "Reproduce failures and identify focused regression tests.",
-            "system_prompt": (
-                "Analyze or reproduce the assigned failure in the sandbox. Report exact "
-                "commands, relevant tests, and likely regression coverage through the "
-                "required ChildCompletion structured response."
-            ) + SANDBOX_PATH_CONTRACT,
-            "response_format": ToolStrategy(ChildCompletion),
-            "middleware": [
-                _loop_guard(
-                    config,
-                    completion_schema=ChildCompletion,
-                    completion_instruction=CHILD_COMPLETION_INSTRUCTION,
-                    audit=backend.audit,
-                    scope="autonomous:test-analyst",
-                )
-            ],
-        },
-        {
-            "name": "implementation-agent",
-            "description": "Implement and validate a self-contained part of the fix.",
-            "system_prompt": (
-                "Implement the delegated part in the shared workspace and run focused "
-                "tests. Finish with the required ChildCompletion structured response, "
-                "including files changed, test results, and unresolved risks."
-            ) + SANDBOX_PATH_CONTRACT,
-            "response_format": ToolStrategy(ChildCompletion),
-            "middleware": [
-                _loop_guard(
-                    config,
-                    completion_schema=ChildCompletion,
-                    completion_instruction=CHILD_COMPLETION_INSTRUCTION,
-                    audit=backend.audit,
-                    scope="autonomous:implementation-agent",
-                )
-            ],
-        },
-    ]
-    agent = create_deep_agent(
-        model=model,
-        tools=[_workspace_patch_tool(backend)],
-        backend=backend,
-        subagents=subagents,
-        system_prompt=AUTONOMOUS_SYSTEM_PROMPT,
-        middleware=[
-            _loop_guard(
-                config,
-                completion_schema=WorkflowCompletion,
-                completion_instruction=WORKFLOW_COMPLETION_INSTRUCTION,
-                audit=backend.audit,
-                scope="autonomous:supervisor",
-            )
-        ],
-        response_format=ToolStrategy(WorkflowCompletion),
-        name="beliefkv-swebench-supervisor",
-    )
+    agent = _build_autonomous_agent(config, workload, backend, adapter)
     return _invoke_with_partial_state(
         agent,
         {"messages": [{"role": "user", "content": _task_prompt(workload)}]},
@@ -1251,6 +1590,17 @@ def _run_planned_child(
             model=_model(config, adapter),
             tools=[],
             middleware=[
+                _tool_circuit(
+                    child_backend,
+                    scope=f"planned:child:{handle.invocation_id}",
+                    adapter=adapter,
+                ),
+                ToolOutcomeStatusMiddleware(),
+                _tool_observation_budget(
+                    config,
+                    audit=backend.audit,
+                    scope=f"planned:child:{handle.invocation_id}",
+                ),
                 _filesystem_middleware(child_backend, allow_direct_edits=False),
                 _loop_guard(
                     config,
@@ -1272,7 +1622,7 @@ def _run_planned_child(
                 "probes. "
                 "You complete the task only by returning the required ChildCompletion "
                 "structured response. Do not finish with ordinary prose."
-            ) + SANDBOX_PATH_CONTRACT,
+            ) + SANDBOX_PATH_CONTRACT + repository_sandbox_contract(workload),
             name=f"beliefkv-planned-{role_name or 'analyst'}",
         )
         result = _invoke_with_partial_state(
@@ -1402,6 +1752,15 @@ def _run_planned(
         model=_model(config, adapter),
         tools=[_workspace_patch_tool(backend)],
         middleware=[
+            _tool_circuit(
+                backend, scope="planned:implementer", adapter=adapter
+            ),
+            ToolOutcomeStatusMiddleware(),
+            _tool_observation_budget(
+                config,
+                audit=backend.audit,
+                scope="planned:implementer",
+            ),
             _filesystem_middleware(backend, allow_direct_edits=True),
             _loop_guard(
                 config,
@@ -1412,7 +1771,9 @@ def _run_planned(
             ),
         ],
         response_format=ToolStrategy(WorkflowCompletion),
-        system_prompt=IMPLEMENTER_SYSTEM_PROMPT,
+        system_prompt=(
+            IMPLEMENTER_SYSTEM_PROMPT + repository_sandbox_contract(workload)
+        ),
         name="beliefkv-planned-implementer",
     )
     result = _invoke_with_partial_state(
@@ -1535,6 +1896,17 @@ def _repair_incomplete_workflow(
             model=_model(config, adapter),
             tools=[_workspace_patch_tool(backend)],
             middleware=[
+                _tool_circuit(
+                    backend,
+                    scope=f"completion-repair:{attempt + 1}",
+                    adapter=adapter,
+                ),
+                ToolOutcomeStatusMiddleware(),
+                _tool_observation_budget(
+                    config,
+                    audit=backend.audit,
+                    scope=f"completion-repair:{attempt + 1}",
+                ),
                 _filesystem_middleware(backend, allow_direct_edits=True),
                 _loop_guard(
                     config,
@@ -1583,12 +1955,136 @@ def _trace_summary(path: Path) -> dict[str, Any]:
         if line.strip()
     ]
     counts = Counter(str(item.get("kind")) for item in records)
+    children = {
+        str(item["invocation_id"])
+        for item in records
+        if item.get("kind") == "invocation_create"
+        and item.get("invocation_id") is not None
+        and item.get("parent_invocation_id") is not None
+        and not bool((item.get("attributes") or {}).get("runtime_internal"))
+    }
+    returned_children = {
+        str(item["invocation_id"])
+        for item in records
+        if item.get("kind") == "return"
+        and item.get("invocation_id") in children
+    }
+    tool_status_observations = 0
+    mutating_tool_ends = 0
+    workspace_digest_observations = 0
+    external_llm_submits = 0
+    external_llm_results = 0
+    for item in records:
+        kind = item.get("kind")
+        attributes = item.get("attributes") or {}
+        if kind == "llm_submit" and not bool(attributes.get("runtime_internal")):
+            external_llm_submits += 1
+        elif kind == "llm_result" and not bool(attributes.get("runtime_internal")):
+            external_llm_results += 1
+        elif kind == "tool_end":
+            tool_status_observations += int(attributes.get("status") is not None)
+            if attributes.get("tool_name") in {
+                "apply_patch",
+                "edit_file",
+                "write_file",
+            }:
+                mutating_tool_ends += 1
+                workspace_digest_observations += int(
+                    attributes.get("workspace_digest_before") is not None
+                    and attributes.get("workspace_digest_after") is not None
+                )
+    join_create_count = counts["join_create"]
+    join_satisfied_count = counts["join_satisfied"]
     return {
         "event_count": len(records),
         "event_counts": dict(sorted(counts.items())),
         "dynamic_subagent_count": counts["spawn"],
-        "llm_request_count": counts["llm_submit"],
+        "llm_request_count": external_llm_submits,
+        "llm_result_count": external_llm_results,
+        "llm_pairing_valid": external_llm_submits == external_llm_results,
         "tool_call_count": counts["tool_start"],
+        "tool_result_count": counts["tool_end"],
+        "tool_pairing_valid": counts["tool_start"] == counts["tool_end"],
+        "tool_status_coverage": (
+            tool_status_observations / counts["tool_end"]
+            if counts["tool_end"]
+            else 1.0
+        ),
+        "mutating_tool_end_count": mutating_tool_ends,
+        "workspace_digest_observation_count": workspace_digest_observations,
+        "workspace_digest_coverage": (
+            workspace_digest_observations / mutating_tool_ends
+            if mutating_tool_ends
+            else 1.0
+        ),
+        "all_subagents_returned": bool(children)
+        and returned_children == children,
+        "all_joins_satisfied": (
+            join_create_count == join_satisfied_count
+            and counts["join_timeout"] == 0
+        ),
+        "workflow_lifecycle_valid": (
+            counts["workflow_start"] == 1 and counts["workflow_end"] == 1
+        ),
+    }
+
+
+def classify_workflow_measurement(
+    *,
+    outcome: str,
+    error: str | None,
+    semantic_completion: Mapping[str, Any] | None,
+    agent_control: Mapping[str, Any],
+    control_delivery: Mapping[str, Any],
+    trace: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Separate system-measurement validity from native agent quality."""
+
+    system_reasons: list[str] = []
+    if outcome != "completed":
+        system_reasons.append(f"outcome:{outcome}")
+    if error is not None:
+        system_reasons.append("workflow_error")
+    if semantic_completion is None:
+        system_reasons.append("missing_semantic_completion")
+    if bool(control_delivery.get("degraded")):
+        system_reasons.append("runtime_control_delivery_degraded")
+    if int(agent_control.get("protocol_repair_failures", 0)):
+        system_reasons.append("protocol_repair_failed")
+    for field in (
+        "workflow_lifecycle_valid",
+        "llm_pairing_valid",
+        "tool_pairing_valid",
+    ):
+        if not bool(trace.get(field)):
+            system_reasons.append(field)
+    if float(trace.get("tool_status_coverage", 0.0)) != 1.0:
+        system_reasons.append("incomplete_tool_status_coverage")
+    if float(trace.get("workspace_digest_coverage", 0.0)) != 1.0:
+        system_reasons.append("incomplete_workspace_digest_coverage")
+    if int(trace.get("dynamic_subagent_count", 0)) > 0:
+        if not bool(trace.get("all_subagents_returned")):
+            system_reasons.append("subagent_not_returned")
+        if not bool(trace.get("all_joins_satisfied")):
+            system_reasons.append("join_not_satisfied")
+
+    native_reasons = list(system_reasons)
+    if agent_control.get("stuck_reasons"):
+        native_reasons.append("guard_detected_stuck_execution")
+    if int(agent_control.get("forced_semantic_completions", 0)):
+        native_reasons.append("forced_semantic_completion")
+    if int(agent_control.get("guard_intervened_completions", 0)):
+        native_reasons.append("guard_intervened_completion")
+    if int(agent_control.get("protocol_repaired_completions", 0)):
+        native_reasons.append("protocol_repaired_completion")
+    if int(agent_control.get("protocol_normalized_completions", 0)):
+        native_reasons.append("protocol_normalized_completion")
+
+    return {
+        "system_jct_eligible": not system_reasons,
+        "system_jct_exclusion_reasons": system_reasons,
+        "native_agent_jct_eligible": not native_reasons,
+        "native_agent_jct_exclusion_reasons": native_reasons,
     }
 
 
@@ -1617,11 +2113,28 @@ def summarize_agent_control(path: Path) -> dict[str, Any]:
         "stuck_reasons": dict(sorted(stuck_reasons.items())),
         "semantic_completions": len(semantic),
         "natural_semantic_completions": sum(
-            not bool(item.get("forced", False)) for item in semantic
+            not bool(item.get("forced", False))
+            and not bool(item.get("guard_intervened", False))
+            and not bool(item.get("protocol_repaired", False))
+            and not bool(item.get("protocol_normalized", False))
+            for item in semantic
         ),
         "forced_semantic_completions": sum(
             bool(item.get("forced", False)) for item in semantic
         ),
+        "guard_intervened_completions": sum(
+            bool(item.get("guard_intervened", False)) for item in semantic
+        ),
+        "protocol_repaired_completions": sum(
+            bool(item.get("protocol_repaired", False)) for item in semantic
+        ),
+        "protocol_normalized_completions": sum(
+            bool(item.get("protocol_normalized", False)) for item in semantic
+        ),
+        "protocol_repair_failures": event_counts["agent_protocol_repair_failed"],
+        "duplicate_tool_calls_suppressed": event_counts[
+            "agent_tool_duplicate_suppressed"
+        ],
     }
 
 
@@ -1633,17 +2146,22 @@ def _run_workflow(
     workflow_dir = config.output_dir / "workflows" / workload.instance_id
     workflow_dir.mkdir(parents=True, exist_ok=False)
     workspace = workflow_dir / "workspace"
-    workspace_metadata = prepare_workspace(bundle.source_repo, workload, workspace)
+    if workload.source_repo is None:
+        raise RuntimeError(f"workload has no source repository: {workload.instance_id}")
+    workspace_metadata = prepare_workspace(workload.source_repo, workload, workspace)
     write_json(workflow_dir / "workspace.json", workspace_metadata)
     trace_path = workflow_dir / "runtime_events.deepagents.jsonl"
     sandbox_audit_path = workflow_dir / "sandbox_audit.jsonl"
     sandbox_audit = JsonlAudit(sandbox_audit_path)
     backend = DockerWorkspaceBackend(
         workspace,
-        image=config.docker_image,
+        image=workload.docker_image or config.docker_image,
         audit=sandbox_audit,
+        default_timeout_s=config.sandbox_command_timeout_s,
         test_env_path=config.sandbox_test_env_path,
-        preflight_command=config.sandbox_preflight_command,
+        preflight_command=(
+            workload.preflight_command or config.sandbox_preflight_command
+        ),
     )
     workflow_token = hashlib.sha256(
         f"{config.output_dir.name}:{config.mode}:{workload.instance_id}".encode()
@@ -1661,7 +2179,11 @@ def _run_workflow(
     )
     trace_sink = JsonlRuntimeEventSink(trace_path)
     control_sink = (
-        UnixDatagramRuntimeEventSink(config.control_socket)
+        UnixDatagramRuntimeEventSink(
+            config.control_socket,
+            ack_timeout_s=config.runtime_event_ack_timeout_s,
+            retries=config.runtime_event_ack_retries,
+        )
         if config.control_socket is not None
         else None
     )
@@ -1669,6 +2191,7 @@ def _run_workflow(
         trace_sink,
         root_metadata,
         control_sink=control_sink,
+        workspace_digest_provider=backend.tool_state_digest,
     )
     started = time.monotonic()
     outcome = "error"
@@ -1688,9 +2211,10 @@ def _run_workflow(
                 config, workload, backend, adapter, workflow_dir
             )
             plan_payload = plan.model_dump(mode="json")
-        result = _repair_incomplete_workflow(
-            config, workload, backend, adapter, result
-        )
+        if config.completion_gate_enabled:
+            result = _repair_incomplete_workflow(
+                config, workload, backend, adapter, result
+            )
         completion = require_structured_completion(result, WorkflowCompletion)
         semantic_completion = completion.model_dump(mode="json")
         outcome = "completed"
@@ -1742,9 +2266,26 @@ def _run_workflow(
         observed_tests=observed_tests,
     )
     control_delivery = adapter.control_delivery_summary()
+    agent_control = summarize_agent_control(sandbox_audit_path)
+    trace = _trace_summary(trace_path)
+    eligibility = classify_workflow_measurement(
+        outcome=outcome,
+        error=error_text,
+        semantic_completion=semantic_completion,
+        agent_control=agent_control,
+        control_delivery=control_delivery,
+        trace=trace,
+    )
+    task_correctness_valid = bool(correctness_gate.get("passed")) and not bool(
+        control_delivery.get("degraded")
+    )
     summary = {
         "schema_version": 1,
         "instance_id": workload.instance_id,
+        "repo": workload.repo,
+        "base_commit": workload.base_commit,
+        "source_repo": str(workload.source_repo) if workload.source_repo else None,
+        "docker_image": workload.docker_image or config.docker_image,
         "mode": config.mode,
         "workflow_id": workflow_id,
         "outcome": outcome,
@@ -1756,11 +2297,13 @@ def _run_workflow(
         "final_status": final_status,
         "semantic_completion": semantic_completion,
         "correctness_gate": correctness_gate,
-        "measurement_valid": bool(correctness_gate.get("passed"))
-        and not bool(control_delivery.get("degraded")),
-        "agent_control": summarize_agent_control(sandbox_audit_path),
+        "task_correctness_valid": task_correctness_valid,
+        # Compatibility alias for pre-P5G experiment readers.
+        "measurement_valid": task_correctness_valid,
+        **eligibility,
+        "agent_control": agent_control,
         "runtime_control_delivery": control_delivery,
-        "trace": _trace_summary(trace_path),
+        "trace": trace,
     }
     write_json(workflow_dir / "result.json", summary)
     return summary
@@ -1929,6 +2472,12 @@ def run_experiment(config: DeepAgentsExperimentConfig) -> dict[str, Any]:
         "measurement_valid_workflows": sum(
             bool(item.get("measurement_valid")) for item in results
         ),
+        "system_jct_eligible_workflows": sum(
+            bool(item.get("system_jct_eligible")) for item in results
+        ),
+        "native_agent_jct_eligible_workflows": sum(
+            bool(item.get("native_agent_jct_eligible")) for item in results
+        ),
         "dynamic_subagent_count": sum(
             int(item.get("trace", {}).get("dynamic_subagent_count", 0))
             for item in results
@@ -1958,6 +2507,46 @@ def run_experiment(config: DeepAgentsExperimentConfig) -> dict[str, Any]:
                 int(
                     item.get("agent_control", {}).get(
                         "forced_semantic_completions", 0
+                    )
+                )
+                for item in results
+            ),
+            "guard_intervened_completions": sum(
+                int(
+                    item.get("agent_control", {}).get(
+                        "guard_intervened_completions", 0
+                    )
+                )
+                for item in results
+            ),
+            "protocol_repaired_completions": sum(
+                int(
+                    item.get("agent_control", {}).get(
+                        "protocol_repaired_completions", 0
+                    )
+                )
+                for item in results
+            ),
+            "protocol_normalized_completions": sum(
+                int(
+                    item.get("agent_control", {}).get(
+                        "protocol_normalized_completions", 0
+                    )
+                )
+                for item in results
+            ),
+            "protocol_repair_failures": sum(
+                int(
+                    item.get("agent_control", {}).get(
+                        "protocol_repair_failures", 0
+                    )
+                )
+                for item in results
+            ),
+            "duplicate_tool_calls_suppressed": sum(
+                int(
+                    item.get("agent_control", {}).get(
+                        "duplicate_tool_calls_suppressed", 0
                     )
                 )
                 for item in results

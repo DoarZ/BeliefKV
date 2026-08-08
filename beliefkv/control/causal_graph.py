@@ -296,11 +296,39 @@ class RuntimeCausalContextGraph:
             changed_contexts=frozenset({invocation.context_id}),
         )
 
+    def _on_context_compact(self, event: RuntimeEvent) -> GraphDelta:
+        invocation = self._event_invocation(event)
+        self._ensure_not_terminal(invocation)
+        if event.context_id not in {None, invocation.context_id}:
+            raise CausalGraphError("context compact does not match invocation context")
+        context = self.contexts[invocation.context_id]
+        previous_epoch = event.attributes.get("previous_context_epoch")
+        if previous_epoch is not None and int(previous_epoch) != context.epoch:
+            raise CausalGraphError(
+                f"context compact previous epoch mismatch for {context.context_id}: "
+                f"{previous_epoch} != {context.epoch}"
+            )
+        if event.context_epoch is None or event.context_epoch <= context.epoch:
+            raise CausalGraphError("context compact must advance the context epoch")
+        self._touch_context(invocation.context_id, event)
+        invocation.updated_ts_ms = event.ts_ms
+        return GraphDelta(
+            event.event_id,
+            changed_contexts=frozenset({invocation.context_id}),
+        )
+
     def _on_structured_action(self, event: RuntimeEvent) -> GraphDelta:
         invocation = self._event_invocation(event)
         self._validate_context_epoch(
             self.contexts[invocation.context_id], event.context_epoch
         )
+        return GraphDelta(event.event_id)
+
+    def _on_call_censored(self, event: RuntimeEvent) -> GraphDelta:
+        """Record an observation label without changing executable RCCG state."""
+
+        if event.invocation_id is not None:
+            self._event_invocation(event)
         return GraphDelta(event.event_id)
 
     def _on_call(self, event: RuntimeEvent) -> GraphDelta:

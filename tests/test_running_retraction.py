@@ -18,6 +18,9 @@ from beliefkv.policy.retraction import (
     RunningRetractionCandidate,
     RunningRetractionPlan,
 )
+from beliefkv.policy.joint_scheduler import JointPlannerMode
+from beliefkv.policy.online_joint import JointPlanEpoch, OnlineJointPlanView
+from beliefkv.policy.reference import AdmissionAction, AdmissionIntent
 from beliefkv.runtime.lock_service import (
     LockedExtentAttribution,
     RequestServiceLedger,
@@ -181,7 +184,262 @@ class _Audit:
         self.events.append((event, ts_ms, fields))
 
 
+class RestoreMicroGateTest(unittest.TestCase):
+    @staticmethod
+    def _runtime() -> EmbeddedSGLangRuntime:
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = BeliefKVConfig(
+            hbm_capacity_bytes=2000,
+            reserve_hbm_bytes=100,
+            kv_bytes_per_token=10,
+            queue_service_observer_enabled=True,
+            queue_service_observer_include_runtime_batches=True,
+            joint_policy_enabled=True,
+            observed_admission_scheduling_enabled=True,
+            running_batch_retraction_enabled=True,
+            running_batch_retraction_min_reclaim_bytes=1,
+            restore_micro_gate_enabled=True,
+            restore_micro_gate_min_private_bytes=1,
+        )
+        runtime.audit = _Audit()
+        runtime._restore_micro_gate_state = {
+            "enabled": True,
+            "gate_id": runtime.config.restore_micro_gate_id,
+            "stage": "armed",
+        }
+        runtime._restore_micro_gate_last_audit_signature = None
+        runtime._online_joint_epoch_sequence = 0
+        runtime._lock_service_ledger = RequestServiceLedger()
+        runtime._lock_service_ledger.observe_selected(
+            request_id="victim",
+            workflow_id="restore-micro-gate:victim",
+            invocation_id="victim-invocation",
+            context_id="victim-context",
+            ts_ms=900.0,
+        )
+        runtime._lock_service_ledger.observe_completed(
+            "victim",
+            ts_ms=901.0,
+            phase="decode",
+        )
+        runtime._joint_retraction_solver = ObservedRetractionPlanner(
+            ObservedRetractionConfig(
+                minimum_admission_stall_ms=100.0,
+                minimum_reclaim_bytes=1,
+            )
+        )
+        runtime._request_metadata_by_id = {
+            "replacement": SimpleNamespace(
+                root_workflow_id=(
+                    runtime.config.restore_micro_gate_replacement_workflow_id
+                )
+            )
+        }
+        return runtime
+
+    @staticmethod
+    def _snapshot() -> ObservedRetractionSnapshot:
+        return ObservedRetractionSnapshot(
+            observed_ts_ms=1000.0,
+            page_revision=7,
+            topology_revision=3,
+            hbm_capacity_bytes=2000,
+            active_kv_budget_bytes=1000,
+            active_kv_footprint_bytes=500,
+            native_reclaim_capacity_bytes=1000,
+            admission_stall_ms=0.0,
+            running_request_count=2,
+            minimum_active_requests=1,
+            candidates=(
+                RunningRetractionCandidate(
+                    request_id="victim",
+                    workflow_id="restore-micro-gate:victim",
+                    invocation_id="victim-invocation",
+                    context_id="victim-context",
+                    private_kv_bytes=200,
+                    service_status="recent",
+                    stale_for_ms=0.0,
+                    causal_rank=1,
+                    unblock_depth=0,
+                    workflow_fair_rank=0,
+                ),
+            ),
+            locked_extents=(
+                RetractionLockedExtent(
+                    "victim-extent", 600, ("victim",), True
+                ),
+            ),
+            replacements=(RetractionReplacement("replacement", 400),),
+        )
+
+    def test_explicit_pair_forces_pressure_but_preserves_physical_eligibility(self):
+        runtime = self._runtime()
+
+        forced, gate_id = runtime._restore_micro_gate_snapshot(self._snapshot())
+
+        self.assertEqual(gate_id, "p5g-restore-v1")
+        self.assertEqual(forced.candidates[0].service_status, "stale")
+        self.assertEqual(forced.native_reclaim_capacity_bytes, 1000)
+        self.assertGreater(
+            forced.active_kv_footprint_bytes - forced.active_kv_budget_bytes,
+            forced.candidates[0].private_kv_bytes,
+        )
+
+    def test_forced_retraction_is_one_atomic_joint_action_group(self):
+        runtime = self._runtime()
+        forced, gate_id = runtime._restore_micro_gate_snapshot(self._snapshot())
+
+        decision, plan_id = runtime._running_retraction_decision(
+            forced,
+            restore_micro_gate_id=gate_id,
+        )
+
+        self.assertIsNotNone(decision.plan)
+        self.assertEqual(decision.plan.request_ids, ("victim",))
+        self.assertEqual(decision.plan.reason, "restore_micro_gate_forced")
+        self.assertEqual(plan_id, runtime._current_joint_plan_epoch.source_plan_id)
+        groups = runtime._current_joint_plan_epoch.action_groups
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(
+            {item.slice_id for item in groups[0].actions},
+            {"request:replacement", "retraction:victim"},
+        )
+
+    def test_explicit_pair_drains_overlap_without_natural_pressure(self):
+        runtime = self._runtime()
+        runtime._now_ms = lambda: 1000.0
+        runtime._last_retraction_decision_ms = None
+        runtime._pending_running_retraction_transaction = None
+        runtime._pending_online_joint_residency = None
+        runtime._pending_running_retraction_barrier = None
+        runtime._retraction_admission_stall_since_ms = 0.0
+        runtime._running_retraction_counts = Counter()
+        runtime.controller = SimpleNamespace(has_pending_transfer_work=lambda: False)
+        runtime._running_retraction_replacements = lambda now_ms: (
+            RetractionReplacement("replacement", 400),
+        )
+        runtime._native_reclaim_capacity_bytes = lambda: 500
+        runtime._observed_admission_snapshot = (
+            lambda **_kwargs: SimpleNamespace(active_kv_footprint_bytes=500)
+        )
+        runtime._metadata = lambda req: req.metadata
+        runtime._running_retraction_barrier_state = lambda *args, **kwargs: {}
+        runtime._preview_running_retraction_barrier_unlock = (
+            lambda **_kwargs: (None, "unavailable", 1.0)
+        )
+        victim = SimpleNamespace(
+            rid="victim",
+            seqlen=1,
+            metadata=SimpleNamespace(
+                root_workflow_id=runtime.config.restore_micro_gate_victim_workflow_id
+            ),
+        )
+
+        self.assertTrue(
+            runtime.running_batch_retraction_barrier_required(
+                SimpleNamespace(reqs=[victim, object()])
+            )
+        )
+        requested = next(
+            fields
+            for event, _ts_ms, fields in runtime.audit.events
+            if event == "running_retraction_overlap_barrier_requested"
+        )
+        self.assertTrue(requested["restore_micro_gate_forced"])
+        self.assertEqual(requested["replacement_deficit_bytes"], 0)
+        self.assertEqual(requested["active_excess_bytes"], 0)
+
+    def test_explicit_pair_does_not_drain_before_private_kv_threshold(self):
+        runtime = self._runtime()
+        runtime._metadata = lambda req: req.metadata
+        victim = SimpleNamespace(
+            rid="victim",
+            seqlen=0,
+            metadata=SimpleNamespace(
+                root_workflow_id=runtime.config.restore_micro_gate_victim_workflow_id
+            ),
+        )
+
+        self.assertFalse(
+            runtime._restore_micro_gate_barrier_pair_visible(
+                (victim,),
+                (RetractionReplacement("replacement", 400),),
+            )
+        )
+
+
 class RunningRetractionCommitTest(unittest.TestCase):
+    def test_online_joint_plan_authorizes_retraction_victims_and_replacement(self):
+        config = BeliefKVConfig(
+            hbm_capacity_bytes=2000,
+            reserve_hbm_bytes=100,
+            observed_admission_scheduling_enabled=True,
+            running_batch_retraction_enabled=True,
+            running_batch_retraction_min_stall_ms=100.0,
+            running_batch_retraction_min_reclaim_bytes=1,
+            joint_policy_enabled=True,
+        )
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime._current_online_joint_view = OnlineJointPlanView(
+            plan_id="joint-1",
+            ordered_request_ids=("replacement",),
+            immediate_request_ids=("replacement",),
+            restore_requirements=(),
+            deferred_request_ids=("a", "b"),
+            residency_intent_indices=(),
+        )
+        runtime._current_joint_plan_epoch = JointPlanEpoch(
+            epoch_id="joint-1:epoch:1",
+            source_plan_id="joint-1",
+            planner_mode=JointPlannerMode.OPTIMIZED,
+            view=runtime._current_online_joint_view,
+            action_slices=(),
+            source_action_count=0,
+            committed_action_count=0,
+        )
+        runtime.audit = _Audit()
+        runtime._online_joint_result = SimpleNamespace(
+            plan=SimpleNamespace(
+                plan_id="joint-1",
+                retractions=(SimpleNamespace(request_id="a"),),
+                admissions=(
+                    AdmissionIntent(
+                        "a", AdmissionAction.DEFER, 0, (), "pause a"
+                    ),
+                    AdmissionIntent(
+                        "b", AdmissionAction.DEFER, 0, (), "pause b"
+                    ),
+                    AdmissionIntent(
+                        "replacement",
+                        AdmissionAction.ADMIT,
+                        400,
+                        (),
+                        "replace",
+                    ),
+                ),
+            )
+        )
+
+        decision, source_plan_id = runtime._running_retraction_decision(
+            snapshot(
+                candidates=(
+                    candidate("a", private_bytes=600, service_status="recent"),
+                    candidate("b", private_bytes=100, service_status="recent"),
+                )
+            )
+        )
+
+        self.assertEqual(source_plan_id, "joint-1")
+        self.assertIsNotNone(decision.plan)
+        assert decision.plan is not None
+        self.assertEqual(decision.plan.request_ids, ("a",))
+        self.assertEqual(decision.plan.replacement_request_ids, ("replacement",))
+        self.assertEqual(
+            decision.plan.reason,
+            "observed_joint_pause_authorized_lock_reclaim",
+        )
+
     def test_predrain_tentative_preview_is_an_observed_stale_upper_bound(self):
         config = BeliefKVConfig(
             hbm_capacity_bytes=2000,
@@ -403,6 +661,30 @@ class RunningRetractionCommitTest(unittest.TestCase):
         )
         self.assertEqual(
             runtime._running_retraction_counts["barrier_no_pressure"], 1
+        )
+
+    def test_overlap_barrier_is_suppressed_before_overdue_restore_rejection(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = BeliefKVConfig(
+            observed_admission_scheduling_enabled=True,
+            running_batch_retraction_enabled=True,
+        )
+        runtime._now_ms = lambda: 1000.0
+        runtime._running_retraction_counts = Counter()
+        runtime._overdue_restore_obligation = lambda **_kwargs: SimpleNamespace(
+            obligation_id="restore-1"
+        )
+
+        self.assertFalse(
+            runtime.running_batch_retraction_barrier_required(
+                SimpleNamespace(reqs=[object(), object()])
+            )
+        )
+        self.assertEqual(
+            runtime._running_retraction_counts[
+                "barrier_restore_debt_suppressed"
+            ],
+            1,
         )
 
     def test_safe_point_starts_stall_timer_before_prefill_epoch_exists(self):

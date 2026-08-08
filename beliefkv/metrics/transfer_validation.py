@@ -69,7 +69,16 @@ def validate_transfer_audit(
 
     dispatch_ids = set(dispatched)
     ack_ids = set(acknowledged)
-    telemetry_ids = set(telemetry_records)
+    command_telemetry_records = {
+        command_id: record
+        for command_id, record in telemetry_records.items()
+        if record.get("telemetry_origin") != "native_hicache_callback"
+    }
+    command_telemetry_ids = set(command_telemetry_records)
+    telemetry_origin_counts = Counter(
+        str(record.get("telemetry_origin", "backend_telemetry"))
+        for record in telemetry_records.values()
+    )
     expected_dma_ids = {
         command_id
         for command_id, record in dispatched.items()
@@ -80,14 +89,15 @@ def validate_transfer_audit(
     byte_bound_violations = 0
     valid_telemetry: list[tuple[int, TransferTelemetry]] = []
     for command_id, record in telemetry_records.items():
-        dispatch = dispatched.get(command_id)
-        ack = acknowledged.get(command_id)
-        if dispatch is None or ack is None or not (
-            int(dispatch.get("sequence", -1))
-            < int(ack.get("sequence", -1))
-            < int(record.get("sequence", -1))
-        ):
-            ordering_violations += 1
+        if command_id in command_telemetry_records:
+            dispatch = dispatched.get(command_id)
+            ack = acknowledged.get(command_id)
+            if dispatch is None or ack is None or not (
+                int(dispatch.get("sequence", -1))
+                < int(ack.get("sequence", -1))
+                < int(record.get("sequence", -1))
+            ):
+                ordering_violations += 1
         submit = float(record.get("submit_ts_ms", -1))
         start = record.get("start_ts_ms")
         complete = float(record.get("complete_ts_ms", -1))
@@ -127,14 +137,25 @@ def validate_transfer_audit(
             "dispatch_count": len(dispatched),
             "ack_count": len(acknowledged),
             "telemetry_count": len(telemetry_records),
+            "command_telemetry_count": len(command_telemetry_records),
+            "native_telemetry_count": telemetry_origin_counts.get(
+                "native_hicache_callback", 0
+            ),
+            "telemetry_origin_counts": dict(
+                sorted(telemetry_origin_counts.items())
+            ),
             "expected_dma_command_count": len(expected_dma_ids),
             "missing_ack_count": len(dispatch_ids - ack_ids),
             "orphan_ack_count": len(ack_ids - dispatch_ids),
             "missing_expected_dma_telemetry_count": len(
-                expected_dma_ids - telemetry_ids
+                expected_dma_ids - command_telemetry_ids
             ),
-            "telemetry_without_dispatch_count": len(telemetry_ids - dispatch_ids),
-            "telemetry_without_ack_count": len(telemetry_ids - ack_ids),
+            "telemetry_without_dispatch_count": len(
+                command_telemetry_ids - dispatch_ids
+            ),
+            "telemetry_without_ack_count": len(
+                command_telemetry_ids - ack_ids
+            ),
             "ordering_violation_count": ordering_violations,
             "timestamp_violation_count": timestamp_violations,
             "telemetry_byte_bound_violation_count": byte_bound_violations,
@@ -143,6 +164,7 @@ def validate_transfer_audit(
             "telemetry_status_counts": dict(sorted(status_counts.items())),
             "telemetry_direction_counts": dict(sorted(direction_counts.items())),
             "all_commands_acknowledged": dispatch_ids == ack_ids,
+            "ack_precedes_every_command_telemetry": ordering_violations == 0,
             "ack_precedes_every_telemetry": ordering_violations == 0,
         },
         "resource_consistency": _resource_consistency(resources),
@@ -411,7 +433,18 @@ def _physical_bundle_metrics(
     shared_owner_snapshots = 0
     closure_ratios: list[float] = []
     for item in previews:
-        blocker_counts.update(str(code) for code in item.get("blocker_codes", ()))
+        compact_blockers = item.get("blocker_histogram")
+        if isinstance(compact_blockers, dict):
+            blocker_counts.update(
+                {
+                    str(code): int(count)
+                    for code, count in compact_blockers.items()
+                }
+            )
+        else:
+            blocker_counts.update(
+                str(code) for code in item.get("blocker_codes", ())
+            )
         lease_counts[str(item.get("lease_kind", "unknown"))] += 1
         command_kind_counts[str(item.get("command_kind", "unknown"))] += 1
         scope_counts[str(item.get("bundle_scope", "unknown"))] += 1
@@ -421,7 +454,13 @@ def _physical_bundle_metrics(
         cross_context_action_bytes += int(
             item.get("cross_context_action_bytes", 0)
         )
-        if len(item.get("owner_context_ids", ())) > 1:
+        owner_context_count = int(
+            item.get(
+                "owner_context_count",
+                len(item.get("owner_context_ids", ())),
+            )
+        )
+        if owner_context_count > 1:
             shared_owner_snapshots += 1
         action_bytes = int(item.get("closure_bytes", 0))
         if action_bytes > 0:
@@ -636,6 +675,8 @@ def _prediction_group(records: list[dict[str, Any]]) -> dict[str, Any]:
 def _resource_consistency(records: list[dict[str, Any]]) -> dict[str, Any]:
     allocator_minus_mirror: list[float] = []
     host_mismatches = 0
+    host_inflight_mismatches = 0
+    host_quiescent_mismatches = 0
     hbm_mirror_exceeds_allocator = 0
     hbm_capacity_mismatches = 0
     host_capacity_mismatches = 0
@@ -650,6 +691,11 @@ def _resource_consistency(records: list[dict[str, Any]]) -> dict[str, Any]:
                 hbm_mirror_exceeds_allocator += 1
         if host is not None and host_mirror is not None and host != host_mirror:
             host_mismatches += 1
+            inflight = _optional_int(record.get("inflight_command_count"))
+            if inflight is not None and inflight > 0:
+                host_inflight_mismatches += 1
+            else:
+                host_quiescent_mismatches += 1
         if all(record.get(key) is not None for key in (
             "hbm_used_bytes", "hbm_free_bytes", "hbm_capacity_bytes"
         )) and int(record["hbm_used_bytes"]) + int(record["hbm_free_bytes"]) != int(
@@ -671,6 +717,8 @@ def _resource_consistency(records: list[dict[str, Any]]) -> dict[str, Any]:
             (int(item.get("host_used_bytes") or 0) for item in records), default=None
         ),
         "host_page_index_mismatch_count": host_mismatches,
+        "host_page_index_inflight_mismatch_count": host_inflight_mismatches,
+        "host_page_index_quiescent_mismatch_count": host_quiescent_mismatches,
         "hbm_mirror_exceeds_allocator_count": hbm_mirror_exceeds_allocator,
         "allocator_minus_hbm_mirror_p50_bytes": percentile(
             allocator_minus_mirror, 50
@@ -683,7 +731,7 @@ def _resource_consistency(records: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "hbm_capacity_mismatch_count": hbm_capacity_mismatches,
         "host_capacity_mismatch_count": host_capacity_mismatches,
-        "host_residency_matches_page_index": host_mismatches == 0,
+        "host_residency_matches_page_index": host_quiescent_mismatches == 0,
         "hbm_mirror_is_allocator_subset": hbm_mirror_exceeds_allocator == 0,
     }
 
@@ -760,6 +808,33 @@ def _parse_telemetry(record: dict[str, Any]) -> TransferTelemetry:
         ),
         command_kind=str(record.get("command_kind", "")),
         compute_phase=str(record.get("compute_phase", "unknown")),
+        host_copy_state=str(record.get("host_copy_state", "unknown")),
+        pinned_host=(
+            bool(record["pinned_host"])
+            if record.get("pinned_host") is not None
+            else None
+        ),
+        native_concurrent_bytes=max(
+            0, int(record.get("native_concurrent_bytes", 0))
+        ),
+        allocator_wait_ms=(
+            float(record["allocator_wait_ms"])
+            if record.get("allocator_wait_ms") is not None
+            else None
+        ),
+        allocator_submit_ms=(
+            float(record["allocator_submit_ms"])
+            if record.get("allocator_submit_ms") is not None
+            else None
+        ),
+        callback_overhead_ms=(
+            float(record["callback_overhead_ms"])
+            if record.get("callback_overhead_ms") is not None
+            else None
+        ),
+        start_timestamp_semantics=str(
+            record.get("start_timestamp_semantics", "unavailable")
+        ),
     )
 
 

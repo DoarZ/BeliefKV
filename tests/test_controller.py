@@ -9,6 +9,8 @@ from beliefkv.runtime.protocol import (
     CommandAck,
     CommandKind,
     CommandStatus,
+    ControlCommand,
+    EnqueueStatus,
     PageHandle,
     PhysicalResidency,
 )
@@ -70,6 +72,81 @@ class ControllerHarness:
 
 
 class ControllerTest(unittest.TestCase):
+    def test_typed_enqueue_adopts_only_equivalent_canonical_command(self):
+        h = ControllerHarness()
+        first = ControlCommand(
+            command_id="restore-1",
+            kind=CommandKind.PREFETCH_CONTEXT,
+            created_ts_ms=1.0,
+            context_id="ctx",
+            context_epoch=0,
+            target_bytes=100,
+        )
+        adopted = ControlCommand(
+            command_id="restore-2",
+            kind=CommandKind.PREFETCH_CONTEXT,
+            created_ts_ms=2.0,
+            context_id="ctx",
+            context_epoch=0,
+            target_bytes=100,
+        )
+        conflict = ControlCommand(
+            command_id="offload-1",
+            kind=CommandKind.OFFLOAD_CONTEXT,
+            created_ts_ms=3.0,
+            context_id="ctx",
+            context_epoch=0,
+            target_bytes=100,
+        )
+
+        first_outcome = h.controller.enqueue_control_command(first)
+        adopted_outcome = h.controller.enqueue_control_command(adopted)
+        conflict_outcome = h.controller.enqueue_control_command(conflict)
+
+        self.assertEqual(first_outcome.status, EnqueueStatus.ENQUEUED)
+        self.assertEqual(adopted_outcome.status, EnqueueStatus.ADOPT_EXISTING)
+        self.assertEqual(adopted_outcome.canonical_command_id, "restore-1")
+        self.assertEqual(conflict_outcome.status, EnqueueStatus.CONTEXT_CONFLICT)
+        self.assertEqual(len(h.controller.command_queue), 1)
+
+    def test_context_epoch_advance_cannot_adopt_stale_command(self):
+        h = ControllerHarness()
+        old = ControlCommand(
+            command_id="restore-old",
+            kind=CommandKind.PREFETCH_CONTEXT,
+            created_ts_ms=1.0,
+            context_id="ctx",
+            context_epoch=0,
+            target_bytes=100,
+        )
+        new = ControlCommand(
+            command_id="restore-new",
+            kind=CommandKind.PREFETCH_CONTEXT,
+            created_ts_ms=2.0,
+            context_id="ctx",
+            context_epoch=1,
+            target_bytes=100,
+        )
+
+        self.assertEqual(
+            h.controller.enqueue_control_command(old).status,
+            EnqueueStatus.ENQUEUED,
+        )
+        outcome = h.controller.enqueue_control_command(new)
+
+        self.assertEqual(outcome.status, EnqueueStatus.CONTEXT_CONFLICT)
+        self.assertEqual(outcome.canonical_command_id, "restore-old")
+
+    def test_online_writer_can_disable_reactive_victim_selection(self):
+        h = ControllerHarness()
+        h.create_parked()
+        h.add_page(400)
+
+        tick = h.controller.tick(10, allow_reactive_transfer=False)
+
+        self.assertIsNone(tick.transfer)
+        self.assertEqual(h.controller.command_history, [])
+
     def test_shadow_prepare_keeps_gpu_until_reactive_commit(self):
         h = ControllerHarness()
         h.create_parked()
@@ -248,6 +325,41 @@ class ControllerTest(unittest.TestCase):
             tick.transfer.command.kind, CommandKind.DROP_TERMINAL_PRIVATE
         )
         self.assertEqual(tick.transfer.command.target_handles, (handle,))
+
+    def test_context_compaction_releases_old_epoch_ownership(self):
+        h = ControllerHarness(shadow_enabled=False, prefetch_enabled=False)
+        h.emit(RuntimeEventKind.WORKFLOW_START)
+        h.emit(
+            RuntimeEventKind.INVOCATION_CREATE,
+            invocation_id="parent",
+            context_id="ctx",
+            context_epoch=0,
+        )
+        handle = PageHandle(1, 0)
+        h.controller.page_index.register_page(
+            handle,
+            size_bytes=200,
+            residency=PhysicalResidency.DUAL_CLEAN,
+        )
+        h.controller.page_index.bind_pages("ctx", 0, (handle,))
+
+        h.emit(
+            RuntimeEventKind.CONTEXT_COMPACT,
+            invocation_id="parent",
+            context_id="ctx",
+            context_epoch=1,
+            attributes={"previous_context_epoch": 0},
+        )
+
+        self.assertEqual(h.controller.page_index.context_epoch("ctx"), 1)
+        self.assertEqual(h.controller.page_index.context_pages("ctx"), [])
+        self.assertEqual(h.controller.page_index.pages[handle].owner_contexts, {})
+        cleanup = h.controller.tick(10)
+        self.assertEqual(
+            cleanup.transfer.command.kind,
+            CommandKind.DROP_TERMINAL_PRIVATE,
+        )
+        self.assertEqual(cleanup.transfer.command.target_handles, (handle,))
 
     def test_wakeup_cancels_inflight_shadow_without_resume_stall(self):
         h = ControllerHarness()

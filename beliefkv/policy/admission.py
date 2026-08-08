@@ -162,6 +162,7 @@ class AdmissionTicket:
     issued_ts_ms: float
     source: str
     reason: str
+    reservation_credit_bytes: int = 0
 
     def __post_init__(self) -> None:
         if min(
@@ -170,6 +171,7 @@ class AdmissionTicket:
             self.context_epoch,
             self.estimated_prefill_tokens,
             self.estimated_incremental_bytes,
+            self.reservation_credit_bytes,
         ) < 0:
             raise ValueError("ticket counters must be non-negative")
         if self.issued_ts_ms < 0:
@@ -728,6 +730,7 @@ class AdmissionTicketCompiler:
         budget: AdmissionCompileBudget,
         source: str,
         reason: str,
+        reservation_credits: Mapping[str, int] | None = None,
     ) -> AdmissionTicketEpoch:
         if epoch < 0 or now_ms < 0:
             raise ValueError("ticket epoch and time must be non-negative")
@@ -735,6 +738,9 @@ class AdmissionTicketCompiler:
             raise ValueError("ticket source and reason must be non-empty")
         if len(ordered_request_ids) != len(set(ordered_request_ids)):
             raise ValueError("ordered request IDs must be unique")
+        credits = dict(reservation_credits or {})
+        if any(not request_id or value < 0 for request_id, value in credits.items()):
+            raise ValueError("admission reservation credits must be non-negative")
 
         tickets: list[AdmissionTicket] = []
         skipped: list[tuple[str, str]] = []
@@ -757,6 +763,10 @@ class AdmissionTicketCompiler:
                 continue
             uncached_prompt_tokens = entry.request.uncached_prompt_tokens
             required_bytes = entry.request.estimated_incremental_bytes
+            reservation_credit_bytes = min(
+                required_bytes, credits.get(request_id, 0)
+            )
+            budgeted_bytes = required_bytes - reservation_credit_bytes
             if uncached_prompt_tokens > 0 and remaining_tokens <= 0:
                 skipped.append((request_id, "prefill_token_budget"))
                 continue
@@ -764,7 +774,7 @@ class AdmissionTicketCompiler:
             # this budget remains admissible because SGLang can prefill its
             # first chunk now and retain the remainder as ``chunked_req``.
             prefill_tokens = min(uncached_prompt_tokens, remaining_tokens)
-            if required_bytes > remaining_hbm:
+            if budgeted_bytes > remaining_hbm:
                 skipped.append((request_id, "bounded_hbm_budget"))
                 continue
             ticket = AdmissionTicket(
@@ -781,10 +791,11 @@ class AdmissionTicketCompiler:
                 issued_ts_ms=now_ms,
                 source=source,
                 reason=reason,
+                reservation_credit_bytes=reservation_credit_bytes,
             )
             tickets.append(ticket)
             remaining_tokens -= prefill_tokens
-            remaining_hbm -= required_bytes
+            remaining_hbm -= budgeted_bytes
         return AdmissionTicketEpoch(
             epoch=epoch,
             tickets=tuple(tickets),

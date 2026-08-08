@@ -147,6 +147,37 @@ class TransferServiceCurveTest(unittest.TestCase):
             estimate.estimated_callback_ms, estimate.callback_floor_p90_ms
         )
 
+    def test_detailed_curve_conditions_on_page_count_and_fixed_overhead(self):
+        curve = TransferServiceCurve(PCIeCostModel(), min_samples=2)
+        for sequence in (1, 2):
+            observation = telemetry(sequence, duration_ms=10)
+            observation = TransferTelemetry(
+                **{
+                    **observation.__dict__,
+                    "page_count": 16,
+                    "command_kind": "offload_context",
+                    "host_copy_state": "missing",
+                    "pinned_host": True,
+                    "native_concurrent_bytes": 1 << 20,
+                    "allocator_wait_ms": 2.0,
+                    "callback_overhead_ms": 1.0,
+                }
+            )
+            curve.observe(observation)
+
+        estimate = curve.estimate(
+            TransferDirection.D2H,
+            1000,
+            page_count=16,
+            command_kind="offload_context",
+            host_copy_state="missing",
+            pinned_host=True,
+            native_concurrent_bytes=1 << 20,
+        )
+
+        self.assertEqual(estimate.source, "bucket")
+        self.assertEqual(estimate.fixed_overhead_p90_ms, 3.0)
+
 
 if __name__ == "__main__":
     unittest.main()

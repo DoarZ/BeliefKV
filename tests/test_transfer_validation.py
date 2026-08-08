@@ -7,6 +7,120 @@ from beliefkv.metrics.transfer_validation import validate_transfer_audit
 
 
 class TransferValidationTest(unittest.TestCase):
+    def test_host_mismatch_is_transient_only_while_dma_is_inflight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "audit.jsonl"
+            records = [
+                {
+                    "event": "resource_snapshot",
+                    "run_id": "run-inflight",
+                    "sequence": 1,
+                    "ts_ms": 1.0,
+                    "host_used_bytes": 200,
+                    "page_index_cpu_bytes": 100,
+                    "inflight_command_count": 1,
+                },
+                {
+                    "event": "resource_snapshot",
+                    "run_id": "run-inflight",
+                    "sequence": 2,
+                    "ts_ms": 2.0,
+                    "host_used_bytes": 200,
+                    "page_index_cpu_bytes": 200,
+                    "inflight_command_count": 0,
+                },
+            ]
+            path.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            report = validate_transfer_audit(path)
+            resources = report["resource_consistency"]
+
+            self.assertEqual(resources["host_page_index_mismatch_count"], 1)
+            self.assertEqual(
+                resources["host_page_index_inflight_mismatch_count"], 1
+            )
+            self.assertEqual(
+                resources["host_page_index_quiescent_mismatch_count"], 0
+            )
+            self.assertTrue(resources["host_residency_matches_page_index"])
+
+    def test_host_mismatch_fails_when_no_dma_is_inflight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "audit.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "event": "resource_snapshot",
+                        "run_id": "run-quiescent",
+                        "sequence": 1,
+                        "ts_ms": 1.0,
+                        "host_used_bytes": 200,
+                        "page_index_cpu_bytes": 100,
+                        "inflight_command_count": 0,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            resources = validate_transfer_audit(path)["resource_consistency"]
+
+            self.assertEqual(
+                resources["host_page_index_quiescent_mismatch_count"], 1
+            )
+            self.assertFalse(resources["host_residency_matches_page_index"])
+
+    def test_native_hicache_telemetry_does_not_require_command_ack(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "audit.jsonl"
+            records = [
+                {
+                    "event": "runtime_initialized",
+                    "run_id": "run-native",
+                    "sequence": 1,
+                    "ts_ms": 1.0,
+                },
+                {
+                    "event": "transfer_telemetry",
+                    "run_id": "run-native",
+                    "sequence": 2,
+                    "ts_ms": 20.0,
+                    "command_id": "native-hicache-1",
+                    "telemetry_origin": "native_hicache_callback",
+                    "submit_ts_ms": 10.0,
+                    "start_ts_ms": None,
+                    "complete_ts_ms": 20.0,
+                    "actual_bytes": 1000,
+                    "closure_bytes": 1000,
+                    "direction": "d2h",
+                    "source_tier": "gpu",
+                    "target_tier": "host",
+                    "status": "completed",
+                    "page_count": 1,
+                },
+            ]
+            path.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            report = validate_transfer_audit(
+                path,
+                service_curve_min_samples=1,
+                holdout_fraction=0.5,
+            )
+
+            integrity = report["command_integrity"]
+            self.assertTrue(integrity["passes"])
+            self.assertEqual(integrity["telemetry_count"], 1)
+            self.assertEqual(integrity["command_telemetry_count"], 0)
+            self.assertEqual(integrity["native_telemetry_count"], 1)
+            self.assertEqual(integrity["telemetry_without_dispatch_count"], 0)
+            self.assertEqual(integrity["telemetry_without_ack_count"], 0)
+
     def test_validates_ack_order_resources_and_holdout(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "audit.jsonl"

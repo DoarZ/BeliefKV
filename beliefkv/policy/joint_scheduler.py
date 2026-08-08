@@ -4,8 +4,9 @@ import hashlib
 import json
 import math
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
+from enum import Enum
 from types import MappingProxyType
 from typing import Mapping, Sequence
 
@@ -41,6 +42,68 @@ from beliefkv.policy.whatif_packer import (
 OBSERVED_SCENARIO_ID = "observed-runtime-frontier"
 
 
+class JointPlannerMode(str, Enum):
+    BOUNDED_SEED = "bounded_seed"
+    OPTIMIZED = "optimized"
+    EMERGENCY = "emergency"
+    NO_ACTION = "no_action"
+
+
+@dataclass(frozen=True)
+class SemanticResidencyTarget:
+    """Stable residency goal resolved to Radix extents at a scheduler safe point."""
+
+    context_id: str
+    context_epoch: int
+    action: ResidencyAction
+    target_bytes_hint: int
+    deadline_ms: float
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.context_id or not self.reason:
+            raise ValueError("semantic residency target identity must be non-empty")
+        if self.context_epoch < 0 or self.target_bytes_hint < 0:
+            raise ValueError("semantic residency target values must be non-negative")
+        if not math.isfinite(self.deadline_ms) or self.deadline_ms < 0:
+            raise ValueError("semantic residency deadline must be non-negative")
+        object.__setattr__(self, "action", ResidencyAction(self.action))
+        if self.action == ResidencyAction.KEEP:
+            raise ValueError("semantic residency targets must request a state change")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "context_id": self.context_id,
+            "context_epoch": self.context_epoch,
+            "action": self.action.value,
+            "target_bytes_hint": self.target_bytes_hint,
+            "deadline_ms": self.deadline_ms,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class RetractionIntent:
+    request_id: str
+    context_id: str
+    context_epoch: int
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.request_id or not self.context_id or not self.reason:
+            raise ValueError("retraction intent identity must be non-empty")
+        if self.context_epoch < 0:
+            raise ValueError("retraction intent context epoch must be non-negative")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "request_id": self.request_id,
+            "context_id": self.context_id,
+            "context_epoch": self.context_epoch,
+            "reason": self.reason,
+        }
+
+
 @dataclass(frozen=True)
 class JointPlannerConfig:
     fairness_lag_budget_ms: float = 50.0
@@ -49,6 +112,8 @@ class JointPlannerConfig:
     max_total_frontier_candidates: int = 16
     max_package_evaluations: int = 8
     max_planning_budget_ms: float = 1.0
+    min_planning_budget_ms: float = 0.25
+    trigger_interval_budget_fraction: float = 0.5
     max_plan_age_ms: float = 100.0
     residency_hysteresis_ms: float = 100.0
     emergency_hbm_ratio: float = 0.98
@@ -67,6 +132,7 @@ class JointPlannerConfig:
         for name in (
             "fairness_lag_budget_ms",
             "max_planning_budget_ms",
+            "min_planning_budget_ms",
             "max_plan_age_ms",
             "residency_hysteresis_ms",
             "memory_penalty_ms",
@@ -76,6 +142,10 @@ class JointPlannerConfig:
                 raise ValueError(f"{name} must be finite and non-negative")
         if self.max_planning_budget_ms == 0 or self.max_plan_age_ms == 0:
             raise ValueError("planning budget and plan age must be positive")
+        if self.min_planning_budget_ms > self.max_planning_budget_ms:
+            raise ValueError("minimum planning budget cannot exceed maximum")
+        if not 0 < self.trigger_interval_budget_fraction <= 1:
+            raise ValueError("trigger interval budget fraction must be in (0, 1]")
         if not 0 < self.emergency_hbm_ratio <= 1:
             raise ValueError("emergency_hbm_ratio must be in (0, 1]")
 
@@ -391,6 +461,9 @@ class JointPlan:
     topology_version: int
     allocator_version: int
     read_set: PlanReadSet
+    semantic_residency: tuple[SemanticResidencyTarget, ...] = ()
+    retractions: tuple[RetractionIntent, ...] = ()
+    planner_mode: JointPlannerMode = JointPlannerMode.OPTIMIZED
     fallback_reason: str | None = None
     candidate_count: int = 0
     evaluated_package_count: int = 0
@@ -399,6 +472,8 @@ class JointPlan:
     search_complete: bool = True
     planning_termination_reason: str = "complete"
     planning_phase_ms: tuple[tuple[str, float], ...] = ()
+    prediction_used: bool = False
+    prediction_influence: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.plan_id or not self.input_snapshot_id:
@@ -413,6 +488,7 @@ class JointPlan:
             self.evaluated_package_count,
         ) < 0:
             raise ValueError("joint plan counters must be non-negative")
+        object.__setattr__(self, "planner_mode", JointPlannerMode(self.planner_mode))
         if (
             not math.isfinite(self.expected_unhidden_stall_ms)
             or self.expected_unhidden_stall_ms < 0
@@ -433,10 +509,40 @@ class JointPlan:
             raise ValueError("planning phase timings must be unique and non-negative")
         admission_ids = [item.request_id for item in self.admissions]
         residency_ids = [item.bundle_id for item in self.residency]
+        semantic_ids = [
+            (item.context_id, item.context_epoch, item.action)
+            for item in self.semantic_residency
+        ]
+        retraction_ids = [item.request_id for item in self.retractions]
         if len(admission_ids) != len(set(admission_ids)):
             raise ValueError("joint plan admissions must be unique")
         if len(residency_ids) != len(set(residency_ids)):
             raise ValueError("joint plan residency intents must be unique")
+        if len(semantic_ids) != len(set(semantic_ids)):
+            raise ValueError("joint plan semantic residency targets must be unique")
+        if len(retraction_ids) != len(set(retraction_ids)):
+            raise ValueError("joint plan retraction intents must be unique")
+        object.__setattr__(
+            self,
+            "prediction_influence",
+            tuple(sorted(self.prediction_influence)),
+        )
+        influence_names = [name for name, _ in self.prediction_influence]
+        if len(influence_names) != len(set(influence_names)):
+            raise ValueError("joint plan prediction influence names must be unique")
+        if any(not name or value < 0 for name, value in self.prediction_influence):
+            raise ValueError(
+                "joint plan prediction influence must use non-empty names "
+                "and non-negative counts"
+            )
+        if self.prediction_used and not self.prediction_influence:
+            raise ValueError(
+                "joint plan using predictions must carry influence telemetry"
+            )
+        if self.residency and self.semantic_residency:
+            raise ValueError(
+                "a JointPlan cannot mix semantic and physical residency intents"
+            )
         for dependency in self.dependencies:
             if dependency.residency_intent_index >= len(self.residency):
                 raise ValueError("joint plan dependency references a missing intent")
@@ -463,6 +569,7 @@ class JointPlan:
                     "expected_hbm_peak_bytes": self.expected_hbm_peak_bytes,
                     "expected_unhidden_stall_ms": self.expected_unhidden_stall_ms,
                     "fallback_reason": self.fallback_reason,
+                    "planner_mode": self.planner_mode.value,
                     "candidate_count": self.candidate_count,
                     "transition_open": self.transition_open,
                     "search_complete": self.search_complete,
@@ -505,12 +612,17 @@ class JointPlan:
             "execution": self.execution.to_dict(),
             "admissions": [item.to_dict() for item in self.admissions],
             "residency": [item.to_dict() for item in self.residency],
+            "semantic_residency": [
+                item.to_dict() for item in self.semantic_residency
+            ],
+            "retractions": [item.to_dict() for item in self.retractions],
             "dependencies": [item.to_dict() for item in self.dependencies],
             "expected_hbm_peak_bytes": self.expected_hbm_peak_bytes,
             "expected_unhidden_stall_ms": self.expected_unhidden_stall_ms,
             "topology_version": self.topology_version,
             "allocator_version": self.allocator_version,
             "read_set": self.read_set.to_dict(),
+            "planner_mode": self.planner_mode.value,
             "fallback_reason": self.fallback_reason,
             "candidate_count": self.candidate_count,
             "evaluated_package_count": self.evaluated_package_count,
@@ -519,6 +631,8 @@ class JointPlan:
             "search_complete": self.search_complete,
             "planning_termination_reason": self.planning_termination_reason,
             "planning_phase_ms": dict(self.planning_phase_ms),
+            "prediction_used": self.prediction_used,
+            "prediction_influence": dict(self.prediction_influence),
         }
 
 
@@ -532,6 +646,28 @@ class _Candidate:
     relation_type: str
     context_mode: str
     execution_mode: str
+    predicted_remaining_decode_tokens: float | None = None
+    predicted_external_wait_ms: float | None = None
+    predicted_next_output_tokens: float | None = None
+    prediction_support_level: str = ""
+
+    @property
+    def prediction_order_key(self) -> tuple[int, float]:
+        tokens = self.predicted_remaining_decode_tokens
+        if tokens is not None and self.prediction_support_level != "unavailable":
+            return (0, float(tokens))
+        return (1, self.request.submitted_ts_ms)
+
+    @property
+    def observed_order_key(self) -> tuple[object, ...]:
+        return (
+            self.causal_rank,
+            -self.unblock_depth,
+            -self.pending_messages,
+            (1, self.request.submitted_ts_ms),
+            self.request.invocation_id,
+            self.request.request_id,
+        )
 
     @property
     def order_key(self) -> tuple[object, ...]:
@@ -539,6 +675,7 @@ class _Candidate:
             self.causal_rank,
             -self.unblock_depth,
             -self.pending_messages,
+            self.prediction_order_key,
             self.request.submitted_ts_ms,
             self.request.invocation_id,
             self.request.request_id,
@@ -583,11 +720,29 @@ class ObservedJointPlanner:
     def decide(self, policy_input: PolicyInput) -> PolicyOutput:
         return self.plan(policy_input).to_policy_output(policy_name=self.name)
 
-    def plan(self, policy_input: PolicyInput) -> JointPlan:
+    def plan(
+        self,
+        policy_input: PolicyInput,
+        *,
+        planning_budget_ms: float | None = None,
+        cancel_check: object | None = None,
+    ) -> JointPlan:
+        budget_ms = (
+            self.config.max_planning_budget_ms
+            if planning_budget_ms is None
+            else float(planning_budget_ms)
+        )
+        if not math.isfinite(budget_ms) or budget_ms <= 0:
+            raise ValueError("planning budget must be finite and positive")
+        budget_ms = min(self.config.max_planning_budget_ms, budget_ms)
+        cancelled = cancel_check if callable(cancel_check) else lambda: False
         started_ns = time.perf_counter_ns()
         transition_open = _transition_open(policy_input)
         candidate_started_ns = time.perf_counter_ns()
-        candidates, fairness = self._ordered_candidates(policy_input)
+        candidates, fairness, prediction_influence = self._ordered_candidates(
+            policy_input
+        )
+        prediction_used = bool(prediction_influence)
         phase_ms = {
             "candidate_order": self._elapsed_ms(candidate_started_ns),
             "prepare": 0.0,
@@ -603,6 +758,8 @@ class ObservedJointPlanner:
                 started_ns=started_ns,
                 transition_open=True,
                 admit_fitting=False,
+                prediction_used=prediction_used,
+                prediction_influence=tuple(prediction_influence.items()),
             )
             return replace(plan, planning_phase_ms=_phase_timings(phase_ms))
         if not candidates:
@@ -618,24 +775,46 @@ class ObservedJointPlanner:
                 started_ns=started_ns,
                 transition_open=False,
                 admit_fitting=False,
+                prediction_used=prediction_used,
+                prediction_influence=tuple(prediction_influence.items()),
             )
             return replace(plan, planning_phase_ms=_phase_timings(phase_ms))
+
+        seed = self._bounded_seed(
+            policy_input,
+            candidates,
+            started_ns=started_ns,
+            prediction_used=prediction_used,
+            prediction_influence=tuple(prediction_influence.items()),
+        )
 
         prepare_started_ns = time.perf_counter_ns()
         try:
             prepared = self.physicalizer.prepare(policy_input)
         except (KeyError, TypeError, ValueError) as error:
-            plan = self._fallback(
-                policy_input,
-                candidates,
-                reason=f"physicalization_error:{type(error).__name__}:{error}",
-                started_ns=started_ns,
-                transition_open=False,
-                admit_fitting=False,
-            )
             phase_ms["prepare"] = self._elapsed_ms(prepare_started_ns)
-            return replace(plan, planning_phase_ms=_phase_timings(phase_ms))
+            return replace(
+                seed,
+                planning_ms=self._elapsed_ms(started_ns),
+                search_complete=False,
+                planning_termination_reason=(
+                    f"optimization_prepare_error:{type(error).__name__}"
+                ),
+                planning_phase_ms=_phase_timings(phase_ms),
+            )
         phase_ms["prepare"] = self._elapsed_ms(prepare_started_ns)
+        if self._elapsed_ms(started_ns) >= budget_ms or cancelled():
+            return replace(
+                seed,
+                planning_ms=self._elapsed_ms(started_ns),
+                search_complete=False,
+                planning_termination_reason=(
+                    "superseded_seed_published"
+                    if cancelled()
+                    else "planning_budget_exceeded_seed_published"
+                ),
+                planning_phase_ms=_phase_timings(phase_ms),
+            )
         search_started_ns = time.perf_counter_ns()
         evaluated = 0
         selected: tuple[ScenarioDemand, ScenarioPlan] | None = None
@@ -648,8 +827,11 @@ class ObservedJointPlanner:
             if (
                 evaluated
                 and self._elapsed_ms(search_started_ns)
-                >= self.config.max_planning_budget_ms
+                >= budget_ms
             ):
+                budget_exhausted = True
+                break
+            if cancelled():
                 budget_exhausted = True
                 break
             # The first package establishes a publishable answer. Later probes
@@ -688,16 +870,16 @@ class ObservedJointPlanner:
                 )
                 phase_ms["pack"] += self._elapsed_ms(phase_started_ns)
             except (KeyError, TypeError, ValueError) as error:
-                plan = self._fallback(
-                    policy_input,
-                    candidates,
-                    reason=f"physicalization_error:{type(error).__name__}:{error}",
-                    started_ns=started_ns,
-                    transition_open=False,
-                    admit_fitting=True,
+                return replace(
+                    seed,
+                    planning_ms=self._elapsed_ms(started_ns),
+                    search_complete=False,
                     evaluated_package_count=evaluated,
+                    planning_termination_reason=(
+                        f"optimization_error_seed_published:{type(error).__name__}"
+                    ),
+                    planning_phase_ms=_phase_timings(phase_ms),
                 )
-                return replace(plan, planning_phase_ms=_phase_timings(phase_ms))
             evaluated += 1
             if scenario_plan.feasible:
                 selected = demand, scenario_plan
@@ -716,7 +898,7 @@ class ObservedJointPlanner:
         if (
             not search_complete
             and self._elapsed_ms(search_started_ns)
-            >= self.config.max_planning_budget_ms
+            >= budget_ms
         ):
             budget_exhausted = True
         if selected is None:
@@ -725,19 +907,12 @@ class ObservedJointPlanner:
                 if budget_exhausted
                 else "no_physically_feasible_joint_package"
             )
-            plan = self._fallback(
-                policy_input,
-                candidates,
-                reason=reason,
-                started_ns=started_ns,
-                transition_open=False,
-                admit_fitting=True,
-                evaluated_package_count=evaluated,
-            )
             return replace(
-                plan,
+                seed,
+                planning_ms=self._elapsed_ms(started_ns),
+                evaluated_package_count=evaluated,
                 search_complete=search_complete,
-                planning_termination_reason=reason,
+                planning_termination_reason=f"{reason}_seed_published",
                 planning_phase_ms=_phase_timings(phase_ms),
             )
         demand, scenario_plan = selected
@@ -749,6 +924,8 @@ class ObservedJointPlanner:
             prepared=prepared,
             candidate_count=len(candidates),
             evaluated_package_count=evaluated,
+            prediction_used=prediction_used,
+            prediction_influence=tuple(prediction_influence.items()),
         )
         phase_ms["materialize"] = self._elapsed_ms(materialize_started_ns)
         termination_reason = (
@@ -761,9 +938,26 @@ class ObservedJointPlanner:
         return replace(
             plan,
             planning_ms=self._elapsed_ms(started_ns),
+            planner_mode=(
+                JointPlannerMode.BOUNDED_SEED
+                if not search_complete
+                else JointPlannerMode.OPTIMIZED
+            ),
             search_complete=search_complete,
             planning_termination_reason=termination_reason,
             planning_phase_ms=_phase_timings(phase_ms),
+        )
+
+    def trigger_budget_ms(self, trigger_interval_ms: float | None) -> float:
+        if trigger_interval_ms is None or not math.isfinite(trigger_interval_ms):
+            return self.config.min_planning_budget_ms
+        return min(
+            self.config.max_planning_budget_ms,
+            max(
+                self.config.min_planning_budget_ms,
+                trigger_interval_ms
+                * self.config.trigger_interval_budget_fraction,
+            ),
         )
 
     def _ordered_candidates(
@@ -825,6 +1019,18 @@ class ObservedJointPlanner:
                     relation_type=relation_type,
                     context_mode=context_mode,
                     execution_mode=execution_mode,
+                    predicted_remaining_decode_tokens=(
+                        request.predicted_remaining_decode_tokens
+                    ),
+                    predicted_external_wait_ms=(
+                        request.predicted_external_wait_ms
+                    ),
+                    predicted_next_output_tokens=(
+                        request.predicted_next_output_tokens
+                    ),
+                    prediction_support_level=(
+                        request.prediction_support_level
+                    ),
                 )
             )
 
@@ -832,8 +1038,22 @@ class ObservedJointPlanner:
             policy_input,
             tuple(candidates_by_workflow),
         )
+        influence: Counter[str] = Counter()
         for items in candidates_by_workflow.values():
             items.sort(key=lambda item: item.order_key)
+            observed = sorted(items, key=lambda item: item.observed_order_key)
+            predictive_index = {
+                item.request.invocation_id: index
+                for index, item in enumerate(items)
+            }
+            for index, item in enumerate(observed):
+                if predictive_index.get(item.request.invocation_id) != index:
+                    influence["ordering_changed"] += 1
+        for items in candidates_by_workflow.values():
+            for item in items:
+                if item.prediction_support_level:
+                    influence["prediction_available"] += 1
+                    influence[f"support_{item.prediction_support_level}"] += 1
         ordered: list[_Candidate] = []
         for index in range(self.config.max_frontier_candidates_per_workflow):
             for workflow_id in workflow_order:
@@ -841,8 +1061,106 @@ class ObservedJointPlanner:
                 if index < len(items):
                     ordered.append(items[index])
                     if len(ordered) >= self.config.max_total_frontier_candidates:
-                        return tuple(ordered), fairness
-        return tuple(ordered), fairness
+                        return tuple(ordered), fairness, influence
+        return tuple(ordered), fairness, influence
+
+    def _bounded_seed(
+        self,
+        policy_input: PolicyInput,
+        candidates: Sequence[_Candidate],
+        *,
+        started_ns: int,
+        prediction_used: bool = False,
+        prediction_influence: tuple[tuple[str, int], ...] = (),
+    ) -> JointPlan:
+        """Build an O(frontier + bundles) plan before physical optimization."""
+
+        cpu_resident_contexts = {
+            context_id
+            for bundle in policy_input.physical_kv.bundles
+            if bundle.gpu_bytes < bundle.physical_unique_bytes
+            for context_id in bundle.owner_context_ids
+        }
+        available = policy_input.resources.hbm_available_bytes
+        admitted: list[RunnableInvocation] = []
+        for candidate in candidates:
+            request = candidate.request
+            needed = _unreserved_startup_bytes(request)
+            if request.context_id in cpu_resident_contexts or needed > available:
+                continue
+            admitted.append(request)
+            available -= needed
+        admitted_ids = {item.request_id for item in admitted}
+        admissions = tuple(
+            AdmissionIntent(
+                request_id=request.request_id,
+                action=(
+                    AdmissionAction.ADMIT
+                    if request.request_id in admitted_ids
+                    else AdmissionAction.DEFER
+                ),
+                reserved_bytes=(
+                    _unreserved_startup_bytes(request)
+                    if request.request_id in admitted_ids
+                    else 0
+                ),
+                required_bundle_ids=(),
+                reason=(
+                    "bounded seed selected current GPU-resident work"
+                    if request.request_id in admitted_ids
+                    else "bounded seed deferred work requiring optimization"
+                ),
+            )
+            for request in policy_input.runnable_frontier
+        )
+        first = admitted[0] if admitted else None
+        execution = ExecutionIntent(
+            ordered_request_ids=tuple(item.request_id for item in admitted),
+            selected_workflow_id=first.workflow_id if first else None,
+            selected_invocation_id=first.invocation_id if first else None,
+            mode="observed_joint_seed",
+            graph_version=policy_input.runtime_graph.graph_version,
+            reason="bounded semantic seed before physical package search",
+        )
+        projected = (
+            policy_input.resources.hbm_used_bytes
+            + policy_input.resources.hbm_reserved_bytes
+            + sum(_unreserved_startup_bytes(item) for item in admitted)
+        )
+        plan = _make_plan(
+            policy_input,
+            execution=execution,
+            admissions=admissions,
+            residency=(),
+            dependencies=(),
+            expected_hbm_peak_bytes=projected,
+            expected_unhidden_stall_ms=0.0,
+            fallback_reason=None,
+            candidate_count=len(candidates),
+            evaluated_package_count=0,
+            transition_open=False,
+            max_plan_age_ms=self.config.max_plan_age_ms,
+            fairness_lag_budget_ms=self.config.fairness_lag_budget_ms,
+            fairness_memory_penalty_ms=self.config.memory_penalty_ms,
+            fairness_max_workflow_candidates=self.config.max_workflow_candidates,
+            prediction_used=prediction_used,
+            prediction_influence=prediction_influence,
+        )
+        used_ratio = (
+            policy_input.resources.hbm_used_bytes
+            / policy_input.resources.hbm_capacity_bytes
+        )
+        return replace(
+            plan,
+            planner_mode=(
+                JointPlannerMode.EMERGENCY
+                if used_ratio >= self.config.emergency_hbm_ratio
+                else JointPlannerMode.BOUNDED_SEED
+            ),
+            planning_ms=self._elapsed_ms(started_ns),
+            search_complete=False,
+            planning_termination_reason="bounded_seed",
+        )
 
     def _fair_workflow_order(
         self,
@@ -915,6 +1233,8 @@ class ObservedJointPlanner:
         prepared: PreparedPolicyInput,
         candidate_count: int,
         evaluated_package_count: int,
+        prediction_used: bool = False,
+        prediction_influence: tuple[tuple[str, int], ...] = (),
     ) -> JointPlan:
         request_by_id = prepared.request_by_id
         residency = tuple(
@@ -1026,6 +1346,8 @@ class ObservedJointPlanner:
                 self.config.max_workflow_candidates
             ),
             prepared=prepared,
+            prediction_used=prediction_used,
+            prediction_influence=prediction_influence,
         )
 
     def _fallback(
@@ -1038,6 +1360,8 @@ class ObservedJointPlanner:
         transition_open: bool,
         admit_fitting: bool,
         evaluated_package_count: int = 0,
+        prediction_used: bool = False,
+        prediction_influence: tuple[tuple[str, int], ...] = (),
     ) -> JointPlan:
         available = policy_input.resources.hbm_available_bytes
         admitted: list[RunnableInvocation] = []
@@ -1122,12 +1446,350 @@ class ObservedJointPlanner:
                 self.config.max_workflow_candidates
             ),
             prepared=prepared,
+            prediction_used=prediction_used,
+            prediction_influence=prediction_influence,
         )
-        return replace(plan, planning_ms=self._elapsed_ms(started_ns))
+        return replace(
+            plan,
+            planning_ms=self._elapsed_ms(started_ns),
+            planner_mode=(
+                JointPlannerMode.NO_ACTION
+                if not admitted
+                else JointPlannerMode.BOUNDED_SEED
+            ),
+        )
 
     @staticmethod
     def _elapsed_ms(started_ns: int) -> float:
         return (time.perf_counter_ns() - started_ns) / 1_000_000.0
+
+
+class AsyncSemanticJointPlanner(ObservedJointPlanner):
+    """Latest-wins planner that never binds plans to Radix extents.
+
+    The worker chooses a causal/fair execution order and context-level tier
+    goals. Exact closure construction, allocator checks, and page generations
+    are intentionally deferred to the scheduler safe point.
+    """
+
+    name = "belief_joint_semantic"
+
+    def plan(
+        self,
+        policy_input: PolicyInput,
+        *,
+        planning_budget_ms: float | None = None,
+        cancel_check: object | None = None,
+    ) -> JointPlan:
+        budget_ms = (
+            self.config.max_planning_budget_ms
+            if planning_budget_ms is None
+            else min(
+                self.config.max_planning_budget_ms,
+                float(planning_budget_ms),
+            )
+        )
+        if not math.isfinite(budget_ms) or budget_ms <= 0:
+            raise ValueError("planning budget must be finite and positive")
+        cancelled = cancel_check if callable(cancel_check) else lambda: False
+        started_ns = time.perf_counter_ns()
+        candidates, _fairness, prediction_influence = self._ordered_candidates(
+            policy_input
+        )
+        prediction_used = bool(prediction_influence)
+        if _transition_open(policy_input):
+            return self._fallback(
+                policy_input,
+                candidates,
+                reason="transition_open_settling_barrier",
+                started_ns=started_ns,
+                transition_open=True,
+                admit_fitting=False,
+                prediction_used=prediction_used,
+                prediction_influence=tuple(prediction_influence.items()),
+            )
+        if not candidates:
+            return self._fallback(
+                policy_input,
+                candidates,
+                reason=(
+                    None
+                    if not policy_input.runnable_frontier
+                    else "no_factual_runnable_request"
+                ),
+                started_ns=started_ns,
+                transition_open=False,
+                admit_fitting=False,
+                prediction_used=prediction_used,
+                prediction_influence=tuple(prediction_influence.items()),
+            )
+
+        seed = self._bounded_seed(
+            policy_input,
+            candidates,
+            started_ns=started_ns,
+            prediction_used=prediction_used,
+            prediction_influence=tuple(prediction_influence.items()),
+        )
+        if cancelled() or self._elapsed_ms(started_ns) >= budget_ms:
+            return replace(
+                seed,
+                planning_ms=self._elapsed_ms(started_ns),
+                planning_termination_reason=(
+                    "superseded_seed_published"
+                    if cancelled()
+                    else "planning_budget_exceeded_seed_published"
+                ),
+            )
+
+        targets, victim_prediction_count = self._semantic_residency_targets(
+            policy_input,
+            candidates,
+            seed,
+        )
+        if victim_prediction_count:
+            prediction_influence["victim_prediction_selected"] = (
+                victim_prediction_count
+            )
+            prediction_used = True
+        execution_ids = frozenset(seed.execution.ordered_request_ids)
+        locked_by_context: dict[str, int] = defaultdict(int)
+        gpu_by_context: dict[str, int] = defaultdict(int)
+        for bundle in policy_input.physical_kv.bundles:
+            for context_id in bundle.owner_context_ids:
+                locked_by_context[context_id] += bundle.locked_bytes
+                gpu_by_context[context_id] += bundle.gpu_bytes
+        retractions = tuple(
+            RetractionIntent(
+                request_id=request.request_id,
+                context_id=request.context_id,
+                context_epoch=request.context_epoch,
+                reason=(
+                    "running request is outside the semantic execution set"
+                ),
+            )
+            for request in sorted(
+                policy_input.runnable_frontier,
+                key=lambda item: (
+                    -locked_by_context[item.context_id],
+                    -gpu_by_context[item.context_id],
+                    item.submitted_ts_ms,
+                    item.request_id,
+                ),
+            )
+            if request.causal_class.startswith("engine_running:")
+            and request.request_id not in execution_ids
+        )
+        plan = _make_plan(
+            policy_input,
+            execution=seed.execution,
+            admissions=seed.admissions,
+            residency=(),
+            dependencies=(),
+            expected_hbm_peak_bytes=seed.expected_hbm_peak_bytes,
+            expected_unhidden_stall_ms=seed.expected_unhidden_stall_ms,
+            fallback_reason=None,
+            candidate_count=len(candidates),
+            evaluated_package_count=0,
+            transition_open=False,
+            max_plan_age_ms=self.config.max_plan_age_ms,
+            fairness_lag_budget_ms=self.config.fairness_lag_budget_ms,
+            fairness_memory_penalty_ms=self.config.memory_penalty_ms,
+            fairness_max_workflow_candidates=(
+                self.config.max_workflow_candidates
+            ),
+            semantic_residency=targets,
+            retractions=retractions,
+            prediction_used=prediction_used,
+            prediction_influence=tuple(prediction_influence.items()),
+        )
+        return replace(
+            plan,
+            planner_mode=(
+                JointPlannerMode.OPTIMIZED
+                if plan.execution.ordered_request_ids or targets or retractions
+                else JointPlannerMode.NO_ACTION
+            ),
+            planning_ms=self._elapsed_ms(started_ns),
+            search_complete=True,
+            planning_termination_reason="semantic_plan_complete",
+            planning_phase_ms=(
+                ("semantic_total", self._elapsed_ms(started_ns)),
+            ),
+        )
+
+    def _semantic_residency_targets(
+        self,
+        policy_input: PolicyInput,
+        candidates: Sequence[_Candidate],
+        seed: JointPlan,
+    ) -> tuple[tuple[SemanticResidencyTarget, ...], int]:
+        state = _mapping(policy_input.runtime_graph.state)
+        rccg = _mapping(state.get("rccg"))
+        context_snapshots = _mapping(rccg.get("contexts"))
+        context_epochs = {
+            str(context_id): _nonnegative_int(_mapping(raw).get("epoch", 0))
+            for context_id, raw in context_snapshots.items()
+        }
+        context_stats: dict[str, dict[str, float]] = defaultdict(
+            lambda: {
+                "missing_gpu_bytes": 0.0,
+                "reclaimable_bytes": 0.0,
+                "last_access_ms": 0.0,
+            }
+        )
+        for bundle in policy_input.physical_kv.bundles:
+            for context_id in bundle.owner_context_ids:
+                stats = context_stats[context_id]
+                stats["missing_gpu_bytes"] += max(
+                    0, bundle.physical_unique_bytes - bundle.gpu_bytes
+                )
+                if bundle.actionable:
+                    stats["reclaimable_bytes"] += (
+                        bundle.marginal_reclaimable_bytes
+                    )
+                stats["last_access_ms"] = max(
+                    stats["last_access_ms"], bundle.last_access_ms
+                )
+
+        admitted_ids = set(seed.execution.ordered_request_ids)
+        runnable_contexts = {
+            item.context_id for item in policy_input.runnable_frontier
+        }
+        selected_contexts = {
+            item.context_id
+            for item in policy_input.runnable_frontier
+            if item.request_id in admitted_ids
+        }
+        deferred = [
+            item.request
+            for item in candidates
+            if item.request.request_id not in admitted_ids
+        ]
+        available = policy_input.resources.hbm_available_bytes
+        reclaim_goal = 0
+        if deferred:
+            first = deferred[0]
+            missing = int(
+                context_stats[first.context_id]["missing_gpu_bytes"]
+            )
+            reclaim_goal = max(
+                0,
+                _unreserved_startup_bytes(first) + missing - available,
+            )
+        used_ratio = (
+            policy_input.resources.hbm_used_bytes
+            / policy_input.resources.hbm_capacity_bytes
+        )
+        if used_ratio >= self.config.emergency_hbm_ratio:
+            target_ratio = max(0.0, self.config.emergency_hbm_ratio - 0.05)
+            reclaim_goal = max(
+                reclaim_goal,
+                int(
+                    policy_input.resources.hbm_used_bytes
+                    - policy_input.resources.hbm_capacity_bytes * target_ratio
+                ),
+            )
+
+        predicted_idle_ms: dict[str, float] = {}
+        prediction_metadata = policy_input.optional_metadata.get(
+            "frontier_predictions"
+        )
+        if (
+            prediction_metadata is not None
+            and isinstance(prediction_metadata.value, Mapping)
+        ):
+            invocations = _mapping(rccg.get("invocations"))
+            invocation_contexts = {
+                str(invocation_id): str(_mapping(raw).get("context_id", ""))
+                for invocation_id, raw in invocations.items()
+            }
+            for invocation_id, raw in prediction_metadata.value.items():
+                if not isinstance(raw, Mapping):
+                    continue
+                idle: float | None = None
+                for key in (
+                    "remaining_external_wait_ms_p50",
+                    "next_output_tokens_p50",
+                    "remaining_decode_tokens_p50",
+                ):
+                    candidate = raw.get(key)
+                    if isinstance(candidate, (int, float)) and candidate >= 0:
+                        idle = float(candidate)
+                        break
+                if idle is None:
+                    continue
+                context_id = invocation_contexts.get(str(invocation_id), "")
+                if not context_id:
+                    continue
+                predicted_idle_ms[context_id] = min(
+                    predicted_idle_ms.get(context_id, idle),
+                    idle,
+                )
+
+        targets: list[SemanticResidencyTarget] = []
+        reclaimed = 0
+        victims = sorted(
+            (
+                (
+                    context_id,
+                    int(stats["reclaimable_bytes"]),
+                    float(stats["last_access_ms"]),
+                )
+                for context_id, stats in context_stats.items()
+                if context_id not in runnable_contexts
+                and context_id not in selected_contexts
+                and int(stats["reclaimable_bytes"]) > 0
+                and context_id in context_epochs
+            ),
+            key=lambda item: (
+                (
+                    -predicted_idle_ms[item[0]]
+                    if item[0] in predicted_idle_ms
+                    else item[2]
+                ),
+                -item[1],
+                item[0],
+            ),
+        )
+        victim_prediction_count = sum(
+            1 for item in victims if item[0] in predicted_idle_ms
+        )
+        for context_id, reclaimable, _last_access in victims:
+            if reclaimed >= reclaim_goal:
+                break
+            targets.append(
+                SemanticResidencyTarget(
+                    context_id=context_id,
+                    context_epoch=context_epochs[context_id],
+                    action=ResidencyAction.COMMIT_CPU,
+                    target_bytes_hint=reclaimable,
+                    deadline_ms=policy_input.resources.ts_ms,
+                    reason="semantic headroom target for a parked context",
+                )
+            )
+            reclaimed += reclaimable
+
+        seen_prefetch_contexts: set[str] = set()
+        for request in deferred:
+            context_id = request.context_id
+            missing = int(context_stats[context_id]["missing_gpu_bytes"])
+            if missing <= 0 or context_id in seen_prefetch_contexts:
+                continue
+            targets.append(
+                SemanticResidencyTarget(
+                    context_id=context_id,
+                    context_epoch=request.context_epoch,
+                    action=ResidencyAction.PREFETCH_GPU,
+                    target_bytes_hint=missing,
+                    deadline_ms=policy_input.resources.ts_ms,
+                    reason="semantic restore target for deferred causal work",
+                )
+            )
+            seen_prefetch_contexts.add(context_id)
+            if len(seen_prefetch_contexts) >= self.config.max_workflow_candidates:
+                break
+        return tuple(targets), victim_prediction_count
 
 
 def _phase_timings(values: Mapping[str, float]) -> tuple[tuple[str, float], ...]:
@@ -1155,6 +1817,10 @@ def _make_plan(
     fairness_memory_penalty_ms: float,
     fairness_max_workflow_candidates: int,
     prepared: PreparedPolicyInput | None = None,
+    semantic_residency: tuple[SemanticResidencyTarget, ...] = (),
+    retractions: tuple[RetractionIntent, ...] = (),
+    prediction_used: bool = False,
+    prediction_influence: tuple[tuple[str, int], ...] = (),
 ) -> JointPlan:
     read_set = _build_read_set(
         policy_input,
@@ -1166,6 +1832,7 @@ def _make_plan(
         fairness_memory_penalty_ms=fairness_memory_penalty_ms,
         fairness_max_workflow_candidates=fairness_max_workflow_candidates,
         prepared=prepared,
+        semantic_residency=semantic_residency,
     )
     provisional = JointPlan(
         plan_id="pending",
@@ -1180,10 +1847,14 @@ def _make_plan(
         topology_version=policy_input.physical_kv.topology_version,
         allocator_version=policy_input.physical_kv.allocator_version,
         read_set=read_set,
+        semantic_residency=semantic_residency,
+        retractions=retractions,
         fallback_reason=fallback_reason,
         candidate_count=candidate_count,
         evaluated_package_count=evaluated_package_count,
         transition_open=transition_open,
+        prediction_used=prediction_used,
+        prediction_influence=prediction_influence,
     )
     semantic = provisional.to_dict()
     semantic.pop("plan_id")
@@ -1212,6 +1883,7 @@ def _build_read_set(
     fairness_memory_penalty_ms: float,
     fairness_max_workflow_candidates: int,
     prepared: PreparedPolicyInput | None = None,
+    semantic_residency: Sequence[SemanticResidencyTarget] = (),
 ) -> PlanReadSet:
     request_by_id = (
         prepared.request_by_id
@@ -1312,8 +1984,14 @@ def _build_read_set(
             for workflow_id, items in sorted(by_workflow.items())
         },
         context_epochs={
-            request.context_id: request.context_epoch
-            for request in requests.values()
+            **{
+                request.context_id: request.context_epoch
+                for request in requests.values()
+            },
+            **{
+                item.context_id: item.context_epoch
+                for item in semantic_residency
+            },
         },
         invocation_fingerprints={
             invocation_id: _fingerprint_json(_mapping(invocations.get(invocation_id)))
@@ -1783,7 +2461,7 @@ def _residency_target_bytes(bundle: object, action: ResidencyAction) -> int:
 
 def _unreserved_startup_bytes(request: RunnableInvocation) -> int:
     if request.causal_class.startswith(
-        ("reserved_admission:", "engine_waiting:")
+        ("reserved_admission:", "engine_waiting:", "engine_running:")
     ):
         return 0
     return request.startup_bytes
@@ -2016,7 +2694,12 @@ def _is_factual_runnable(
         return True
     if state == "running_llm":
         return causal_class.startswith(
-            ("engine_waiting:", "pending_admission:", "reserved_admission:")
+            (
+                "engine_running:",
+                "engine_waiting:",
+                "pending_admission:",
+                "reserved_admission:",
+            )
         )
     return state == "unknown"
 

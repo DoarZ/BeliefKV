@@ -1,0 +1,161 @@
+digraph BeliefKVJointDecision {
+  graph [
+    rankdir=TB,
+    newrank=true,
+    compound=true,
+    splines=polyline,
+    nodesep=0.42,
+    ranksep=0.58,
+    pad=0.28,
+    bgcolor="#FFFFFF",
+    fontname="Noto Sans CJK SC",
+    fontsize=21,
+    fontcolor="#17212B",
+    labelloc=t,
+    label="一次 HBM Pressure 决策：JointPlan 如何同时选择 Agent 与 KV 动作"
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Noto Sans CJK SC",
+    fontsize=10.5,
+    margin="0.17,0.11",
+    penwidth=1.4,
+    color="#52606D",
+    fillcolor="#FFFFFF",
+    fontcolor="#17212B"
+  ];
+  edge [
+    fontname="Noto Sans CJK SC",
+    fontsize=9,
+    color="#52606D",
+    fontcolor="#3C4855",
+    penwidth=1.25,
+    arrowsize=0.72
+  ];
+
+  pressure [
+    label="当前状态：HBM 95%，存在多个 READY / RUNNING agent",
+    fillcolor="#FDEBEC",
+    color="#B23A48",
+    penwidth=2.0
+  ];
+
+  subgraph cluster_agents {
+    label="Observed Runnable Frontier + KV obligations";
+    color="#8CA0B3";
+    style="rounded";
+    margin=16;
+
+    r3 [
+      label="Agent request r3\nREADY + prefix resident\nstartup 0.5 GB\n可立即推进 tool action",
+      fillcolor="#E5F4EA",
+      color="#2D7A4B"
+    ];
+    r1 [
+      label="Parent request r1\nJOIN 已满足，但 KV 在 CPU\nrestore closure 3 GB\n恢复后推进关键路径",
+      fillcolor="#FFF3D6",
+      color="#A66A00"
+    ];
+    r2 [
+      label="Agent request r2\nREADY，但 startup 4 GB\n当前 headroom 不足\n本 epoch 可延后",
+      fillcolor="#F1F4F7",
+      color="#657786"
+    ];
+    q5 [
+      label="Running q5 / q6 blocker package\n长期未获得 service\n共同锁住可释放 closure\n单独 retract 一个不够",
+      fillcolor="#FDEBEC",
+      color="#B23A48"
+    ];
+
+    { rank=same; r3; r1; r2; q5; }
+  }
+
+  package [
+    label="JointPlanner 构造 ExecutionPackage\ncausal progress + startup/restore bytes + blocker closure\n在同一 HBM / PCIe 约束下选择动作组合",
+    fillcolor="#E8F0FA",
+    color="#34699A",
+    penwidth=2.0
+  ];
+
+  subgraph cluster_plan {
+    label="同一个 JointPlanEpoch";
+    color="#5E8C6A";
+    style="rounded";
+    margin=16;
+
+    now [
+      label="现在运行 r3\nExecution: r3 优先\nAdmission: ADMIT\nKV: KEEP resident prefix",
+      fillcolor="#E5F4EA",
+      color="#2D7A4B"
+    ];
+    restore [
+      label="准备 r1\nAdmission: RESTORE_THEN_ADMIT\nKV: PREFETCH_GPU(closure)\nACK 前无 ticket",
+      fillcolor="#FFF3D6",
+      color="#A66A00"
+    ];
+    defer [
+      label="暂缓 r2\nAdmission: DEFER\n保留在 visible queue\n不建立长期 HBM reservation",
+      fillcolor="#F1F4F7",
+      color="#657786"
+    ];
+    reclaim [
+      label="仅在需要空间时处理 q5/q6\nRetraction: 完整 blocker set\nKV: COMMIT_CPU / DROP\n实际 reclaim ACK 后再放行 replacement",
+      fillcolor="#FDEBEC",
+      color="#B23A48"
+    ];
+
+    { rank=same; now; restore; defer; reclaim; }
+  }
+
+  batch1 [
+    label="Epoch t：PrefillAdder 最终选择 r3\nr1 因 WAIT_RESTORE 跳过；r2 因无 ticket 跳过",
+    fillcolor="#E8F0FA",
+    color="#34699A"
+  ];
+  transfer [
+    label="Physical transaction\n必要时 retract blocker set -> D2H/DROP -> ACK\nH2D r1 closure -> ACK -> prefix rematch",
+    fillcolor="#FDEBEC",
+    color="#B23A48"
+  ];
+  batch2 [
+    label="Epoch t+k：为 r1 重新生成短期 ticket\nPrefillAdder 确认 allocator 可行后进入 batch",
+    fillcolor="#E8F0FA",
+    color="#34699A"
+  ];
+  feedback [
+    label="结果反馈\n更新 RCCG progress、actual service、HBM/Host residency\n使相关旧 plan 失效并触发下一次 JointPlan",
+    fillcolor="#E5F4EA",
+    color="#2D7A4B"
+  ];
+
+  pressure -> r3;
+  pressure -> r1;
+  pressure -> r2;
+  pressure -> q5;
+  r3 -> package;
+  r1 -> package;
+  r2 -> package;
+  q5 -> package;
+  package -> now;
+  package -> restore;
+  package -> defer;
+  package -> reclaim;
+  now -> batch1;
+  defer -> batch1 [style=dashed, label="本轮不可执行"];
+  reclaim -> transfer;
+  restore -> transfer [label="依赖"];
+  batch1 -> transfer [label="与 GPU 执行重叠（若可行）"];
+  transfer -> batch2 [label="completed ACK", color="#2D7A4B"];
+  batch2 -> feedback;
+  feedback -> pressure [label="下一状态", color="#2D7A4B", constraint=false];
+
+  note [
+    label="关键点：JointPlan 不是先选 agent、再被动找 KV victim。\n它先组合『谁运行、谁等待、谁恢复、谁迁移』，再由 SGLang 和物理 arbiter 最终验收。",
+    fillcolor="#F7F9FB",
+    color="#7C8B99",
+    fontsize=10
+  ];
+  feedback -> note [style=invis];
+}

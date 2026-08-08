@@ -44,6 +44,7 @@ from beliefkv.runtime.event_channel import (
     JsonlRuntimeEventSink,
     UnixDatagramRuntimeEventSink,
 )
+from beliefkv.runtime.context_lifecycle import ContextLifecyclePolicy
 
 
 DEFAULT_IMAGE = "swebench/sweb.eval.x86_64.sympy_1776_sympy-20590:latest"
@@ -96,14 +97,46 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-turns", type=int, default=18)
     parser.add_argument("--max-completion-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--context-window-tokens",
+        type=int,
+        default=32_768,
+        help="Dynamic message-history tokens that trigger runtime compaction.",
+    )
+    parser.add_argument(
+        "--context-keep-tokens",
+        type=int,
+        default=8_192,
+        help="Recent dynamic message-history tokens retained after compaction.",
+    )
+    parser.add_argument(
+        "--intermediate-completion-tokens",
+        type=int,
+        default=1_024,
+        help="Output budget for ordinary tool-decision turns.",
+    )
+    parser.add_argument(
+        "--summary-completion-tokens",
+        type=int,
+        default=2_048,
+        help="Output budget for the internal context summarizer.",
+    )
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument(
+        "--sandbox-command-timeout-seconds",
+        type=int,
+        default=600,
+        help="Per-command timeout inside the offline SWE-bench sandbox.",
+    )
+    parser.add_argument(
+        "--workflow-wall-clock-seconds",
         "--activation-wall-clock-seconds",
+        dest="workflow_wall_clock_seconds",
         type=float,
-        default=1800.0,
+        default=7200.0,
         help=(
-            "Hard liveness deadline shared by one root activation and its children; "
-            "this is a runaway-workflow guard, not a latency SLO."
+            "Hard liveness deadline shared by the workflow and all descendants; "
+            "the activation spelling is retained as a deprecated CLI alias."
         ),
     )
     parser.add_argument("--recursion-limit", type=int, default=512)
@@ -119,6 +152,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--stuck-no-progress-limit", type=int, default=8)
     parser.add_argument("--stuck-max-model-calls", type=int, default=48)
     parser.add_argument("--stuck-max-tool-calls", type=int, default=128)
+    parser.add_argument(
+        "--enforce-stuck-call-budgets",
+        action="store_true",
+        help=(
+            "Treat the model/tool call thresholds as termination conditions. "
+            "By default they are telemetry only so progressing agents can run "
+            "until model completion or the workflow watchdog."
+        ),
+    )
     parser.add_argument("--min-workflow-llm-requests", type=int, default=16)
     parser.add_argument("--min-workflow-tool-calls", type=int, default=16)
     parser.add_argument("--min-subagent-llm-requests", type=int, default=4)
@@ -190,6 +232,143 @@ def _workflow_id(run_id: str, instance_id: str, mode: str, index: int) -> str:
     return f"p3-{run_id}-peer-{mode}-{index:03d}-{digest}"
 
 
+def _collect_workspace_artifacts(
+    workspace: Path,
+    destination: Path,
+    *,
+    command_runner=command_output,
+) -> dict[str, object]:
+    errors: list[str] = []
+    patch = ""
+    final_status = ""
+    try:
+        patch = command_runner(
+            ["git", "diff", "--binary", "HEAD"], cwd=workspace
+        )
+    except Exception as caught:
+        errors.append(f"model.patch: {type(caught).__name__}: {caught}")
+    try:
+        (destination / "model.patch").write_text(
+            patch + ("\n" if patch else ""), encoding="utf-8"
+        )
+    except OSError as caught:
+        errors.append(f"model.patch.write: {type(caught).__name__}: {caught}")
+    try:
+        final_status = command_runner(
+            ["git", "status", "--porcelain"], cwd=workspace
+        )
+    except Exception as caught:
+        errors.append(f"git.status: {type(caught).__name__}: {caught}")
+    return {
+        "patch_chars": len(patch),
+        "workspace_modified": bool(final_status),
+        "final_status": final_status,
+        "artifact_collection_valid": not errors,
+        "artifact_collection_errors": errors,
+    }
+
+
+def _unhandled_workflow_result(
+    *,
+    workload: object,
+    arrival: WorkflowArrival,
+    mode: str,
+    run_id: str,
+    caught: BaseException,
+) -> dict[str, object]:
+    instance_id = str(workload.instance_id)
+    return {
+        "schema_version": 1,
+        "workflow_id": _workflow_id(
+            run_id, instance_id, mode, arrival.workflow_index
+        ),
+        "instance_id": instance_id,
+        "mode": mode,
+        "completed": False,
+        "termination_reason": "worker_unhandled_exception",
+        "turn_count": None,
+        "transition_hash": None,
+        "trace_sensitivity": TraceSensitivity.SEMANTIC_RACE_SENSITIVE.value,
+        "orchestration_event_count": 0,
+        "duration_seconds": None,
+        "arrival": {
+            "batch_index": arrival.batch_index,
+            "position_in_batch": arrival.position_in_batch,
+            "scheduled_start_offset_seconds": arrival.scheduled_offset_seconds,
+            "worker_start_offset_seconds": None,
+            "runtime_start_offset_seconds": None,
+            "runtime_start_lag_seconds": None,
+            "spawn_offsets_seconds": [],
+        },
+        "error": f"{type(caught).__name__}: {caught}",
+        "backend": None,
+        "agent_control": {
+            "event_counts": {},
+            "stuck_reasons": {"worker_unhandled_exception": 1},
+            "semantic_completions": 0,
+            "natural_semantic_completions": 0,
+            "forced_semantic_completions": 0,
+            "guard_intervened_completions": 0,
+            "protocol_repaired_completions": 0,
+            "protocol_normalized_completions": 0,
+            "protocol_repair_failures": 1,
+            "duplicate_tool_calls_suppressed": 0,
+        },
+        "agent_runtime_trace": {
+            "event_count": 0,
+            "event_counts": {},
+            "dynamic_subagent_count": 0,
+            "llm_request_count": 0,
+            "tool_call_count": 0,
+            "tool_status_counts": {},
+            "tool_error_class_counts": {},
+            "tool_status_coverage": 1.0,
+            "workspace_digest_observation_count": 0,
+            "mutating_tool_end_count": 0,
+            "workspace_digest_coverage": 1.0,
+            "workspace_change_count": 0,
+            "multi_turn_subagent_count": 0,
+            "all_subagents_returned": False,
+            "all_joins_satisfied": False,
+            "child_invocations": [],
+            "spawn_timestamps_ms": [],
+        },
+        "patch_chars": 0,
+        "workspace_modified": False,
+        "final_status": "",
+        "artifact_collection_valid": False,
+        "artifact_collection_errors": [
+            f"worker: {type(caught).__name__}: {caught}"
+        ],
+        "load_valid": False,
+        "guard_valid": False,
+        "runtime_protocol_valid": False,
+        "native_protocol_valid": False,
+        "runtime_valid": False,
+        "clean_jct_eligible": False,
+        "workflow_intensity_valid": False,
+        "subagent_intensity_valid": False,
+        "spawn_range_valid": False,
+        "subagent_trace_valid": False,
+        "peer_reactivation_count": 0,
+    }
+
+
+def _initial_spawn_range_valid(
+    *,
+    required: bool,
+    observed_initial_subagents: object,
+    minimum: int,
+    maximum: int,
+) -> bool:
+    if not required:
+        return True
+    if observed_initial_subagents is None:
+        return False
+    observed = int(observed_initial_subagents)
+    return minimum <= observed <= maximum
+
+
 def _run_one(
     *,
     workload: object,
@@ -220,6 +399,7 @@ def _run_one(
             workspace,
             image=args.docker_image,
             audit=audit,
+            default_timeout_s=args.sandbox_command_timeout_seconds,
             test_env_path=args.sandbox_test_env,
             preflight_command=args.sandbox_preflight_command or None,
         )
@@ -249,6 +429,14 @@ def _run_one(
                         model=args.model,
                         base_url=args.base_url,
                         max_completion_tokens=args.max_completion_tokens,
+                        context_lifecycle=ContextLifecyclePolicy(
+                            window_tokens=args.context_window_tokens,
+                            keep_tokens=args.context_keep_tokens,
+                            intermediate_output_tokens=(
+                                args.intermediate_completion_tokens
+                            ),
+                            summary_output_tokens=args.summary_completion_tokens,
+                        ),
                         request_timeout_s=args.timeout,
                         recursion_limit=args.recursion_limit,
                         enable_subagents=mode == "mixed",
@@ -267,9 +455,10 @@ def _run_one(
                                 args.stuck_max_model_calls
                             ),
                             max_tool_calls_without_completion=args.stuck_max_tool_calls,
+                            enforce_call_budgets=args.enforce_stuck_call_budgets,
                             recovery_model_call_limit=2,
                             activation_wall_clock_s=(
-                                args.activation_wall_clock_seconds
+                                args.workflow_wall_clock_seconds
                             ),
                         ),
                     ),
@@ -303,6 +492,7 @@ def _run_one(
                 trace_sensitivity=TraceSensitivity.SEMANTIC_RACE_SENSITIVE,
                 llm_event_source=LLMEventSource.MODEL_RUNTIME,
                 parallel_subagents=mode == "mixed",
+                workflow_timeout_s=args.workflow_wall_clock_seconds,
             )
             result = workflow.run(
                 _task_prompt(workload)
@@ -319,20 +509,19 @@ def _run_one(
             workspace_backend.close()
         if audit is not None:
             audit.close()
+    runtime_finished = time.monotonic()
     _write_events(destination / "orchestration_events.jsonl", events)
-    patch_chars = 0
-    workspace_modified = False
-    final_status = ""
+    artifact_collection = {
+        "patch_chars": 0,
+        "workspace_modified": False,
+        "final_status": "",
+        "artifact_collection_valid": True,
+        "artifact_collection_errors": [],
+    }
     if workspace is not None:
-        patch = command_output(["git", "diff", "--binary", "HEAD"], cwd=workspace)
-        (destination / "model.patch").write_text(
-            patch + ("\n" if patch else ""), encoding="utf-8"
+        artifact_collection = _collect_workspace_artifacts(
+            workspace, destination
         )
-        final_status = command_output(
-            ["git", "status", "--porcelain"], cwd=workspace
-        )
-        patch_chars = len(patch)
-        workspace_modified = bool(final_status)
     agent_trace_path = destination / "runtime_events.agentic.jsonl"
     agent_trace = (
         summarize_agentic_runtime_trace(agent_trace_path)
@@ -359,6 +548,11 @@ def _run_one(
             "semantic_completions": 0,
             "natural_semantic_completions": 0,
             "forced_semantic_completions": 0,
+            "guard_intervened_completions": 0,
+            "protocol_repaired_completions": 0,
+            "protocol_normalized_completions": 0,
+            "protocol_repair_failures": 0,
+            "duplicate_tool_calls_suppressed": 0,
         }
     )
     reactivation_count = sum(
@@ -383,15 +577,31 @@ def _run_one(
         and int(item["tool_call_count"]) >= args.min_subagent_tool_calls
         for item in child_stats
     )
+    backend_summary = backend.summary() if backend is not None else None
+    observed_initial_subagents = (
+        backend_summary.get("observed_initial_subagent_count")
+        if isinstance(backend_summary, dict)
+        else None
+    )
     spawn_range_required = mode == "mixed" and args.spawn_policy == "required-range"
-    spawn_range_valid = not spawn_range_required or (
-        args.min_initial_subagents
-        <= int(agent_trace["dynamic_subagent_count"])
-        <= args.max_initial_subagents
+    spawn_range_valid = _initial_spawn_range_valid(
+        required=spawn_range_required,
+        observed_initial_subagents=observed_initial_subagents,
+        minimum=args.min_initial_subagents,
+        maximum=args.max_initial_subagents,
     )
     guard_valid = (
         not agent_control["stuck_reasons"]
         and int(agent_control["forced_semantic_completions"]) == 0
+    )
+    runtime_protocol_valid = int(agent_control["protocol_repair_failures"]) == 0
+    native_protocol_valid = (
+        int(agent_control["protocol_repaired_completions"]) == 0
+        and int(agent_control["protocol_normalized_completions"]) == 0
+    )
+    runtime_observability_valid = (
+        float(agent_trace["tool_status_coverage"]) == 1.0
+        and float(agent_trace["workspace_digest_coverage"]) == 1.0
     )
     clean_jct_eligible = bool(
         result
@@ -399,6 +609,15 @@ def _run_one(
         and result.termination_reason == "semantic_complete"
         and error is None
         and guard_valid
+        and runtime_protocol_valid
+        and runtime_observability_valid
+    )
+    runtime_valid = bool(
+        result
+        and result.completed
+        and error is None
+        and runtime_protocol_valid
+        and runtime_observability_valid
     )
     summary = {
         "schema_version": 1,
@@ -413,7 +632,7 @@ def _run_one(
         "transition_hash": result.transition_hash if result is not None else None,
         "trace_sensitivity": TraceSensitivity.SEMANTIC_RACE_SENSITIVE.value,
         "orchestration_event_count": len(events),
-        "duration_seconds": time.monotonic() - started,
+        "duration_seconds": runtime_finished - started,
         "arrival": {
             "batch_index": arrival.batch_index,
             "position_in_batch": arrival.position_in_batch,
@@ -430,18 +649,22 @@ def _run_one(
             "spawn_offsets_seconds": spawn_offsets_seconds,
         },
         "error": error,
-        "backend": backend.summary() if backend is not None else None,
+        "backend": backend_summary,
         "agent_control": agent_control,
         "agent_runtime_trace": agent_trace,
-        "patch_chars": patch_chars,
-        "workspace_modified": workspace_modified,
-        "final_status": final_status,
+        **artifact_collection,
         "load_valid": bool(result and result.completed)
         and guard_valid
+        and runtime_protocol_valid
+        and runtime_observability_valid
         and workflow_intensity_valid
         and subagent_intensity_valid
         and spawn_range_valid,
         "guard_valid": guard_valid,
+        "runtime_protocol_valid": runtime_protocol_valid,
+        "native_protocol_valid": native_protocol_valid,
+        "runtime_valid": runtime_valid,
+        "runtime_observability_valid": runtime_observability_valid,
         "clean_jct_eligible": clean_jct_eligible,
         "workflow_intensity_valid": workflow_intensity_valid,
         "subagent_intensity_valid": subagent_intensity_valid,
@@ -464,6 +687,10 @@ def main() -> int:
         args.concurrency,
         args.max_turns,
         args.max_completion_tokens,
+        args.context_window_tokens,
+        args.context_keep_tokens,
+        args.intermediate_completion_tokens,
+        args.summary_completion_tokens,
         args.recursion_limit,
         args.event_retries,
         args.arrival_batch_size,
@@ -471,8 +698,21 @@ def main() -> int:
         raise ValueError("workflow, concurrency, turn and token limits must be positive")
     if args.event_ack_timeout <= 0:
         raise ValueError("event ACK timeout must be positive")
-    if args.timeout <= 0 or args.activation_wall_clock_seconds <= 0:
-        raise ValueError("request and activation timeouts must be positive")
+    if (
+        args.timeout <= 0
+        or args.workflow_wall_clock_seconds <= 0
+        or args.sandbox_command_timeout_seconds <= 0
+    ):
+        raise ValueError("request and workflow timeouts must be positive")
+    if args.context_keep_tokens >= args.context_window_tokens:
+        raise ValueError("context keep tokens must be smaller than the window")
+    if (
+        args.summary_completion_tokens
+        > args.context_window_tokens - args.context_keep_tokens
+    ):
+        raise ValueError("summary output must fit outside retained context")
+    if args.intermediate_completion_tokens > args.max_completion_tokens:
+        raise ValueError("intermediate completion budget exceeds the final budget")
     if args.arrival_batch_interval_seconds < 0:
         raise ValueError("arrival batch interval must be non-negative")
     if not (
@@ -561,23 +801,38 @@ def main() -> int:
                     time.sleep(delay)
                 for arrival in batch:
                     workload = selected[arrival.workflow_index]
-                    futures[
-                        executor.submit(
-                            _run_one,
-                            workload=workload,
-                            source_repo=bundle.source_repo,
-                            arrival=arrival,
-                            mode=modes[arrival.workflow_index % len(modes)],
-                            run_id=run_id,
-                            args=args,
-                            output=staging,
-                            experiment_started_monotonic=(
-                                experiment_started_monotonic
-                            ),
-                        )
-                    ] = workload
+                    mode = modes[arrival.workflow_index % len(modes)]
+                    future = executor.submit(
+                        _run_one,
+                        workload=workload,
+                        source_repo=bundle.source_repo,
+                        arrival=arrival,
+                        mode=mode,
+                        run_id=run_id,
+                        args=args,
+                        output=staging,
+                        experiment_started_monotonic=(
+                            experiment_started_monotonic
+                        ),
+                    )
+                    futures[future] = (workload, arrival, mode)
             for future in as_completed(futures):
-                results.append(future.result())
+                workload, arrival, mode = futures[future]
+                try:
+                    results.append(future.result())
+                except BaseException as caught:
+                    failure = _unhandled_workflow_result(
+                        workload=workload,
+                        arrival=arrival,
+                        mode=mode,
+                        run_id=run_id,
+                        caught=caught,
+                    )
+                    _write_json(
+                        staging / str(failure["workflow_id"]) / "result.json",
+                        failure,
+                    )
+                    results.append(failure)
         results.sort(key=lambda item: str(item["workflow_id"]))
         workflow_results_valid = all(
             bool(item["completed"])
@@ -622,8 +877,17 @@ def main() -> int:
             "backend": args.backend,
             "max_turns": args.max_turns,
             "max_completion_tokens": args.max_completion_tokens,
+            "context_lifecycle": {
+                "window_tokens": args.context_window_tokens,
+                "keep_tokens": args.context_keep_tokens,
+                "intermediate_output_tokens": (
+                    args.intermediate_completion_tokens
+                ),
+                "summary_output_tokens": args.summary_completion_tokens,
+            },
             "request_timeout_seconds": args.timeout,
-            "activation_wall_clock_seconds": args.activation_wall_clock_seconds,
+            "workflow_wall_clock_seconds": args.workflow_wall_clock_seconds,
+            "activation_wall_clock_seconds": args.workflow_wall_clock_seconds,
             "recursion_limit": args.recursion_limit,
             "spawn_policy": {
                 "mode": args.spawn_policy,
@@ -666,8 +930,9 @@ def main() -> int:
                 "max_tool_calls_without_completion": (
                     args.stuck_max_tool_calls
                 ),
-                "activation_wall_clock_seconds": (
-                    args.activation_wall_clock_seconds
+                "enforce_call_budgets": args.enforce_stuck_call_budgets,
+                "workflow_wall_clock_seconds": (
+                    args.workflow_wall_clock_seconds
                 ),
             },
             "intensity_gate": {
@@ -734,6 +999,9 @@ def main() -> int:
                     "network": "none",
                     "workspace_isolation": "per_workflow_git_clone",
                     "sandbox_test_env": args.sandbox_test_env,
+                    "command_timeout_seconds": (
+                        args.sandbox_command_timeout_seconds
+                    ),
                 }
                 if args.backend == "agentic"
                 else None
@@ -766,6 +1034,12 @@ def main() -> int:
                 "guard_valid_workflows": sum(
                     bool(item["guard_valid"]) for item in results
                 ),
+                "runtime_valid_workflows": sum(
+                    bool(item["runtime_valid"]) for item in results
+                ),
+                "native_protocol_valid_workflows": sum(
+                    bool(item["native_protocol_valid"]) for item in results
+                ),
                 "clean_jct_workflows": sum(
                     bool(item["clean_jct_eligible"]) for item in results
                 ),
@@ -773,6 +1047,42 @@ def main() -> int:
                     int(
                         item["agent_control"][
                             "forced_semantic_completions"
+                        ]
+                    )
+                    for item in results
+                ),
+                "guard_intervened_completions": sum(
+                    int(
+                        item["agent_control"][
+                            "guard_intervened_completions"
+                        ]
+                    )
+                    for item in results
+                ),
+                "protocol_repaired_completions": sum(
+                    int(
+                        item["agent_control"][
+                            "protocol_repaired_completions"
+                        ]
+                    )
+                    for item in results
+                ),
+                "protocol_normalized_completions": sum(
+                    int(
+                        item["agent_control"][
+                            "protocol_normalized_completions"
+                        ]
+                    )
+                    for item in results
+                ),
+                "protocol_repair_failures": sum(
+                    int(item["agent_control"]["protocol_repair_failures"])
+                    for item in results
+                ),
+                "duplicate_tool_calls_suppressed": sum(
+                    int(
+                        item["agent_control"][
+                            "duplicate_tool_calls_suppressed"
                         ]
                     )
                     for item in results

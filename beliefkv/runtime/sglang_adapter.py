@@ -4,6 +4,7 @@ import ast
 import importlib.metadata
 import subprocess
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Protocol
 
@@ -18,6 +19,7 @@ from beliefkv.runtime.protocol import (
 
 BASE_SGLANG_VERSION = "0.5.2rc1"
 BASE_SGLANG_GIT_COMMIT = "18f91eb639084825717c0e3c3c7273492812ab71"
+_BRIDGE_TICK_INTERVAL_MS = 5.0
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,8 @@ class BeliefKVRequestMetadata:
     execution_mode: str = "foreground"
     return_target_id: str | None = None
     join_id: str | None = None
+    # Scheduler-side GPU-service inactivity watchdog, not request wall time.
+    execution_timeout_s: float | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("root_workflow_id", "invocation_id", "context_id"):
@@ -90,6 +94,11 @@ class BeliefKVRequestMetadata:
             raise ValueError("unsupported context_mode")
         if self.execution_mode not in {"foreground", "background"}:
             raise ValueError("unsupported execution_mode")
+        if self.execution_timeout_s is not None and (
+            not math.isfinite(self.execution_timeout_s)
+            or self.execution_timeout_s <= 0
+        ):
+            raise ValueError("execution_timeout_s must be positive when provided")
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -106,6 +115,7 @@ class BeliefKVRequestMetadata:
             "execution_mode": self.execution_mode,
             "return_target_id": self.return_target_id,
             "join_id": self.join_id,
+            "execution_timeout_s": self.execution_timeout_s,
         }
 
     @classmethod
@@ -136,6 +146,11 @@ class BeliefKVRequestMetadata:
                 else None
             ),
             join_id=str(raw["join_id"]) if raw.get("join_id") is not None else None,
+            execution_timeout_s=(
+                float(raw["execution_timeout_s"])
+                if raw.get("execution_timeout_s") is not None
+                else None
+            ),
         )
 
 
@@ -197,14 +212,36 @@ class SGLangSchedulerBridge:
     ) -> None:
         self.controller = controller
         self.backend = backend
+        self._last_tick_ms: float | None = None
+        self._tick_skipped_count = 0
 
     def scheduler_step(
-        self, now_ms: float, *, drain_acks: bool = True
+        self,
+        now_ms: float,
+        *,
+        drain_acks: bool = True,
+        allow_reactive_transfer: bool = True,
     ) -> ControllerTickResult:
         if drain_acks:
             self.drain_acks()
             self.drain_transfer_telemetry()
-        tick = self.controller.tick(now_ms)
+        if (
+            self._last_tick_ms is not None
+            and now_ms - self._last_tick_ms < _BRIDGE_TICK_INTERVAL_MS
+            and not self.controller.has_pending_transfer_work()
+            and not self.controller.admission.pending_requests()
+        ):
+            # The scheduler event loop can run thousands of times per second
+            # between batches. Admission and transfer planning only need to
+            # react at batch/event cadence, so the full controller tick is
+            # gated to a bounded interval when nothing is pending.
+            self._tick_skipped_count += 1
+            return ControllerTickResult(now_ms=now_ms)
+        self._last_tick_ms = now_ms
+        tick = self.controller.tick(
+            now_ms,
+            allow_reactive_transfer=allow_reactive_transfer,
+        )
         for command_id in tick.cancel_command_ids:
             self.backend.cancel(command_id)
         if tick.transfer is not None:
@@ -316,7 +353,7 @@ class SGLangSourceContract:
             "beliefkv_metadata=request.beliefkv_metadata",
         ),
         "python/sglang/srt/managers/scheduler.py": (
-            "beliefkv_runtime.close()",
+            "close_runtime_with_signal_shield(beliefkv_runtime)",
             "ready_requests = self.grammar_queue[:num_ready_reqs]",
             "running_batch_retraction_barrier_required",
             "Commit a plan only after the overlap pipeline has been drained.",

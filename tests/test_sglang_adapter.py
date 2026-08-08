@@ -1,4 +1,5 @@
 import json
+import signal
 import subprocess
 import sys
 import tempfile
@@ -8,6 +9,7 @@ from collections import Counter, deque
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from beliefkv.control.controller import BeliefKVController
 from beliefkv.core.config import BeliefKVConfig
@@ -20,18 +22,26 @@ from beliefkv.core.events import (
 from beliefkv.policy.admission import AdmissionRequest, AdmissionSideState
 from beliefkv.experiments.policy_replay import load_replay_trace
 from beliefkv.policy.joint_scheduler import JointPlannerConfig, ObservedJointPlanner
+from beliefkv.policy.online_joint import (
+    OnlineJointPlanDecision,
+    OnlineJointPlanView,
+)
+from beliefkv.policy.reference import ResidencyAction, RunnableInvocation
 from beliefkv.policy.resource_snapshot import RuntimeResourceObservation
 from beliefkv.runtime.audit import PolicySnapshotLog
 from beliefkv.runtime.joint_shadow import (
     IncrementalPolicyInputAssembler,
     LatestWinsJointPlanWorker,
 )
+from beliefkv.runtime.lock_service import RequestServiceLedger
 from beliefkv.runtime.page_index import PageOwnershipIndex
 from beliefkv.runtime.protocol import (
     CommandAck,
     CommandKind,
     CommandStatus,
     ControlCommand,
+    EnqueueOutcome,
+    EnqueueStatus,
     PageHandle,
     PhysicalBundleIntent,
     PhysicalPageAction,
@@ -53,6 +63,17 @@ from beliefkv.runtime.sglang_v052rc1 import (
     HiCacheNodeCommandBackend,
     SGLangBackendError,
     SGLangNodeRegistry,
+    close_runtime_with_signal_shield,
+    install_scheduler_shutdown_handler,
+)
+from beliefkv.runtime.restore_obligation import (
+    RestoreAuthorityMode,
+    RestoreLeaseState,
+    RestoreObligationCause,
+    RestoreObligationIndex,
+    RestoreObligationState,
+    RestoreTransactionStage,
+    SafePointPhysicalPhase,
 )
 
 
@@ -89,6 +110,10 @@ class _TreeCache:
         self.root_node = _Node(0)
         self.ongoing_write_through = {}
         self.ongoing_load_back = {}
+        self.beliefkv_transfer_metadata = {"d2h": {}, "h2d": {}}
+        self.token_to_kv_pool_host = SimpleNamespace(
+            layout="layer_first", pin_memory=True
+        )
         self.token_to_kv_pool_allocator = _Allocator(1_000_000)
         self.cache_controller = _CacheController(
             self.token_to_kv_pool_allocator
@@ -101,6 +126,20 @@ class _TreeCache:
 
     def evictable_size(self):
         return self.evictable_tokens
+
+    def inc_lock_ref(self, node):
+        current = node
+        while current is not None and current is not self.root_node:
+            current.lock_ref += 1
+            current = current.parent
+        return 0
+
+    def dec_lock_ref(self, node):
+        current = node
+        while current is not None and current is not self.root_node:
+            current.lock_ref -= 1
+            current = current.parent
+        return 0
 
     def write_backup(self, node, *, beliefkv_source=None):
         _ = beliefkv_source
@@ -221,9 +260,21 @@ class _AdmissionRecorder:
 class _Allocator:
     def __init__(self, available_tokens):
         self.available_tokens = available_tokens
+        self._next_token = 1
 
     def available_size(self):
         return self.available_tokens
+
+    def alloc(self, need_size):
+        if need_size > self.available_tokens:
+            return None
+        result = list(range(self._next_token, self._next_token + need_size))
+        self._next_token += need_size
+        self.available_tokens -= need_size
+        return result
+
+    def free(self, indices):
+        self.available_tokens += len(indices)
 
 
 class _HostAllocator(_Allocator):
@@ -306,8 +357,8 @@ class _CloseRecorder:
     def close(self):
         self.close_count += 1
 
-    def emit(self, event, ts_ms):
-        self.events.append((event, ts_ms))
+    def emit(self, event, ts_ms, **fields):
+        self.events.append((event, ts_ms, fields))
 
 
 class _AuditRecorder:
@@ -374,8 +425,15 @@ class _TransferTickBridge:
         self.telemetry = []
         return result
 
-    def scheduler_step(self, now_ms, *, drain_acks):
+    def scheduler_step(
+        self,
+        now_ms,
+        *,
+        drain_acks,
+        allow_reactive_transfer=True,
+    ):
         self.drain_acks_argument = drain_acks
+        self.allow_reactive_transfer = allow_reactive_transfer
         return SimpleNamespace(
             now_ms=now_ms,
             admission=self.admission,
@@ -506,6 +564,11 @@ class SGLangBackendTest(unittest.TestCase):
             "token_count": 4,
             "node_ids": (7,),
             "reason": "",
+            "host_copy_state": "present",
+            "pinned_host": True,
+            "allocator_submit_ms": 0.25,
+            "native_inflight_operation_count": 2,
+            "native_inflight_token_count": 8,
         }
 
         runtime.on_hicache_transfer_completed(record)
@@ -520,9 +583,17 @@ class SGLangBackendTest(unittest.TestCase):
         self.assertEqual(fields["telemetry_origin"], "native_hicache_callback")
         self.assertEqual(fields["context_id"], "ctx-child")
         self.assertEqual(fields["owner_context_ids"], ("ctx-child",))
+        self.assertEqual(fields["host_copy_state"], "present")
+        self.assertIs(fields["pinned_host"], True)
+        self.assertEqual(fields["native_concurrent_bytes"], 80)
+        self.assertEqual(fields["allocator_submit_ms"], 0.25)
+        self.assertEqual(fields["callback_overhead_ms"], 10.0)
+        self.assertEqual(
+            fields["native_inflight_operation_count_at_submit"], 2
+        )
         self.assertFalse(fields["start_timestamp_observed"])
 
-    def test_p4_runtime_rejects_online_joint_plan_application(self):
+    def test_online_joint_plan_requires_shadow_observed_worker(self):
         scheduler = SimpleNamespace(
             enable_hierarchical_cache=True,
             tree_cache=_TreeCache(),
@@ -530,11 +601,14 @@ class SGLangBackendTest(unittest.TestCase):
 
         with self.assertRaisesRegex(
             SGLangBackendError,
-            "online JointPlan application is not implemented",
+            "online observed JointPlan requires its validated shadow worker",
         ):
             EmbeddedSGLangRuntime(
                 scheduler,
-                config=BeliefKVConfig(joint_policy_enabled=True),
+                config=BeliefKVConfig(
+                    joint_policy_enabled=True,
+                    joint_policy_shadow_mode=False,
+                ),
             )
 
     def test_gpu_service_observer_pairs_overlap_launch_and_completion(self):
@@ -555,6 +629,7 @@ class SGLangBackendTest(unittest.TestCase):
         requests = [
             SimpleNamespace(
                 rid=f"request-{index}",
+                output_ids=[],
                 beliefkv_metadata=BeliefKVRequestMetadata(
                     f"service-calibration:train:decode-b1-r0-i{index}",
                     f"inv-{index}",
@@ -570,6 +645,8 @@ class SGLangBackendTest(unittest.TestCase):
         )
 
         runtime._observe_gpu_batch_launch(batch, 10.0)
+        for request in requests:
+            request.output_ids.append(1)
         runtime.on_batch_completed(batch)
 
         event, _, fields = runtime.audit.events[-1]
@@ -582,6 +659,20 @@ class SGLangBackendTest(unittest.TestCase):
         self.assertEqual(fields["episode_id"], "train:decode-b1-r0")
         self.assertEqual(fields["elapsed_ms"], 2.5)
         self.assertEqual(fields["launch_to_completion_ms"], 2.5)
+        self.assertEqual(
+            [item["request_id"] for item in fields["request_samples"]],
+            ["request-0", "request-1"],
+        )
+        self.assertEqual(
+            [item["token_delta"] for item in fields["request_samples"]],
+            [1, 1],
+        )
+        self.assertTrue(
+            all(
+                item["token_delta_semantics"] == "observed_output_ids_delta"
+                for item in fields["request_samples"]
+            )
+        )
         self.assertEqual(len(runtime._gpu_service_launches), 0)
 
     def test_gpu_service_observer_removes_overlap_queue_time(self):
@@ -764,6 +855,239 @@ class SGLangBackendTest(unittest.TestCase):
         self.assertEqual(fields["allocator_growth_bytes_upper_bound"], 60)
         self.assertTrue(fields["allocator_growth_exact"])
         self.assertEqual(fields["new_extent_bytes"], 40)
+
+    def test_abort_race_preserves_physical_start_until_late_finish(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = BeliefKVConfig(
+            hbm_capacity_bytes=10_000,
+            host_capacity_bytes=10_000,
+            reserve_hbm_bytes=0,
+            kv_bytes_per_token=10,
+        )
+        runtime.controller = BeliefKVController(runtime.config)
+        runtime.controller.page_index.register_context("ctx", "wf", 0)
+        first = PageHandle(1, 0)
+        runtime.controller.page_index.register_page(first, size_bytes=100)
+        runtime.controller.page_index.bind_pages("ctx", 0, (first,))
+        runtime.scheduler = SimpleNamespace(
+            page_size=1,
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
+        )
+        runtime.audit = _AuditRecorder()
+        runtime._now_ms = lambda: 20.0
+        runtime._tree_dirty = False
+        runtime._request_physical_start_by_id = {}
+        runtime._aborted_request_physical_start_by_id = {}
+        runtime._pending_request_physical_finish_by_id = {}
+        runtime._request_submitted_ts_by_id = {"request": 1.0}
+        runtime._queue_timeout_request_ids = set()
+        runtime._execution_timeout_request_ids = set()
+        runtime._retracted_engine_request_ids = set()
+        runtime._pending_selective_retraction_ids = set()
+        runtime._retraction_cooldown_until_by_request = {}
+        runtime._ordinary_restore_capacity_waiters = set()
+        runtime._finish_restore_obligation = lambda *args, **kwargs: None
+        runtime._cancel_restore_service_grace = lambda *args, **kwargs: None
+        metadata = BeliefKVRequestMetadata("wf", "inv", "ctx", 0)
+        runtime._request_metadata_by_id = {"request": metadata}
+        request = SimpleNamespace(
+            rid="request",
+            origin_input_ids=_NoBooleanSequence(10),
+            prefix_indices=_NoBooleanSequence(5),
+        )
+
+        runtime._capture_request_physical_start(request, metadata, 10.0)
+        runtime.on_abort_request(SimpleNamespace(abort_all=False, rid="request"))
+        second = PageHandle(2, 0)
+        runtime.controller.page_index.register_page(second, size_bytes=40)
+        runtime.controller.page_index.bind_pages("ctx", 0, (second,))
+        runtime._queue_request_physical_finish(
+            request,
+            metadata,
+            output_tokens=2,
+            cache_commit_tokens=11,
+        )
+        runtime._flush_request_physical_finishes()
+
+        event, _, fields = runtime.audit.events[-1]
+        self.assertEqual(event, "request_physical_delta")
+        self.assertTrue(fields["request_aborted_during_finish"])
+        self.assertEqual(fields["request_abort_reason"], "request_aborted")
+        self.assertEqual(fields["context_path_growth_bytes"], 40)
+        self.assertNotIn(
+            "request", runtime._aborted_request_physical_start_by_id
+        )
+
+    def test_execution_timeout_falls_back_to_physical_start_without_ledger(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        metadata = BeliefKVRequestMetadata(
+            "wf",
+            "inv",
+            "ctx",
+            0,
+            execution_timeout_s=2.0,
+        )
+        aborted = []
+        runtime.scheduler = SimpleNamespace(
+            abort_request=lambda request: aborted.append(request)
+        )
+        runtime.audit = _AuditRecorder()
+        runtime._request_metadata_by_id = {"request": metadata}
+        runtime._request_submitted_ts_by_id = {"request": -100_000.0}
+        runtime._request_physical_start_by_id = {
+            "request": {"checkpoint_ts_ms": 1_000.0}
+        }
+        runtime._execution_timeout_request_ids = set()
+        runtime._terminal_cancelled_request_ids = set()
+
+        runtime._enforce_execution_timeouts(now_ms=2_999.0)
+        self.assertEqual(aborted, [])
+
+        runtime._enforce_execution_timeouts(now_ms=3_001.0)
+
+        self.assertEqual(len(aborted), 1)
+        self.assertEqual(aborted[0].rid, "request")
+        self.assertIn("request", runtime._terminal_cancelled_request_ids)
+        timeout_events = [
+            fields
+            for event, _, fields in runtime.audit.events
+            if event == "request_execution_timeout"
+        ]
+        self.assertEqual(timeout_events[0]["execution_started_ts_ms"], 1_000.0)
+        self.assertEqual(
+            timeout_events[0]["timeout_scope"],
+            "physical_start_to_scheduler_abort_fallback",
+        )
+
+    def test_execution_timeout_uses_last_completed_gpu_service(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        metadata = BeliefKVRequestMetadata(
+            "wf",
+            "inv",
+            "ctx",
+            0,
+            execution_timeout_s=2.0,
+        )
+        aborted = []
+        runtime.scheduler = SimpleNamespace(
+            abort_request=lambda request: aborted.append(request)
+        )
+        runtime.audit = _AuditRecorder()
+        runtime._request_metadata_by_id = {"request": metadata}
+        runtime._request_physical_start_by_id = {
+            "request": {"checkpoint_ts_ms": 1_000.0}
+        }
+        runtime._execution_timeout_request_ids = set()
+        runtime._terminal_cancelled_request_ids = set()
+        runtime._lock_service_ledger = RequestServiceLedger()
+        runtime._lock_service_ledger.observe_selected(
+            request_id="request",
+            workflow_id="wf",
+            invocation_id="inv",
+            context_id="ctx",
+            ts_ms=1_000.0,
+        )
+        runtime._lock_service_ledger.observe_completed(
+            "request",
+            ts_ms=2_500.0,
+            phase="decode",
+        )
+
+        runtime._enforce_execution_timeouts(now_ms=3_001.0)
+        self.assertEqual(aborted, [])
+
+        runtime._enforce_execution_timeouts(now_ms=4_501.0)
+
+        self.assertEqual(len(aborted), 1)
+        timeout_events = [
+            fields
+            for event, _, fields in runtime.audit.events
+            if event == "request_execution_timeout"
+        ]
+        self.assertEqual(timeout_events[0]["execution_elapsed_ms"], 3_501.0)
+        self.assertEqual(timeout_events[0]["gpu_service_no_progress_ms"], 2_001.0)
+        self.assertEqual(timeout_events[0]["last_gpu_service_ts_ms"], 2_500.0)
+        self.assertEqual(timeout_events[0]["completed_gpu_service_count"], 1)
+        self.assertEqual(
+            timeout_events[0]["timeout_scope"],
+            "last_completed_gpu_service_to_scheduler_abort",
+        )
+
+    def test_queue_timeout_excludes_requests_that_started_execution(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = BeliefKVConfig(request_queue_timeout_ms=2_000.0)
+        metadata = BeliefKVRequestMetadata("wf", "inv", "ctx", 0)
+        aborted = []
+        runtime.scheduler = SimpleNamespace(
+            abort_request=lambda request: aborted.append(request)
+        )
+        runtime.audit = _AuditRecorder()
+        runtime._request_metadata_by_id = {
+            "queued": metadata,
+            "started": metadata,
+        }
+        runtime._request_submitted_ts_by_id = {
+            "queued": 1_000.0,
+            "started": 1_000.0,
+        }
+        runtime._request_physical_start_by_id = {
+            "started": {"checkpoint_ts_ms": 1_500.0}
+        }
+        runtime._queue_timeout_request_ids = set()
+        runtime._terminal_cancelled_request_ids = set()
+
+        runtime._enforce_queue_timeouts(now_ms=3_001.0)
+
+        self.assertEqual([item.rid for item in aborted], ["queued"])
+        self.assertIn("queued", runtime._terminal_cancelled_request_ids)
+        self.assertNotIn("started", runtime._terminal_cancelled_request_ids)
+
+    def test_final_runtime_summary_exposes_joint_correctness_gates(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.scheduler = SimpleNamespace(
+            waiting_queue=(),
+            running_batch=None,
+            chunked_req=None,
+        )
+        runtime.controller = BeliefKVController()
+        runtime.audit = _AuditRecorder()
+        runtime._shutdown_state = "acknowledged"
+        runtime._online_joint_counts = Counter()
+        runtime._running_retraction_counts = Counter()
+        runtime._pending_online_joint_residency = None
+        runtime._pending_running_retraction_transaction = None
+        runtime._current_online_joint_view = None
+
+        payload = runtime._runtime_summary_payload(now_ms=10.0, final=True)
+
+        self.assertTrue(
+            payload["correctness_gates"][
+                "all_online_actions_have_source_joint_plan_id"
+            ]
+        )
+        self.assertTrue(
+            payload["correctness_gates"]["no_pending_transactions"]
+        )
+        self.assertTrue(
+            payload["correctness_gates"]["shutdown_summary_complete"]
+        )
+        self.assertTrue(
+            payload["correctness_gates"]
+            ["all_non_user_cancelled_obligations_satisfied"]
+        )
+        self.assertTrue(
+            payload["correctness_gates"]
+            ["shutdown_cleanup_did_not_mask_unresolved_transactions"]
+        )
+
+        runtime._shutdown_prepare_transaction_snapshot = {
+            "active_obligation_ids": ["restore-1"]
+        }
+        payload = runtime._runtime_summary_payload(now_ms=11.0, final=True)
+        self.assertFalse(
+            payload["correctness_gates"]
+            ["shutdown_cleanup_did_not_mask_unresolved_transactions"]
+        )
 
     def test_sparse_policy_snapshot_capture_is_replay_compatible(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1112,14 +1436,37 @@ class SGLangBackendTest(unittest.TestCase):
                     origin_input_ids=_NoBooleanSequence(10),
                     prefix_indices=_NoBooleanSequence(5),
                 )
-            ]
+            ],
+            running_batch=SimpleNamespace(
+                reqs=[
+                    SimpleNamespace(
+                        rid="running-request",
+                        beliefkv_metadata=BeliefKVRequestMetadata(
+                            "wf", "running-inv", "running-ctx", 0
+                        ),
+                        sampling_params=SimpleNamespace(max_new_tokens=20),
+                        output_ids=_NoBooleanSequence(4),
+                        origin_input_ids=_NoBooleanSequence(8),
+                        prefix_indices=_NoBooleanSequence(8),
+                    )
+                ]
+            ),
         )
 
         runnable = runtime._policy_runtime_runnable(100.0)
 
-        self.assertEqual(len(runnable), 1)
-        self.assertEqual(runnable[0].request_id, "request")
-        self.assertEqual(runnable[0].startup_bytes, 220)
+        self.assertEqual(len(runnable), 2)
+        by_request = {item.request_id: item for item in runnable}
+        self.assertEqual(by_request["request"].startup_bytes, 220)
+        self.assertTrue(
+            by_request["request"].causal_class.startswith("engine_waiting:")
+        )
+        self.assertEqual(by_request["running-request"].startup_bytes, 160)
+        self.assertTrue(
+            by_request["running-request"].causal_class.startswith(
+                "engine_running:"
+            )
+        )
 
     def test_tree_sync_defers_generation_changes_until_transfer_ack(self):
         runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
@@ -1416,7 +1763,483 @@ class SGLangBackendTest(unittest.TestCase):
 
         self.assertFalse(runtime._context_has_engine_request("ctx"))
         runtime._active_request_ids.add("request")
+        self.assertFalse(runtime._context_has_engine_request("ctx"))
+        request.req_pool_idx = 7
+        # Native ownership is immutable inside an epoch; the next safe point sees it.
+        runtime._finish_physical_safe_point()
         self.assertTrue(runtime._context_has_engine_request("ctx"))
+
+    def test_native_and_explicit_load_ownership_are_both_visible(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        metadata = BeliefKVRequestMetadata("wf", "inv", "ctx", 0)
+        request = SimpleNamespace(
+            rid="request",
+            beliefkv_metadata=metadata,
+            load_operation_id="native-load-1",
+        )
+        runtime._request_metadata_by_id = {"request": metadata}
+        runtime._request_submitted_ts_by_id = {"request": 1.0}
+        runtime._h2d_context_by_command = {
+            "explicit-h2d-1": ("ctx", ("page:1:0",))
+        }
+        runtime.scheduler = SimpleNamespace(
+            waiting_queue=[request],
+            running_batch=SimpleNamespace(reqs=[]),
+            chunked_req=None,
+        )
+
+        snapshot = runtime._context_physical_snapshots("ctx")[0]
+
+        self.assertEqual(snapshot.native_load_operation_id, "native-load-1")
+        self.assertEqual(snapshot.explicit_transfer_ids, ("explicit-h2d-1",))
+        self.assertTrue(runtime._context_has_engine_request("ctx"))
+
+    def test_native_snapshot_is_built_lazily_once_per_capture_epoch(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        first_metadata = BeliefKVRequestMetadata("wf", "inv-1", "ctx-1", 0)
+        second_metadata = BeliefKVRequestMetadata("wf", "inv-2", "ctx-2", 0)
+        first = SimpleNamespace(rid="request-1", req_pool_idx=1)
+        second = SimpleNamespace(rid="request-2")
+        runtime._request_metadata_by_id = {
+            "request-1": first_metadata,
+            "request-2": second_metadata,
+        }
+        runtime._request_submitted_ts_by_id = {
+            "request-1": 1.0,
+            "request-2": 2.0,
+        }
+        runtime.scheduler = SimpleNamespace(
+            waiting_queue=[first, second],
+            running_batch=SimpleNamespace(reqs=[]),
+            chunked_req=None,
+        )
+        runtime._begin_physical_safe_point_apply_events()
+        runtime._begin_physical_safe_point_capture_and_plan()
+
+        self.assertEqual(len(runtime._context_physical_snapshots("ctx-1")), 1)
+        self.assertEqual(len(runtime._context_physical_snapshots("ctx-2")), 1)
+        self.assertEqual(runtime._native_physical_snapshot_counts["call_count"], 1)
+        self.assertEqual(
+            runtime._native_physical_snapshot_counts["cache_hit_count"], 1
+        )
+
+    def test_native_snapshot_commit_rejects_changed_request_ownership(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        metadata = BeliefKVRequestMetadata("wf", "inv", "ctx", 0)
+        request = SimpleNamespace(rid="request")
+        runtime._request_metadata_by_id = {"request": metadata}
+        runtime._request_submitted_ts_by_id = {"request": 1.0}
+        runtime.scheduler = SimpleNamespace(
+            waiting_queue=[request],
+            running_batch=SimpleNamespace(reqs=[]),
+            chunked_req=None,
+        )
+        runtime._begin_physical_safe_point_apply_events()
+        runtime._begin_physical_safe_point_capture_and_plan()
+        runtime._context_physical_snapshots("ctx")
+        captured_epoch = runtime._safe_point_physical_epoch_sequence
+
+        request.req_pool_idx = 9
+        self.assertFalse(runtime._begin_physical_transactional_commit("ctx"))
+        self.assertGreater(runtime._safe_point_physical_epoch_sequence, captured_epoch)
+        self.assertEqual(
+            runtime._safe_point_physical_phase,
+            SafePointPhysicalPhase.CAPTURE_AND_PLAN,
+        )
+        self.assertEqual(
+            runtime._native_physical_snapshot_counts["commit_readset_stale"], 1
+        )
+        self.assertEqual(
+            runtime._context_physical_snapshots("ctx")[0].req_pool_slot, 9
+        )
+
+    def test_native_snapshot_commit_rejects_request_id_reuse(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        request = SimpleNamespace(rid="request")
+        runtime._request_metadata_by_id = {
+            "request": BeliefKVRequestMetadata("wf", "old", "old-ctx", 0)
+        }
+        runtime._request_submitted_ts_by_id = {"request": 1.0}
+        runtime.scheduler = SimpleNamespace(
+            waiting_queue=[request],
+            running_batch=SimpleNamespace(reqs=[]),
+            chunked_req=None,
+        )
+        runtime._context_physical_snapshots("old-ctx")
+
+        runtime._request_metadata_by_id["request"] = BeliefKVRequestMetadata(
+            "wf", "new", "new-ctx", 1
+        )
+        runtime._request_submitted_ts_by_id["request"] = 2.0
+
+        self.assertFalse(
+            runtime._begin_physical_transactional_commit("old-ctx")
+        )
+
+    def test_native_snapshot_commit_rejects_explicit_operation_change(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        metadata = BeliefKVRequestMetadata("wf", "inv", "ctx", 0)
+        runtime._request_metadata_by_id = {"request": metadata}
+        runtime._request_submitted_ts_by_id = {"request": 1.0}
+        runtime._h2d_context_by_command = {}
+        runtime.scheduler = SimpleNamespace(
+            waiting_queue=[SimpleNamespace(rid="request")],
+            running_batch=SimpleNamespace(reqs=[]),
+            chunked_req=None,
+        )
+        runtime._context_physical_snapshots("ctx")
+        runtime._h2d_context_by_command["h2d"] = ("ctx", ("page:1:0",))
+
+        self.assertFalse(runtime._begin_physical_transactional_commit("ctx"))
+
+    def test_native_snapshot_high_cardinality_index_is_complete(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        requests = [SimpleNamespace(rid=f"request-{index:03d}") for index in range(128)]
+        runtime._request_metadata_by_id = {
+            request.rid: BeliefKVRequestMetadata(
+                f"wf-{index:03d}",
+                f"inv-{index:03d}",
+                f"ctx-{index:03d}",
+                0,
+            )
+            for index, request in enumerate(requests)
+        }
+        runtime._request_submitted_ts_by_id = {
+            request.rid: float(index) for index, request in enumerate(requests)
+        }
+        runtime.scheduler = SimpleNamespace(
+            waiting_queue=requests[:64],
+            running_batch=SimpleNamespace(reqs=requests[64:]),
+            chunked_req=None,
+        )
+
+        for index in range(128):
+            snapshots = runtime._context_physical_snapshots(f"ctx-{index:03d}")
+            self.assertEqual(len(snapshots), 1)
+        self.assertEqual(runtime._native_physical_snapshot_counts["call_count"], 1)
+        self.assertEqual(
+            runtime._native_physical_snapshot_counts["cache_hit_count"], 127
+        )
+
+    def test_planning_snapshot_is_forbidden_after_commit_starts(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime._request_metadata_by_id = {}
+        runtime.scheduler = SimpleNamespace(
+            waiting_queue=[],
+            running_batch=SimpleNamespace(reqs=[]),
+            chunked_req=None,
+        )
+        runtime._begin_physical_safe_point_apply_events()
+        runtime._begin_physical_safe_point_capture_and_plan()
+        self.assertTrue(runtime._begin_physical_transactional_commit())
+
+        with self.assertRaisesRegex(RuntimeError, "after transactional commit"):
+            runtime._context_physical_snapshots("ctx")
+
+    def test_guard_blocked_restore_does_not_allocate_a_lease(self):
+        config = BeliefKVConfig(kv_bytes_per_token=10)
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.controller = BeliefKVController(config)
+        runtime.audit = _AuditRecorder()
+        runtime._restore_obligation_counts = Counter()
+        runtime._restore_command_sequence = 0
+        metadata = BeliefKVRequestMetadata("wf", "inv", "ctx", 0)
+        request = SimpleNamespace(rid="request", last_node=None)
+        runtime._request_metadata_by_id = {"request": metadata}
+        runtime._request_submitted_ts_by_id = {"request": 1.0}
+        runtime.scheduler = SimpleNamespace(
+            waiting_queue=[request],
+            running_batch=SimpleNamespace(reqs=[]),
+            chunked_req=None,
+        )
+        obligation = runtime._restore_obligation_index().create(
+            request_id="request",
+            workflow_id="wf",
+            invocation_id="inv",
+            context_id="ctx",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction-1",
+            source_joint_plan_id="joint-1",
+            created_ts_ms=1.0,
+            path_extent_ids=("page:1:0",),
+        )
+        obligation.source_transaction_terminal = True
+        obligation.requeued = True
+        bundle = SimpleNamespace(
+            generation_fingerprint="closure-1",
+            scope=SimpleNamespace(value="exclusive_suffix"),
+            bundle_id="bundle-1",
+            closure_bytes=100,
+            marginal_reclaimable_bytes=0,
+            exclusive_action_bytes=100,
+            cross_context_action_bytes=0,
+            foreign_owner_context_ids=(),
+        )
+        preview = SimpleNamespace(
+            eligible=True,
+            copy_bytes=100,
+            bundle=bundle,
+            context_id="ctx",
+            context_epoch=0,
+            command_kind=CommandKind.PREFETCH_CONTEXT,
+            blockers=(),
+            intent=lambda: None,
+        )
+        runtime._refresh_restore_obligation = lambda *_args, **_kwargs: (
+            request,
+            ("page:1:0",),
+        )
+        runtime._restore_attempt_stamp = lambda: (1,)
+        runtime._allocator_available_bytes = lambda: 1000
+        runtime._restore_h2d_previews = lambda *_args, **_kwargs: (preview,)
+        runtime.controller.preflight_control_command = lambda command: EnqueueOutcome(
+            status=EnqueueStatus.RETRY_GUARD_BLOCKED,
+            canonical_command_id=None,
+            attempt_key=("ctx", 0, command.kind.value),
+            blocker_codes=("engine_busy",),
+            wake_conditions=("engine_owner_changed",),
+        )
+        runtime.controller.transfer_guard.generation_for = lambda _command: 1
+        runtime._grant_restore_lease = mock.Mock()
+
+        runtime._drive_restore_obligations(now_ms=2.0)
+
+        runtime._grant_restore_lease.assert_not_called()
+        self.assertEqual(obligation.blocker_codes, ("engine_busy",))
+
+    def test_restore_enqueue_failure_rolls_back_prepared_lease_and_pin(self):
+        config = BeliefKVConfig(kv_bytes_per_token=10)
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.controller = BeliefKVController(config)
+        runtime.audit = _AuditRecorder()
+        runtime._restore_obligation_counts = Counter()
+        runtime._restore_command_sequence = 0
+        metadata = BeliefKVRequestMetadata("wf", "inv", "ctx", 0)
+        request = SimpleNamespace(rid="request", last_node=None)
+        runtime._request_metadata_by_id = {"request": metadata}
+        runtime._request_submitted_ts_by_id = {"request": 1.0}
+        runtime.scheduler = SimpleNamespace(
+            waiting_queue=[request],
+            running_batch=SimpleNamespace(reqs=[]),
+            chunked_req=None,
+        )
+        obligation = runtime._restore_obligation_index().create(
+            request_id="request",
+            workflow_id="wf",
+            invocation_id="inv",
+            context_id="ctx",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction-1",
+            source_joint_plan_id="joint-1",
+            created_ts_ms=1.0,
+            path_extent_ids=("page:1:0",),
+        )
+        obligation.source_transaction_terminal = True
+        obligation.requeued = True
+        bundle = SimpleNamespace(
+            generation_fingerprint="closure-1",
+            scope=SimpleNamespace(value="exclusive_suffix"),
+            bundle_id="bundle-1",
+            closure_bytes=100,
+            marginal_reclaimable_bytes=0,
+            exclusive_action_bytes=100,
+            cross_context_action_bytes=0,
+            foreign_owner_context_ids=(),
+        )
+        preview = SimpleNamespace(
+            eligible=True,
+            copy_bytes=100,
+            bundle=bundle,
+            context_id="ctx",
+            context_epoch=0,
+            command_kind=CommandKind.PREFETCH_CONTEXT,
+            blockers=(),
+            intent=lambda: None,
+        )
+        runtime._refresh_restore_obligation = lambda *_args, **_kwargs: (
+            request,
+            ("page:1:0",),
+        )
+        runtime._restore_attempt_stamp = lambda: (1,)
+        runtime._allocator_available_bytes = lambda: 1000
+        runtime._restore_h2d_previews = lambda *_args, **_kwargs: (preview,)
+        runtime.controller.preflight_control_command = lambda command: EnqueueOutcome(
+            status=EnqueueStatus.ENQUEUED,
+            canonical_command_id=command.command_id,
+            attempt_key=("ctx", 0, command.kind.value),
+        )
+        runtime.controller.transfer_guard.generation_for = lambda _command: 0
+        events = []
+        lease = SimpleNamespace(lease_id="lease-1")
+        runtime._grant_restore_lease = lambda *_args, **_kwargs: (
+            events.append("reserve") or lease
+        )
+        runtime._pin_restore_lease_prefix = lambda *_args, **_kwargs: (
+            events.append("pin") or True
+        )
+        runtime._queue_restore_obligation_command = lambda *_args, **_kwargs: (
+            events.append("enqueue")
+            or EnqueueOutcome(
+                status=EnqueueStatus.CONTEXT_CONFLICT,
+                canonical_command_id="other-command",
+                attempt_key=("ctx", 0, "prefetch_context"),
+                blocker_codes=("context_command_owned",),
+                wake_conditions=("command_terminal:other-command",),
+            )
+        )
+        runtime._release_restore_lease = lambda *_args, **_kwargs: events.append(
+            "rollback"
+        )
+
+        runtime._drive_restore_obligations(now_ms=2.0)
+
+        self.assertEqual(events, ["reserve", "pin", "enqueue", "rollback"])
+        transaction = runtime._restore_transactions["request"]
+        self.assertIsNone(transaction.capacity_reservation_id)
+        self.assertIsNone(transaction.prefix_pin_token)
+        self.assertIsNone(obligation.pending_command_id)
+
+    def test_canonical_restore_ack_notifies_all_subscribers(self):
+        config = BeliefKVConfig(restore_lease_enabled=False)
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.audit = _AuditRecorder()
+        runtime._restore_obligation_counts = Counter()
+        runtime._restore_command_to_request = {"canonical": {"first", "second"}}
+        runtime._restore_funding_target_by_command = {}
+        index = runtime._restore_obligation_index()
+        for request_id in ("first", "second"):
+            obligation = index.create(
+                request_id=request_id,
+                workflow_id=f"wf-{request_id}",
+                invocation_id=f"inv-{request_id}",
+                context_id="ctx",
+                context_epoch=0,
+                source_retraction_transaction_id=f"retraction-{request_id}",
+                source_joint_plan_id=f"joint-{request_id}",
+                created_ts_ms=1.0,
+                path_extent_ids=("page:1:0",),
+            )
+            obligation.start_command(
+                "canonical",
+                CommandKind.PREFETCH_CONTEXT,
+                now_ms=1.0,
+                attempt_stamp=(1,),
+            )
+
+        runtime._advance_restore_obligations(
+            (
+                CommandAck(
+                    "canonical",
+                    CommandStatus.COMPLETED,
+                    2.0,
+                    actual_bytes=100,
+                ),
+            ),
+            now_ms=2.0,
+        )
+
+        self.assertEqual(
+            index.get("first").state, RestoreObligationState.RESTORE_ACKED
+        )
+        self.assertEqual(
+            index.get("second").state, RestoreObligationState.RESTORE_ACKED
+        )
+        self.assertNotIn("canonical", runtime._restore_command_to_request)
+
+    def test_noncomplete_restore_acks_park_transaction_for_external_event(self):
+        for status in (
+            CommandStatus.PARTIAL,
+            CommandStatus.REJECTED,
+            CommandStatus.STALE,
+        ):
+            with self.subTest(status=status.value):
+                config = BeliefKVConfig(restore_lease_enabled=False)
+                runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+                runtime.config = config
+                runtime.audit = _AuditRecorder()
+                runtime._restore_obligation_counts = Counter()
+                runtime._restore_command_to_request = {
+                    status.value: {"request"}
+                }
+                runtime._restore_funding_target_by_command = {}
+                obligation = runtime._restore_obligation_index().create(
+                    request_id="request",
+                    workflow_id="wf",
+                    invocation_id="inv",
+                    context_id="ctx",
+                    context_epoch=0,
+                    source_retraction_transaction_id="retraction-1",
+                    source_joint_plan_id="joint-1",
+                    created_ts_ms=1.0,
+                    path_extent_ids=("page:1:0",),
+                )
+                obligation.start_command(
+                    status.value,
+                    CommandKind.PREFETCH_CONTEXT,
+                    now_ms=1.0,
+                    attempt_stamp=(1,),
+                )
+
+                runtime._advance_restore_obligations(
+                    (
+                        CommandAck(
+                            status.value,
+                            status,
+                            2.0,
+                            actual_bytes=0,
+                        ),
+                    ),
+                    now_ms=2.0,
+                )
+
+                transaction = runtime._restore_transactions["request"]
+                self.assertEqual(
+                    obligation.state, RestoreObligationState.PARKED_WAIT
+                )
+                self.assertEqual(
+                    transaction.stage, RestoreTransactionStage.WAIT_EVENT
+                )
+
+    def test_restore_drain_acquires_and_releases_exclusive_authority(self):
+        config = BeliefKVConfig()
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.controller = BeliefKVController(config)
+        runtime.audit = _AuditRecorder()
+        obligation = runtime._restore_obligation_index().create(
+            request_id="request",
+            workflow_id="wf",
+            invocation_id="inv",
+            context_id="ctx",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction-1",
+            source_joint_plan_id="joint-1",
+            created_ts_ms=1.0,
+            path_extent_ids=(),
+        )
+        runtime._restore_authority_mode = (
+            RestoreAuthorityMode.RESTORE_DRAIN_REQUESTED
+        )
+        runtime._restore_authority_request_id = "request"
+
+        runtime._advance_restore_authority(now_ms=2.0)
+        self.assertEqual(
+            runtime._restore_authority_mode,
+            RestoreAuthorityMode.RESTORE_DRAIN_ACTIVE,
+        )
+
+        obligation.finish(
+            RestoreObligationState.CANCELLED,
+            now_ms=3.0,
+            reason="test_cancel",
+        )
+        runtime._advance_restore_authority(now_ms=3.0)
+        self.assertEqual(
+            runtime._restore_authority_mode, RestoreAuthorityMode.NORMAL_JOINT
+        )
 
     def test_late_runtime_event_is_committed_at_workflow_watermark(self):
         runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
@@ -1664,6 +2487,112 @@ class SGLangBackendTest(unittest.TestCase):
         self.assertEqual(released.state, AdmissionSideState.VISIBLE_PENDING)
         self.assertEqual(released.request.uncached_prompt_tokens, 1)
 
+    def test_h2d_dependency_blocks_only_requests_whose_radix_path_intersects(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.controller = BeliefKVController()
+        runtime.controller.process_runtime_events(
+            (
+                RuntimeEvent("start", 1.0, RuntimeEventKind.WORKFLOW_START, "wf"),
+                RuntimeEvent(
+                    "create",
+                    2.0,
+                    RuntimeEventKind.INVOCATION_CREATE,
+                    "wf",
+                    invocation_id="inv",
+                    context_id="ctx",
+                    context_epoch=0,
+                ),
+            )
+        )
+        runtime.registry = SGLangNodeRegistry()
+        runtime.tree_cache = _TreeCache()
+        runtime.config = BeliefKVConfig(kv_bytes_per_token=16)
+        matched = _Node(11)
+        matched.parent = runtime.tree_cache.root_node
+        unrelated = _Node(12)
+        unrelated.parent = runtime.tree_cache.root_node
+        matched_handle = runtime.registry.register(matched)
+        unrelated_handle = runtime.registry.register(unrelated)
+        for handle in (matched_handle, unrelated_handle):
+            runtime.controller.page_index.register_page(
+                handle,
+                size_bytes=100,
+                residency=PhysicalResidency.CPU_ONLY,
+            )
+        runtime.controller.page_index.bind_pages(
+            "ctx", 0, (matched_handle, unrelated_handle)
+        )
+        metadata = BeliefKVRequestMetadata("wf", "inv", "ctx", 0)
+        requests = [
+            SimpleNamespace(rid="matched", last_node=matched),
+            SimpleNamespace(rid="unrelated", last_node=unrelated),
+        ]
+        runtime.scheduler = SimpleNamespace(waiting_queue=requests)
+        for request in requests:
+            runtime.controller.register_visible_request(
+                AdmissionRequest(
+                    request.rid,
+                    "wf",
+                    "inv",
+                    "ctx",
+                    0,
+                    10.0,
+                    1,
+                    1,
+                    16,
+                )
+            )
+
+        runtime._mark_h2d_waiters(
+            "ctx",
+            restored_extent_ids=(
+                f"page:{matched_handle.page_id}:"
+                f"{matched_handle.allocation_generation}",
+            ),
+            reason="h2d_inflight",
+        )
+
+        matched_entry = runtime.controller.visible_admission.get("matched")
+        unrelated_entry = runtime.controller.visible_admission.get("unrelated")
+        self.assertEqual(matched_entry.state, AdmissionSideState.WAIT_RESTORE)
+        self.assertEqual(
+            unrelated_entry.state, AdmissionSideState.VISIBLE_PENDING
+        )
+
+    def test_online_residency_hysteresis_blocks_reclaim_after_recent_restore(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = BeliefKVConfig(
+            hbm_capacity_bytes=1000,
+            reserve_hbm_bytes=100,
+            residency_hysteresis_ms=100.0,
+            joint_emergency_hbm_ratio=0.98,
+        )
+        runtime.controller = BeliefKVController(runtime.config)
+        runtime.controller.report_hbm_usage(900)
+        runtime.audit = _AuditRecorder()
+        runtime._online_joint_counts = Counter()
+        runtime._online_joint_hysteresis_audit = set()
+        runtime._online_joint_last_residency_action = {
+            "bundle": (ResidencyAction.PREFETCH_GPU, 10.0)
+        }
+
+        blocked = runtime._online_residency_hysteresis_blocks(
+            plan_id="plan",
+            bundle_id="bundle",
+            action=ResidencyAction.COMMIT_CPU,
+            now_ms=50.0,
+        )
+        runtime.controller.report_hbm_usage(990)
+        emergency = runtime._online_residency_hysteresis_blocks(
+            plan_id="plan-2",
+            bundle_id="bundle",
+            action=ResidencyAction.COMMIT_CPU,
+            now_ms=60.0,
+        )
+
+        self.assertTrue(blocked)
+        self.assertFalse(emergency)
+
     def test_close_emits_controller_timing_summary(self):
         runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
         runtime._closed = False
@@ -1679,7 +2608,11 @@ class SGLangBackendTest(unittest.TestCase):
 
         runtime.close()
 
-        event, _, fields = runtime.audit.events[0]
+        event, _, fields = next(
+            item
+            for item in runtime.audit.events
+            if item[0] == "controller_timing_summary"
+        )
         self.assertEqual(event, "controller_timing_summary")
         self.assertEqual(fields["telemetry_event_count"], 3)
         self.assertAlmostEqual(fields["telemetry_event_overhead_ratio_p99"], 0.02)
@@ -1698,7 +2631,69 @@ class SGLangBackendTest(unittest.TestCase):
         self.assertTrue(runtime._closed)
         self.assertIsNone(runtime.event_server)
         self.assertIsNone(runtime.event_log)
-        self.assertEqual(runtime.audit.events, [("runtime_shutdown", 42.0)])
+        self.assertEqual(
+            [item[0] for item in runtime.audit.events],
+            ["shutdown_prepare", "shutdown_ack", "runtime_shutdown"],
+        )
+        self.assertEqual(runtime.audit.close_count, 1)
+
+    def test_scheduler_shutdown_shields_runtime_close_from_repeated_signals(self):
+        runtime = SimpleNamespace(close=mock.Mock())
+        previous = {
+            signal_number: object()
+            for signal_number in (signal.SIGINT, signal.SIGTERM, signal.SIGQUIT)
+        }
+
+        with mock.patch(
+            "beliefkv.runtime.sglang_v052rc1.signal.signal",
+            side_effect=lambda signum, handler: previous[signum],
+        ) as install:
+            close_runtime_with_signal_shield(runtime)
+
+        runtime.close.assert_called_once_with()
+        self.assertEqual(install.call_count, 6)
+
+    def test_scheduler_sigterm_handler_unwinds_through_finally(self):
+        previous = object()
+        with mock.patch(
+            "beliefkv.runtime.sglang_v052rc1.signal.signal",
+            return_value=previous,
+        ) as install:
+            self.assertIs(install_scheduler_shutdown_handler(), previous)
+
+        signum, handler = install.call_args.args
+        self.assertEqual(signum, signal.SIGTERM)
+        with self.assertRaises(SystemExit) as caught:
+            handler(signal.SIGTERM, None)
+        self.assertEqual(caught.exception.code, 0)
+
+    def test_shutdown_ack_is_written_after_audit_close(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime._shutdown_state = "acknowledged"
+        runtime.audit = _CloseRecorder()
+        runtime.audit.run_id = "run"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime._runtime_scheduler_pid_path = root / "scheduler.pid.json"
+            runtime._runtime_shutdown_ack_path = root / "shutdown_ack.json"
+            runtime._runtime_summary_path = root / "latest_runtime_summary.json"
+
+            runtime._write_scheduler_identity()
+            runtime.audit.close()
+            runtime._write_shutdown_ack()
+
+            identity = json.loads(
+                runtime._runtime_scheduler_pid_path.read_text(encoding="utf-8")
+            )
+            ack = json.loads(
+                runtime._runtime_shutdown_ack_path.read_text(encoding="utf-8")
+            )
+        self.assertEqual(identity["pid"], ack["pid"])
+        self.assertEqual(
+            identity["linux_start_time_ticks"],
+            ack["linux_start_time_ticks"],
+        )
+        self.assertEqual(ack["shutdown_state"], "acknowledged")
         self.assertEqual(runtime.audit.close_count, 1)
 
     def test_shadow_cancel_does_not_assume_submitted_dma_is_preemptible(self):
@@ -1767,6 +2762,12 @@ class SGLangBackendTest(unittest.TestCase):
         self.assertEqual(telemetry.actual_bytes, 400)
         self.assertEqual(telemetry.closure_bytes, 400)
         self.assertIsNone(telemetry.first_layer_ready_ts_ms)
+        self.assertEqual(telemetry.host_copy_state, "missing")
+        self.assertIs(telemetry.pinned_host, True)
+        self.assertIsNotNone(telemetry.allocator_submit_ms)
+        self.assertEqual(
+            telemetry.start_timestamp_semantics, "hicache_api_submit_begin"
+        )
 
     def test_atomic_bundle_preflight_has_no_side_effect_when_child_is_locked(self):
         tree = _LockPropagatingTreeCache()
@@ -2763,6 +3764,53 @@ class SGLangBackendTest(unittest.TestCase):
         runtime.end_prefill_epoch(selected)
         self.assertEqual(len(controller.visible_admission.entries()), 0)
 
+    def test_joint_active_window_defers_but_keeps_inactive_workflow_visible(self):
+        config = BeliefKVConfig(
+            hbm_capacity_bytes=1_000,
+            reserve_hbm_bytes=0,
+            joint_policy_enabled=True,
+            joint_workflow_active_window=1,
+        )
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.controller = BeliefKVController(config)
+        runtime.controller.fairness.register("wf-a")
+        runtime.controller.fairness.register("wf-b")
+        runtime.controller.fairness.charge_service("wf-a", 100.0)
+        requests = (
+            RunnableInvocation(
+                request_id="request-a",
+                workflow_id="wf-a",
+                invocation_id="inv-a",
+                context_id="ctx-a",
+                context_epoch=0,
+                submitted_ts_ms=1.0,
+                startup_bytes=10,
+            ),
+            RunnableInvocation(
+                request_id="request-b",
+                workflow_id="wf-b",
+                invocation_id="inv-b",
+                context_id="ctx-b",
+                context_epoch=0,
+                submitted_ts_ms=1.0,
+                startup_bytes=10,
+            ),
+        )
+        runtime._policy_runtime_runnable = lambda _now_ms: requests
+        runtime._current_online_joint_decision = None
+        runtime._current_joint_plan_epoch = None
+        runtime._online_joint_epoch_sequence = 0
+        runtime._online_joint_counts = Counter()
+
+        decision = runtime._safe_point_seed_decision(now_ms=10.0)
+
+        self.assertEqual(decision.view.ordered_request_ids, ("request-b",))
+        self.assertEqual(decision.view.deferred_request_ids, ("request-a",))
+        self.assertEqual(
+            set(runtime.controller.fairness.accounts), {"wf-a", "wf-b"}
+        )
+
     def test_observed_admission_holds_new_tickets_at_active_kv_watermark(self):
         config = BeliefKVConfig(
             hbm_capacity_bytes=1000,
@@ -2969,6 +4017,1274 @@ class SGLangBackendTest(unittest.TestCase):
         entry = controller.visible_admission.get("victim")
         self.assertEqual(entry.state, AdmissionSideState.VISIBLE_PENDING)
 
+    def test_restore_obligation_supersedes_retraction_cooldown_on_requeue(self):
+        config = BeliefKVConfig(
+            hbm_capacity_bytes=2000,
+            reserve_hbm_bytes=100,
+            kv_bytes_per_token=10,
+            observed_admission_scheduling_enabled=True,
+            running_batch_retraction_enabled=True,
+        )
+        controller = BeliefKVController(config)
+        controller.process_runtime_events(
+            (
+                RuntimeEvent("start", 1.0, RuntimeEventKind.WORKFLOW_START, "wf"),
+                RuntimeEvent(
+                    "create",
+                    2.0,
+                    RuntimeEventKind.INVOCATION_CREATE,
+                    "wf",
+                    invocation_id="inv",
+                    context_id="ctx",
+                    context_epoch=0,
+                ),
+            )
+        )
+        tree_cache = _TreeCache()
+        node = _Node(17)
+        node.parent = tree_cache.root_node
+        registry = SGLangNodeRegistry()
+        handle = registry.register(node)
+        controller.page_index.register_page(
+            handle,
+            size_bytes=100,
+            residency=PhysicalResidency.CPU_ONLY,
+            radix_depth=1,
+        )
+        controller.page_index.bind_pages("ctx", 0, (handle,))
+        metadata = BeliefKVRequestMetadata("wf", "inv", "ctx", 0)
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.controller = controller
+        runtime.tree_cache = tree_cache
+        runtime.registry = registry
+        runtime.audit = _AuditRecorder()
+        runtime._now_ms = lambda: 1000.0
+        runtime._request_metadata_by_id = {"victim": metadata}
+        runtime._request_submitted_ts_by_id = {"victim": 10.0}
+        runtime._pending_selective_retraction_ids = {"victim"}
+        runtime._retraction_cooldown_until_by_request = {"victim": 5000.0}
+        obligation = runtime._restore_obligation_index().create(
+            request_id="victim",
+            workflow_id="wf",
+            invocation_id="inv",
+            context_id="ctx",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction-1",
+            source_joint_plan_id="joint-1",
+            created_ts_ms=900.0,
+            path_extent_ids=(f"page:{handle.page_id}:0",),
+        )
+        obligation.source_transaction_terminal = True
+        request = SimpleNamespace(
+            rid="victim",
+            beliefkv_metadata=metadata,
+            origin_input_ids=(1, 2),
+            output_ids=(3,),
+            prefix_indices=(),
+            sampling_params=SimpleNamespace(max_new_tokens=8),
+            last_node=node,
+            init_next_round_input=lambda _cache: None,
+        )
+
+        runtime.on_requests_requeued((request,), is_retracted=True)
+
+        entry = controller.visible_admission.get("victim")
+        self.assertEqual(entry.state, AdmissionSideState.WAIT_RESTORE)
+        self.assertEqual(entry.blocker_reason, "restore_obligation_pending")
+        self.assertEqual(
+            entry.restore_bundle_ids,
+            (f"page:{handle.page_id}:0",),
+        )
+        self.assertTrue(obligation.requeued)
+
+    def test_restore_debt_bypass_is_idle_bounded_and_smallest_first(self):
+        config = BeliefKVConfig(
+            kv_bytes_per_token=10,
+            restore_obligation_escalation_ms=1000.0,
+            restore_obligation_max_blocked_ms=2000.0,
+            restore_lease_max_bypass_admissions=1,
+        )
+        controller = BeliefKVController(config)
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.controller = controller
+        runtime.audit = _AuditRecorder()
+        runtime.scheduler = SimpleNamespace(
+            running_batch=SimpleNamespace(reqs=[]),
+            chunked_req=None,
+        )
+        runtime._metadata_scope_is_terminal = lambda _metadata: False
+        runtime._request_restore_bundle_ids = lambda _req, _context_id: ()
+
+        obligation = runtime._restore_obligation_index().create(
+            request_id="restore-target",
+            workflow_id="wf-restore",
+            invocation_id="inv-restore",
+            context_id="ctx-restore",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction-restore",
+            source_joint_plan_id="joint-restore",
+            created_ts_ms=0.0,
+            path_extent_ids=(),
+        )
+        requests = []
+        for request_id, estimated_tokens in (("large", 10), ("small", 2)):
+            metadata = BeliefKVRequestMetadata(
+                f"wf-{request_id}",
+                f"inv-{request_id}",
+                f"ctx-{request_id}",
+                0,
+            )
+            request = SimpleNamespace(
+                rid=request_id,
+                beliefkv_metadata=metadata,
+            )
+            requests.append(request)
+            controller.process_runtime_events(
+                (
+                    RuntimeEvent(
+                        f"start-{request_id}",
+                        1.0,
+                        RuntimeEventKind.WORKFLOW_START,
+                        metadata.root_workflow_id,
+                    ),
+                    RuntimeEvent(
+                        f"create-{request_id}",
+                        2.0,
+                        RuntimeEventKind.INVOCATION_CREATE,
+                        metadata.root_workflow_id,
+                        invocation_id=metadata.invocation_id,
+                        context_id=metadata.context_id,
+                        context_epoch=0,
+                    ),
+                )
+            )
+            controller.register_visible_request(
+                AdmissionRequest(
+                    request_id,
+                    metadata.root_workflow_id,
+                    metadata.invocation_id,
+                    metadata.context_id,
+                    0,
+                    10.0,
+                    estimated_tokens,
+                    0,
+                    10,
+                )
+            )
+
+        self.assertEqual(
+            runtime._select_restore_bypass_request(requests, now_ms=1001.0),
+            "small",
+        )
+        runtime.scheduler.running_batch.reqs.append(requests[0])
+        self.assertIsNone(
+            runtime._select_restore_bypass_request(requests, now_ms=1002.0)
+        )
+        runtime.scheduler.running_batch.reqs.clear()
+        obligation.bypass_count = 1
+        self.assertIsNone(
+            runtime._select_restore_bypass_request(requests, now_ms=1003.0)
+        )
+
+    def test_active_restore_lease_does_not_disable_debt_barrier(self):
+        config = BeliefKVConfig(
+            kv_bytes_per_token=10,
+            restore_obligation_escalation_ms=1000.0,
+            restore_obligation_max_blocked_ms=2000.0,
+        )
+        controller = BeliefKVController(config)
+        metadata = BeliefKVRequestMetadata(
+            "wf-ordinary", "inv-ordinary", "ctx-ordinary", 0
+        )
+        controller.process_runtime_events(
+            (
+                RuntimeEvent(
+                    "start-ordinary",
+                    1.0,
+                    RuntimeEventKind.WORKFLOW_START,
+                    metadata.root_workflow_id,
+                ),
+                RuntimeEvent(
+                    "create-ordinary",
+                    2.0,
+                    RuntimeEventKind.INVOCATION_CREATE,
+                    metadata.root_workflow_id,
+                    invocation_id=metadata.invocation_id,
+                    context_id=metadata.context_id,
+                    context_epoch=0,
+                ),
+            )
+        )
+        controller.register_visible_request(
+            AdmissionRequest(
+                "ordinary",
+                metadata.root_workflow_id,
+                metadata.invocation_id,
+                metadata.context_id,
+                0,
+                10.0,
+                1,
+                1,
+                10,
+            )
+        )
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.controller = controller
+        runtime.audit = _AuditRecorder()
+        runtime._now_ms = lambda: 2000.0
+        runtime._retraction_cooldown_until_by_request = {}
+        runtime._pending_h2d_contexts = set()
+        runtime._restore_bypass_request_id = None
+        runtime._context_bundle_generations = lambda _context_id: ()
+        runtime._request_restore_bundle_ids = lambda _req, _context_id: ()
+        runtime._metadata_scope_is_terminal = lambda _metadata: False
+        runtime._workflow_transition_state = lambda _workflow_id: (0, False)
+        obligation = runtime._restore_obligation_index().create(
+            request_id="restore-target",
+            workflow_id="wf-restore",
+            invocation_id="inv-restore",
+            context_id="ctx-restore",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction-restore",
+            source_joint_plan_id="joint-restore",
+            created_ts_ms=0.0,
+            path_extent_ids=(),
+        )
+        runtime._restore_lease_index().grant(
+            obligation=obligation,
+            granted_ts_ms=1000.0,
+            reserved_tokens=1,
+            reserved_bytes=10,
+            h2d_bytes=0,
+        )
+
+        runtime._sync_visible_gate_state(
+            "ordinary", metadata, req=SimpleNamespace(rid="ordinary")
+        )
+
+        entry = controller.visible_admission.get("ordinary")
+        self.assertEqual(entry.state, AdmissionSideState.POLICY_BLOCKED)
+        self.assertEqual(
+            entry.blocker_reason,
+            f"restore_debt_barrier:{obligation.obligation_id}",
+        )
+
+    def test_restore_service_grace_counts_decode_completion_not_wall_time(self):
+        config = BeliefKVConfig(restore_service_grace_decode_tokens=4)
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.audit = _AuditRecorder()
+        runtime.scheduler = SimpleNamespace(
+            server_args=SimpleNamespace(num_continuous_decode_steps=1)
+        )
+        runtime._restore_obligation_counts = Counter()
+        runtime._restore_service_grace_by_request = {}
+        obligation = runtime._restore_obligation_index().create(
+            request_id="restored",
+            workflow_id="wf",
+            invocation_id="inv",
+            context_id="ctx",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction-1",
+            source_joint_plan_id="joint-1",
+            created_ts_ms=0.0,
+            path_extent_ids=(),
+        )
+        runtime._start_restore_service_grace(obligation, now_ms=1000.0)
+        request = SimpleNamespace(rid="restored", output_ids=[])
+        batch = SimpleNamespace(reqs=[request])
+
+        request.output_ids.append(1)
+        runtime._observe_restore_service_grace(
+            batch, now_ms=5000.0, phase="prefill"
+        )
+        self.assertIn("restored", runtime._restore_service_grace_by_request)
+        for offset in range(3):
+            request.output_ids.append(offset + 2)
+            runtime._observe_restore_service_grace(
+                batch, now_ms=6000.0 + offset, phase="decode"
+            )
+        self.assertIn("restored", runtime._restore_service_grace_by_request)
+        request.output_ids.append(5)
+        runtime._observe_restore_service_grace(
+            batch, now_ms=7000.0, phase="decode"
+        )
+        self.assertNotIn("restored", runtime._restore_service_grace_by_request)
+
+    def test_restore_obligation_funds_h2d_then_releases_ticket(self):
+        config = BeliefKVConfig(
+            hbm_capacity_bytes=2000,
+            host_capacity_bytes=4000,
+            reserve_hbm_bytes=100,
+            kv_bytes_per_token=10,
+            observed_admission_scheduling_enabled=True,
+            running_batch_retraction_enabled=True,
+        )
+        controller = BeliefKVController(config)
+        events = [
+            RuntimeEvent("start", 1.0, RuntimeEventKind.WORKFLOW_START, "wf")
+        ]
+        for suffix in ("target", "victim"):
+            events.append(
+                RuntimeEvent(
+                    f"create-{suffix}",
+                    2.0,
+                    RuntimeEventKind.INVOCATION_CREATE,
+                    "wf",
+                    invocation_id=f"inv-{suffix}",
+                    context_id=f"ctx-{suffix}",
+                    context_epoch=0,
+                )
+            )
+        controller.process_runtime_events(tuple(events))
+        tree_cache = _TreeCache()
+        target_node = _Node(21)
+        target_node.parent = tree_cache.root_node
+        registry = SGLangNodeRegistry()
+        target_handle = registry.register(target_node)
+        victim_handle = PageHandle(22, 0)
+        controller.page_index.register_page(
+            target_handle,
+            size_bytes=200,
+            residency=PhysicalResidency.CPU_ONLY,
+            radix_depth=1,
+        )
+        controller.page_index.register_page(
+            victim_handle,
+            size_bytes=200,
+            residency=PhysicalResidency.DUAL_CLEAN,
+            radix_depth=1,
+        )
+        controller.page_index.bind_pages("ctx-target", 0, (target_handle,))
+        controller.page_index.bind_pages("ctx-victim", 0, (victim_handle,))
+        metadata = BeliefKVRequestMetadata("wf", "inv-target", "ctx-target", 0)
+        request = SimpleNamespace(
+            rid="target",
+            beliefkv_metadata=metadata,
+            origin_input_ids=(1, 2),
+            output_ids=(),
+            prefix_indices=(),
+            sampling_params=SimpleNamespace(max_new_tokens=8),
+            last_node=target_node,
+            init_next_round_input=lambda _cache: None,
+        )
+        allocator = _Allocator(10)
+        scheduler = SimpleNamespace(
+            waiting_queue=[request],
+            token_to_kv_pool_allocator=allocator,
+        )
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.controller = controller
+        runtime.scheduler = scheduler
+        runtime.tree_cache = tree_cache
+        runtime.registry = registry
+        runtime.audit = _AuditRecorder()
+        runtime._now_ms = lambda: 1000.0
+        runtime._request_metadata_by_id = {"target": metadata}
+        runtime._request_submitted_ts_by_id = {"target": 10.0}
+        runtime._retraction_cooldown_until_by_request = {}
+        runtime._pending_h2d_contexts = set()
+        runtime._runtime_resource_observation = lambda **_kwargs: SimpleNamespace(
+            host_free_bytes=4000
+        )
+        controller.register_visible_request(
+            AdmissionRequest(
+                "target", "wf", "inv-target", "ctx-target", 0, 10.0, 1, 1, 10
+            )
+        )
+        obligation = runtime._restore_obligation_index().create(
+            request_id="target",
+            workflow_id="wf",
+            invocation_id="inv-target",
+            context_id="ctx-target",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction-1",
+            source_joint_plan_id="joint-1",
+            created_ts_ms=900.0,
+            path_extent_ids=(f"page:{target_handle.page_id}:0",),
+        )
+        obligation.source_transaction_terminal = True
+        obligation.requeued = True
+
+        runtime._drive_restore_obligations(now_ms=1000.0)
+        funding = controller.command_queue.pop()
+        self.assertIsNotNone(funding, runtime.audit.events)
+        self.assertEqual(funding.kind, CommandKind.OFFLOAD_CONTEXT)
+        self.assertEqual(funding.context_id, "ctx-victim")
+        controller._queued_by_context.pop("ctx-victim", None)
+        controller.page_index.commit_cpu(victim_handle)
+        allocator.available_tokens = 30
+        runtime._advance_restore_obligations(
+            (
+                CommandAck(
+                    funding.command_id,
+                    CommandStatus.COMPLETED,
+                    1001.0,
+                    actual_bytes=200,
+                    page_handles=(victim_handle,),
+                ),
+            ),
+            now_ms=1001.0,
+        )
+        self.assertEqual(allocator.available_tokens, 18)
+        self.assertEqual(obligation.funding_reserved_tokens, 12)
+        self.assertEqual(obligation.funding_reserved_bytes, 120)
+
+        runtime._drive_restore_obligations(now_ms=1002.0)
+        restore = controller.command_queue.pop()
+        self.assertIsNotNone(restore)
+        self.assertEqual(restore.kind, CommandKind.PREFETCH_CONTEXT)
+        self.assertEqual(restore.context_id, "ctx-target")
+        self.assertEqual(allocator.available_tokens, 28)
+        self.assertEqual(obligation.funding_reserved_tokens, 0)
+        self.assertEqual(obligation.funding_reserved_bytes, 0)
+        lease = runtime._restore_lease_index().get("target")
+        self.assertIsNotNone(lease)
+        self.assertEqual(lease.reserved_tokens, 2)
+        # Model the H2D allocator claim followed by concurrent decode growth.
+        # The competing requests can consume every unreserved token, but not
+        # the two-token restore admission lease.
+        self.assertIsNotNone(allocator.alloc(20))
+        self.assertIsNotNone(allocator.alloc(8))
+        self.assertIsNone(allocator.alloc(1))
+        controller._queued_by_context.pop("ctx-target", None)
+        controller.page_index.begin_transfer(target_handle, TransferDirection.H2D)
+        controller.page_index.complete_transfer(
+            target_handle, TransferDirection.H2D
+        )
+        runtime._advance_restore_obligations(
+            (
+                CommandAck(
+                    restore.command_id,
+                    CommandStatus.COMPLETED,
+                    1003.0,
+                    actual_bytes=200,
+                    page_handles=(target_handle,),
+                ),
+            ),
+            now_ms=1003.0,
+        )
+        runtime._drive_restore_obligations(now_ms=1003.1)
+        runtime._sync_visible_gate_state("target", metadata, req=request)
+
+        entry = controller.visible_admission.get("target")
+        self.assertEqual(entry.state, AdmissionSideState.VISIBLE_PENDING)
+        self.assertEqual(obligation.state, RestoreObligationState.TICKET_READY)
+        self.assertEqual(lease.state, RestoreLeaseState.RESTORED_RESERVED)
+        self.assertEqual(target_node.lock_ref, 1)
+
+        self.assertTrue(
+            runtime._begin_restore_lease_admission(obligation, now_ms=1003.5)
+        )
+        self.assertEqual(allocator.available_tokens, 2)
+        runtime._reject_restore_lease_admission(
+            obligation, now_ms=1003.6, native_result="NO_TOKEN"
+        )
+        self.assertEqual(allocator.available_tokens, 0)
+        self.assertEqual(lease.state, RestoreLeaseState.RESTORED_RESERVED)
+
+        self.assertTrue(
+            runtime._begin_restore_lease_admission(obligation, now_ms=1003.7)
+        )
+        runtime._commit_restore_lease_admission(obligation, now_ms=1003.8)
+        self.assertEqual(allocator.available_tokens, 2)
+        self.assertEqual(lease.state, RestoreLeaseState.ADMITTED)
+        self.assertEqual(target_node.lock_ref, 0)
+        runtime._finish_restore_obligation(
+            "target",
+            RestoreObligationState.SATISFIED,
+            now_ms=1004.0,
+            reason="gpu_service_resumed",
+        )
+        self.assertEqual(obligation.state, RestoreObligationState.SATISFIED)
+        self.assertEqual(lease.state, RestoreLeaseState.RELEASED)
+
+    def test_admission_only_restore_reclaims_funding_before_granting_lease(self):
+        config = BeliefKVConfig(
+            hbm_capacity_bytes=2000,
+            host_capacity_bytes=4000,
+            reserve_hbm_bytes=100,
+            kv_bytes_per_token=10,
+            observed_admission_scheduling_enabled=True,
+        )
+        controller = BeliefKVController(config)
+        events = [RuntimeEvent("start", 1.0, RuntimeEventKind.WORKFLOW_START, "wf")]
+        for suffix in ("target", "victim"):
+            events.append(
+                RuntimeEvent(
+                    f"create-{suffix}",
+                    2.0,
+                    RuntimeEventKind.INVOCATION_CREATE,
+                    "wf",
+                    invocation_id=f"inv-{suffix}",
+                    context_id=f"ctx-{suffix}",
+                    context_epoch=0,
+                )
+            )
+        controller.process_runtime_events(tuple(events))
+        tree_cache = _TreeCache()
+        target_node = _Node(41)
+        target_node.parent = tree_cache.root_node
+        registry = SGLangNodeRegistry()
+        target_handle = registry.register(target_node)
+        victim_handle = PageHandle(42, 0)
+        controller.page_index.register_page(
+            target_handle,
+            size_bytes=200,
+            residency=PhysicalResidency.GPU_ONLY,
+            radix_depth=1,
+        )
+        controller.page_index.register_page(
+            victim_handle,
+            size_bytes=200,
+            residency=PhysicalResidency.DUAL_CLEAN,
+            radix_depth=1,
+        )
+        controller.page_index.bind_pages("ctx-target", 0, (target_handle,))
+        controller.page_index.bind_pages("ctx-victim", 0, (victim_handle,))
+        metadata = BeliefKVRequestMetadata("wf", "inv-target", "ctx-target", 0)
+        request = SimpleNamespace(
+            rid="target",
+            beliefkv_metadata=metadata,
+            origin_input_ids=(1, 2),
+            output_ids=(),
+            prefix_indices=(),
+            sampling_params=SimpleNamespace(max_new_tokens=8),
+            last_node=target_node,
+            init_next_round_input=lambda _cache: None,
+        )
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.controller = controller
+        runtime.scheduler = SimpleNamespace(
+            waiting_queue=[request],
+            token_to_kv_pool_allocator=_Allocator(1),
+        )
+        runtime.tree_cache = tree_cache
+        runtime.registry = registry
+        runtime.audit = _AuditRecorder()
+        runtime._request_metadata_by_id = {"target": metadata}
+        runtime._request_submitted_ts_by_id = {"target": 10.0}
+        runtime._retraction_cooldown_until_by_request = {}
+        runtime._pending_h2d_contexts = set()
+        runtime._runtime_resource_observation = lambda **_kwargs: SimpleNamespace(
+            host_free_bytes=4000
+        )
+        controller.register_visible_request(
+            AdmissionRequest(
+                "target", "wf", "inv-target", "ctx-target", 0, 10.0, 1, 1, 10
+            )
+        )
+        obligation = runtime._restore_obligation_index().create(
+            request_id="target",
+            workflow_id="wf",
+            invocation_id="inv-target",
+            context_id="ctx-target",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction-target",
+            source_joint_plan_id="joint-target",
+            created_ts_ms=900.0,
+            path_extent_ids=(f"page:{target_handle.page_id}:0",),
+        )
+        obligation.source_transaction_terminal = True
+        obligation.requeued = True
+
+        runtime._drive_restore_obligations(now_ms=1000.0)
+
+        funding = controller.command_queue.pop()
+        self.assertIsNotNone(funding, runtime.audit.events)
+        self.assertEqual(funding.kind, CommandKind.OFFLOAD_CONTEXT)
+        self.assertEqual(funding.context_id, "ctx-victim")
+        self.assertEqual(
+            funding.metadata["reason"], "restore_obligation_funding"
+        )
+        self.assertEqual(
+            obligation.state, RestoreObligationState.EVICT_FOR_RESTORE
+        )
+        self.assertIsNone(runtime._restore_lease_index().get("target"))
+
+    def test_allocator_backed_reservations_include_funding_and_lease_slots(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime._restore_funding_allocations = {
+            "request-a": [[1, 2, 3], [4, 5]],
+        }
+        runtime._restore_lease_allocations = {
+            "request-b": [[6, 7, 8, 9]],
+        }
+
+        self.assertEqual(runtime.allocator_backed_reservation_tokens(), 9)
+
+    def test_full_restore_lease_table_does_not_churn_funding_capacity(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = BeliefKVConfig(
+            kv_bytes_per_token=10,
+            restore_lease_enabled=True,
+            restore_lease_max_active=1,
+        )
+        runtime.audit = _AuditRecorder()
+        allocator = _Allocator(100)
+        runtime.scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator,
+        )
+        obligations = runtime._restore_obligation_index()
+        first = obligations.create(
+            request_id="first",
+            workflow_id="wf-first",
+            invocation_id="inv-first",
+            context_id="ctx-first",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction-first",
+            source_joint_plan_id="joint-first",
+            created_ts_ms=1.0,
+            path_extent_ids=(),
+        )
+        second = obligations.create(
+            request_id="second",
+            workflow_id="wf-second",
+            invocation_id="inv-second",
+            context_id="ctx-second",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction-second",
+            source_joint_plan_id="joint-second",
+            created_ts_ms=2.0,
+            path_extent_ids=(),
+        )
+        runtime._restore_lease_index().grant(
+            obligation=first,
+            granted_ts_ms=3.0,
+            reserved_tokens=1,
+            reserved_bytes=10,
+            h2d_bytes=0,
+        )
+        funding = allocator.alloc(12)
+        self.assertIsNotNone(funding)
+        runtime._set_restore_funding_reservation(second, [funding])
+        available_before = allocator.available_tokens
+
+        lease = runtime._grant_restore_lease(
+            second,
+            h2d_bytes=0,
+            now_ms=4.0,
+        )
+
+        self.assertIsNone(lease)
+        self.assertEqual(allocator.available_tokens, available_before)
+        self.assertEqual(runtime._restore_funding_reserved_tokens("second"), 12)
+        self.assertFalse(
+            any(
+                event == "restore_funding_capacity_released"
+                for event, _, _ in runtime.audit.events
+            )
+        )
+
+    def test_restore_prefix_pin_waits_for_host_only_h2d(self):
+        config = BeliefKVConfig(kv_bytes_per_token=10)
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.tree_cache = _TreeCache()
+        runtime.audit = _AuditRecorder()
+        runtime._restore_obligation_counts = Counter()
+        runtime._restore_lease_pins = {}
+        obligation = runtime._restore_obligation_index().create(
+            request_id="request",
+            workflow_id="wf",
+            invocation_id="inv",
+            context_id="ctx",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction-1",
+            source_joint_plan_id="joint-1",
+            created_ts_ms=1.0,
+            path_extent_ids=("page:1:0",),
+        )
+        runtime._restore_lease_index().grant(
+            obligation=obligation,
+            granted_ts_ms=2.0,
+            reserved_tokens=4,
+            reserved_bytes=40,
+            h2d_bytes=40,
+        )
+        node = _Node(1)
+        node.parent = runtime.tree_cache.root_node
+        node.host_value = [10, 11, 12, 13]
+        node.value = None
+        request = SimpleNamespace(rid="request", last_node=node)
+
+        self.assertTrue(
+            runtime._pin_restore_lease_prefix(
+                obligation,
+                request,
+                now_ms=3.0,
+                allow_unmaterialized=True,
+            )
+        )
+        self.assertNotIn("request", runtime._restore_lease_pins)
+        self.assertFalse(
+            runtime._pin_restore_lease_prefix(
+                obligation,
+                request,
+                now_ms=4.0,
+            )
+        )
+
+        node.value = [1, 2, 3, 4]
+        self.assertTrue(
+            runtime._pin_restore_lease_prefix(
+                obligation,
+                request,
+                now_ms=5.0,
+            )
+        )
+        self.assertIn("request", runtime._restore_lease_pins)
+        self.assertEqual(node.lock_ref, 1)
+
+    def test_blocked_restore_head_does_not_starve_later_obligation(self):
+        config = BeliefKVConfig(
+            kv_bytes_per_token=10,
+            restore_obligation_max_active=2,
+            restore_lease_enabled=True,
+        )
+        controller = BeliefKVController(config)
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.controller = controller
+        runtime.audit = _AuditRecorder()
+        runtime._request_metadata_by_id = {}
+        obligations = runtime._restore_obligation_index()
+        head = obligations.create(
+            request_id="head",
+            workflow_id="wf-head",
+            invocation_id="inv-head",
+            context_id="ctx-head",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction-head",
+            source_joint_plan_id="joint-head",
+            created_ts_ms=1.0,
+            path_extent_ids=(),
+        )
+        tail = obligations.create(
+            request_id="tail",
+            workflow_id="wf-tail",
+            invocation_id="inv-tail",
+            context_id="ctx-tail",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction-tail",
+            source_joint_plan_id="joint-tail",
+            created_ts_ms=2.0,
+            path_extent_ids=(),
+        )
+        for obligation in (head, tail):
+            obligation.source_transaction_terminal = True
+            obligation.requeued = True
+        runtime._refresh_restore_obligation = (
+            lambda obligation, **_kwargs: (
+                SimpleNamespace(rid=obligation.request_id),
+                (),
+            )
+        )
+        runtime._restore_attempt_stamp = lambda: (1, 1, 0, 0)
+        tail_lease = SimpleNamespace(mark_restored=lambda: None)
+        runtime._grant_restore_lease = (
+            lambda obligation, **_kwargs: (
+                None if obligation.request_id == "head" else tail_lease
+            )
+        )
+        funding_attempts = []
+        runtime._try_queue_restore_lease_funding = (
+            lambda obligation, **_kwargs: (
+                funding_attempts.append(obligation.request_id) or False,
+                ("restore_lease_capacity", "no_funding_bundle"),
+            )
+        )
+        runtime._pin_restore_lease_prefix = lambda *_args, **_kwargs: True
+        runtime._sync_visible_gate_state = lambda *_args, **_kwargs: None
+
+        runtime._drive_restore_obligations(now_ms=1000.0)
+
+        self.assertEqual(head.state, RestoreObligationState.PARKED_WAIT)
+        self.assertEqual(
+            head.blocker_codes,
+            ("no_funding_bundle", "restore_lease_capacity"),
+        )
+        self.assertEqual(tail.state, RestoreObligationState.TICKET_READY)
+        self.assertEqual(funding_attempts, ["head"])
+        self.assertTrue(
+            any(
+                event == "restore_obligation_ticket_ready"
+                and fields["request_id"] == "tail"
+                for event, _, fields in runtime.audit.events
+            )
+        )
+
+        runtime._drive_restore_obligations(now_ms=1001.0)
+
+        self.assertEqual(funding_attempts, ["head"])
+
+    def test_ordinary_waiting_cpu_prefix_creates_and_drives_restore(self):
+        config = BeliefKVConfig(
+            hbm_capacity_bytes=2000,
+            host_capacity_bytes=4000,
+            reserve_hbm_bytes=100,
+            kv_bytes_per_token=10,
+            observed_admission_scheduling_enabled=True,
+        )
+        controller = BeliefKVController(config)
+        controller.process_runtime_events(
+            (
+                RuntimeEvent("start", 1.0, RuntimeEventKind.WORKFLOW_START, "wf"),
+                RuntimeEvent(
+                    "create",
+                    2.0,
+                    RuntimeEventKind.INVOCATION_CREATE,
+                    "wf",
+                    invocation_id="inv",
+                    context_id="ctx",
+                    context_epoch=0,
+                ),
+            )
+        )
+        tree_cache = _TreeCache()
+        node = _Node(31)
+        node.parent = tree_cache.root_node
+        registry = SGLangNodeRegistry()
+        handle = registry.register(node)
+        controller.page_index.register_page(
+            handle,
+            size_bytes=200,
+            residency=PhysicalResidency.CPU_ONLY,
+            radix_depth=1,
+        )
+        controller.page_index.bind_pages("ctx", 0, (handle,))
+        metadata = BeliefKVRequestMetadata("wf", "inv", "ctx", 0)
+        request = SimpleNamespace(
+            rid="waiting",
+            beliefkv_metadata=metadata,
+            origin_input_ids=(1, 2),
+            output_ids=(),
+            prefix_indices=(),
+            sampling_params=SimpleNamespace(max_new_tokens=8),
+            last_node=node,
+            init_next_round_input=lambda _cache: None,
+        )
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.controller = controller
+        runtime.scheduler = SimpleNamespace(
+            waiting_queue=[request],
+            token_to_kv_pool_allocator=_Allocator(100),
+        )
+        runtime.tree_cache = tree_cache
+        runtime.registry = registry
+        runtime.audit = _AuditRecorder()
+        runtime._now_ms = lambda: 1000.0
+        runtime._request_metadata_by_id = {"waiting": metadata}
+        runtime._request_submitted_ts_by_id = {"waiting": 10.0}
+        runtime._retraction_cooldown_until_by_request = {}
+        runtime._pending_h2d_contexts = set()
+        controller.register_visible_request(
+            AdmissionRequest(
+                "waiting", "wf", "inv", "ctx", 0, 10.0, 1, 1, 10
+            )
+        )
+
+        runtime._sync_visible_gate_state("waiting", metadata, req=request)
+
+        obligation = runtime._restore_obligation_index().get("waiting")
+        self.assertIsNotNone(obligation)
+        self.assertEqual(
+            obligation.cause,
+            RestoreObligationCause.ORDINARY_WAITING_PREFIX,
+        )
+        self.assertTrue(obligation.source_transaction_terminal)
+        self.assertTrue(obligation.requeued)
+        self.assertEqual(
+            controller.visible_admission.get("waiting").state,
+            AdmissionSideState.WAIT_RESTORE,
+        )
+
+        runtime._drive_restore_obligations(now_ms=1001.0)
+        restore = controller.command_queue.pop()
+        self.assertIsNotNone(restore, runtime.audit.events)
+        self.assertEqual(restore.kind, CommandKind.PREFETCH_CONTEXT)
+        self.assertEqual(restore.context_id, "ctx")
+        self.assertEqual(
+            restore.metadata["joint_plan_id"],
+            "joint-restore-liveness:waiting:0",
+        )
+
+        controller._queued_by_context.pop("ctx", None)
+        controller.page_index.begin_transfer(handle, TransferDirection.H2D)
+        controller.page_index.complete_transfer(handle, TransferDirection.H2D)
+        runtime._advance_restore_obligations(
+            (
+                CommandAck(
+                    restore.command_id,
+                    CommandStatus.COMPLETED,
+                    1002.0,
+                    actual_bytes=200,
+                    page_handles=(handle,),
+                ),
+            ),
+            now_ms=1002.0,
+        )
+        runtime._drive_restore_obligations(now_ms=1002.1)
+        runtime._sync_visible_gate_state("waiting", metadata, req=request)
+
+        self.assertEqual(obligation.state, RestoreObligationState.TICKET_READY)
+        entry = controller.visible_admission.get("waiting")
+        self.assertEqual(entry.state, AdmissionSideState.VISIBLE_PENDING)
+        self.assertEqual(
+            runtime._restore_ready_ticket_priority({"waiting": entry}),
+            ("waiting",),
+        )
+
+    def test_ordinary_restore_rebinds_current_request_path(self):
+        config = BeliefKVConfig(
+            hbm_capacity_bytes=2000,
+            host_capacity_bytes=4000,
+            reserve_hbm_bytes=100,
+            kv_bytes_per_token=10,
+            observed_admission_scheduling_enabled=True,
+        )
+        controller = BeliefKVController(config)
+        controller.process_runtime_events(
+            (
+                RuntimeEvent("start", 1.0, RuntimeEventKind.WORKFLOW_START, "wf"),
+                RuntimeEvent(
+                    "create",
+                    2.0,
+                    RuntimeEventKind.INVOCATION_CREATE,
+                    "wf",
+                    invocation_id="inv",
+                    context_id="ctx",
+                    context_epoch=0,
+                ),
+            )
+        )
+        tree_cache = _TreeCache()
+        stale_node = _Node(31)
+        stale_node.parent = tree_cache.root_node
+        current_node = _Node(32)
+        current_node.parent = tree_cache.root_node
+        registry = SGLangNodeRegistry()
+        stale_handle = registry.register(stale_node)
+        current_handle = registry.register(current_node)
+        for handle in (stale_handle, current_handle):
+            controller.page_index.register_page(
+                handle,
+                size_bytes=200,
+                residency=PhysicalResidency.CPU_ONLY,
+                radix_depth=1,
+            )
+        controller.page_index.bind_pages("ctx", 0, (stale_handle,))
+        metadata = BeliefKVRequestMetadata("wf", "inv", "ctx", 0)
+        request = SimpleNamespace(
+            rid="waiting",
+            beliefkv_metadata=metadata,
+            origin_input_ids=(1, 2),
+            output_ids=(),
+            prefix_indices=(),
+            sampling_params=SimpleNamespace(max_new_tokens=8),
+            last_node=current_node,
+            init_next_round_input=lambda _cache: None,
+        )
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.controller = controller
+        runtime.scheduler = SimpleNamespace(
+            waiting_queue=[request],
+            token_to_kv_pool_allocator=_Allocator(100),
+        )
+        runtime.tree_cache = tree_cache
+        runtime.registry = registry
+        runtime.audit = _AuditRecorder()
+        runtime._now_ms = lambda: 1000.0
+        runtime._request_metadata_by_id = {"waiting": metadata}
+        runtime._request_submitted_ts_by_id = {"waiting": 10.0}
+        runtime._retraction_cooldown_until_by_request = {}
+        runtime._pending_h2d_contexts = set()
+        controller.register_visible_request(
+            AdmissionRequest(
+                "waiting", "wf", "inv", "ctx", 0, 10.0, 1, 1, 10
+            )
+        )
+
+        runtime._sync_visible_gate_state("waiting", metadata, req=request)
+        runtime._drive_restore_obligations(now_ms=1001.0)
+
+        owned_handles = {
+            page.handle for page in controller.page_index.context_pages("ctx")
+        }
+        self.assertEqual(owned_handles, {current_handle})
+        self.assertNotIn(
+            "ctx", controller.page_index.pages[stale_handle].owner_contexts
+        )
+        restore = controller.command_queue.pop()
+        self.assertIsNotNone(restore, runtime.audit.events)
+        self.assertEqual(
+            restore.physical_bundle.page_actions[0].handle,
+            current_handle,
+        )
+        self.assertTrue(
+            any(
+                event == "restore_obligation_path_rebound"
+                for event, _, _ in runtime.audit.events
+            )
+        )
+
+    def test_ordinary_restore_uses_native_fallback_when_preview_is_missing(self):
+        config = BeliefKVConfig(
+            hbm_capacity_bytes=2000,
+            host_capacity_bytes=4000,
+            reserve_hbm_bytes=100,
+            kv_bytes_per_token=10,
+            observed_admission_scheduling_enabled=True,
+        )
+        controller = BeliefKVController(config)
+        controller.process_runtime_events(
+            (
+                RuntimeEvent("start", 1.0, RuntimeEventKind.WORKFLOW_START, "wf"),
+                RuntimeEvent(
+                    "create",
+                    2.0,
+                    RuntimeEventKind.INVOCATION_CREATE,
+                    "wf",
+                    invocation_id="inv",
+                    context_id="ctx",
+                    context_epoch=0,
+                ),
+            )
+        )
+        tree_cache = _TreeCache()
+        node = _Node(31)
+        node.parent = tree_cache.root_node
+        registry = SGLangNodeRegistry()
+        handle = registry.register(node)
+        controller.page_index.register_page(
+            handle,
+            size_bytes=200,
+            residency=PhysicalResidency.CPU_ONLY,
+            radix_depth=1,
+        )
+        controller.page_index.bind_pages("ctx", 0, (handle,))
+        controller.arbiter.bundle_builder = SimpleNamespace(
+            previews_for_context=lambda *_args, **_kwargs: ()
+        )
+        metadata = BeliefKVRequestMetadata("wf", "inv", "ctx", 0)
+        request = SimpleNamespace(
+            rid="waiting",
+            beliefkv_metadata=metadata,
+            origin_input_ids=(1, 2),
+            output_ids=(),
+            prefix_indices=(),
+            sampling_params=SimpleNamespace(max_new_tokens=8),
+            last_node=node,
+            init_next_round_input=lambda _cache: None,
+        )
+        allocator = _Allocator(100)
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.controller = controller
+        runtime.scheduler = SimpleNamespace(
+            waiting_queue=[request],
+            token_to_kv_pool_allocator=allocator,
+        )
+        runtime.tree_cache = tree_cache
+        runtime.registry = registry
+        runtime.audit = _AuditRecorder()
+        runtime._now_ms = lambda: 1000.0
+        runtime._request_metadata_by_id = {"waiting": metadata}
+        runtime._request_submitted_ts_by_id = {"waiting": 10.0}
+        runtime._retraction_cooldown_until_by_request = {}
+        runtime._pending_h2d_contexts = set()
+        controller.register_visible_request(
+            AdmissionRequest(
+                "waiting", "wf", "inv", "ctx", 0, 10.0, 1, 1, 10
+            )
+        )
+
+        runtime._sync_visible_gate_state("waiting", metadata, req=request)
+        runtime._drive_restore_obligations(now_ms=1001.0)
+
+        obligation = runtime._restore_obligation_index().get("waiting")
+        lease = runtime._restore_lease_index().get("waiting")
+        self.assertTrue(obligation.native_admission_fallback)
+        self.assertEqual(obligation.state, RestoreObligationState.TICKET_READY)
+        self.assertEqual(lease.state, RestoreLeaseState.RESTORED_RESERVED)
+        self.assertIsNone(controller.command_queue.pop())
+        self.assertEqual(
+            controller.visible_admission.get("waiting").state,
+            AdmissionSideState.VISIBLE_PENDING,
+        )
+
+        runtime._sync_visible_gate_state("waiting", metadata, req=request)
+        self.assertEqual(
+            controller.visible_admission.get("waiting").state,
+            AdmissionSideState.VISIBLE_PENDING,
+        )
+        self.assertTrue(
+            runtime._begin_restore_lease_admission(obligation, now_ms=1002.0)
+        )
+        runtime._reject_restore_lease_admission(
+            obligation,
+            now_ms=1002.1,
+            native_result="NO_TOKEN",
+        )
+        self.assertEqual(lease.state, RestoreLeaseState.RESTORED_RESERVED)
+        self.assertTrue(
+            any(
+                event == "restore_obligation_native_fallback_ready"
+                for event, _, _ in runtime.audit.events
+            )
+        )
+        fallback_event = next(
+            fields
+            for event, _, fields in runtime.audit.events
+            if event == "restore_obligation_native_fallback_ready"
+        )
+        self.assertEqual(fallback_event["required_extent_count"], 1)
+        self.assertEqual(fallback_event["restore_bytes"], 200)
+
+    def test_ticket_ready_restore_debt_preempts_stale_joint_order(self):
+        config = BeliefKVConfig(
+            hbm_capacity_bytes=1000,
+            reserve_hbm_bytes=0,
+            kv_bytes_per_token=10,
+            joint_policy_enabled=True,
+            restore_lease_enabled=False,
+        )
+        controller = BeliefKVController(config)
+        for suffix in ("old", "new"):
+            controller.process_runtime_events(
+                (
+                    RuntimeEvent(
+                        f"start-{suffix}",
+                        1.0,
+                        RuntimeEventKind.WORKFLOW_START,
+                        f"wf-{suffix}",
+                    ),
+                    RuntimeEvent(
+                        f"create-{suffix}",
+                        2.0,
+                        RuntimeEventKind.INVOCATION_CREATE,
+                        f"wf-{suffix}",
+                        invocation_id=f"inv-{suffix}",
+                        context_id=f"ctx-{suffix}",
+                        context_epoch=0,
+                    ),
+                )
+            )
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.controller = controller
+        runtime.audit = _AuditRecorder()
+        runtime._now_ms = lambda: 100.0
+        runtime._admission_epoch = 0
+        runtime._current_ticket_epoch = None
+        runtime._current_tickets_by_request = {}
+        runtime._ticket_attempted_request_ids = set()
+        runtime._ticket_selected_request_ids = set()
+        runtime._ticket_skip_audit = set()
+        runtime._ticket_selection_details = {}
+        runtime._ticket_native_rejections = {}
+        runtime._pending_h2d_contexts = set()
+        runtime._request_metadata_by_id = {}
+        runtime._request_submitted_ts_by_id = {}
+        runtime._current_online_joint_decision = None
+        runtime._online_joint_result = None
+        runtime._current_joint_plan_epoch = None
+        runtime._online_joint_counts = Counter()
+        runtime._online_joint_epoch_sequence = 0
+        runtime._restore_obligations = RestoreObligationIndex(max_active=2)
+        obligation = runtime._restore_obligations.create(
+            request_id="oldest",
+            workflow_id="wf-old",
+            invocation_id="inv-old",
+            context_id="ctx-old",
+            context_epoch=0,
+            source_retraction_transaction_id="ordinary-waiting:oldest",
+            source_joint_plan_id="joint-old",
+            created_ts_ms=1.0,
+            path_extent_ids=("page:1:0",),
+            cause=RestoreObligationCause.ORDINARY_WAITING_PREFIX,
+        )
+        obligation.source_transaction_terminal = True
+        obligation.requeued = True
+        obligation.mark_ticket_ready(now_ms=2.0)
+        requests = []
+        for request_id, suffix, submitted_ts_ms in (
+            ("oldest", "old", 1.0),
+            ("newer", "new", 2.0),
+        ):
+            metadata = BeliefKVRequestMetadata(
+                f"wf-{suffix}", f"inv-{suffix}", f"ctx-{suffix}", 0
+            )
+            request = SimpleNamespace(
+                rid=request_id,
+                beliefkv_metadata=metadata,
+                origin_input_ids=(1,),
+                prefix_indices=(),
+                last_node=None,
+            )
+            requests.append(request)
+            runtime._request_metadata_by_id[request_id] = metadata
+            runtime._request_submitted_ts_by_id[request_id] = submitted_ts_ms
+            controller.register_visible_request(
+                AdmissionRequest(
+                    request_id,
+                    f"wf-{suffix}",
+                    f"inv-{suffix}",
+                    f"ctx-{suffix}",
+                    0,
+                    submitted_ts_ms,
+                    1,
+                    1,
+                    10,
+                )
+            )
+        stale_view = OnlineJointPlanView(
+            plan_id="stale-plan",
+            ordered_request_ids=("newer",),
+            immediate_request_ids=("newer",),
+            restore_requirements=(),
+            deferred_request_ids=("oldest",),
+            residency_intent_indices=(),
+        )
+        runtime._online_joint_admission_decision = lambda **_kwargs: (
+            OnlineJointPlanDecision(stale_view, "applicable")
+        )
+
+        runtime.begin_prefill_epoch(
+            requests,
+            SimpleNamespace(
+                rem_input_tokens=10,
+                rem_chunk_tokens=None,
+                rem_total_tokens=100,
+            ),
+            max_requests=2,
+        )
+
+        self.assertEqual(
+            [
+                ticket.request_id
+                for ticket in runtime._current_ticket_epoch.tickets
+            ],
+            ["oldest", "newer"],
+        )
+        self.assertIn(
+            "restore_liveness", runtime._current_ticket_epoch.source
+        )
+        self.assertNotEqual(
+            runtime._current_online_joint_view.plan_id, "stale-plan"
+        )
+        self.assertEqual(
+            runtime._current_online_joint_view.immediate_request_ids,
+            ("oldest", "newer"),
+        )
+
     def test_batch_time_is_charged_proportionally_to_root_workflows(self):
         runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
         runtime.controller = BeliefKVController()
@@ -3125,6 +5441,31 @@ class SGLangContractTest(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertFalse(payload["compatible"])
         self.assertNotIn("ModuleNotFoundError", result.stderr)
+
+    def test_idle_memory_check_accounts_for_beliefkv_allocator_reservations(self):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        scheduler = object.__new__(Scheduler)
+        scheduler.is_hybrid = False
+        scheduler.max_total_num_tokens = 100
+        scheduler.enable_hierarchical_cache = True
+        scheduler.tree_cache = SimpleNamespace(protected_size=lambda: 0)
+        scheduler._get_token_info = lambda: (20, 0.2, 10, 70)
+        scheduler.beliefkv_runtime = SimpleNamespace(
+            allocator_backed_reservation_tokens=lambda: 20
+        )
+        scheduler.disaggregation_mode = None
+        scheduler.req_to_token_pool = SimpleNamespace(size=1, free_slots=[0])
+        scheduler.enable_metrics = False
+        scheduler._publish_kv_events = lambda: None
+
+        Scheduler.check_memory(scheduler)
+
+        scheduler.beliefkv_runtime = SimpleNamespace(
+            allocator_backed_reservation_tokens=lambda: 19
+        )
+        with self.assertRaisesRegex(ValueError, "memory leak detected"):
+            Scheduler.check_memory(scheduler)
 
 
 if __name__ == "__main__":

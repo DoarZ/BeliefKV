@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Mapping
+from typing import Iterable, Mapping
 
 from beliefkv.core.events import RuntimeEvent, RuntimeEventKind
 
@@ -166,6 +166,134 @@ class ActionFrontierAuditEvent:
     fields: Mapping[str, object]
 
 
+@dataclass(frozen=True)
+class ActionFrontierCoverage:
+    """P6.0 identifiability report computed before training any hazard model."""
+
+    call_count: int
+    action_call_count: int
+    exact_boundary_call_count: int
+    runtime_only_boundary_call_count: int
+    unknown_call_count: int
+    malformed_call_count: int
+    reentry_eligible_call_count: int
+    reentry_observed_count: int
+    demand_label_count: int
+
+    def __post_init__(self) -> None:
+        if min(
+            self.call_count,
+            self.action_call_count,
+            self.exact_boundary_call_count,
+            self.runtime_only_boundary_call_count,
+            self.unknown_call_count,
+            self.malformed_call_count,
+            self.reentry_eligible_call_count,
+            self.reentry_observed_count,
+            self.demand_label_count,
+        ) < 0:
+            raise ValueError("action-frontier coverage counts must be non-negative")
+        if self.action_call_count > self.call_count:
+            raise ValueError("action call count cannot exceed all calls")
+
+    @property
+    def exact_boundary_call_coverage(self) -> float:
+        if self.action_call_count == 0:
+            return 0.0
+        return self.exact_boundary_call_count / self.action_call_count
+
+    @property
+    def exact_boundary_decode_time_coverage(self) -> None:
+        """Remain unavailable until native per-token service time is recorded."""
+
+        return None
+
+    @property
+    def reentry_cause_coverage(self) -> float:
+        return (
+            self.reentry_observed_count / self.reentry_eligible_call_count
+            if self.reentry_eligible_call_count
+            else 0.0
+        )
+
+    @property
+    def demand_label_completeness(self) -> float:
+        return self.demand_label_count / self.call_count if self.call_count else 0.0
+
+    def to_dict(self) -> dict[str, int | float | None]:
+        return {
+            "call_count": self.call_count,
+            "action_call_count": self.action_call_count,
+            "exact_boundary_call_count": self.exact_boundary_call_count,
+            "runtime_only_boundary_call_count": (
+                self.runtime_only_boundary_call_count
+            ),
+            "unknown_call_count": self.unknown_call_count,
+            "malformed_call_count": self.malformed_call_count,
+            "reentry_eligible_call_count": self.reentry_eligible_call_count,
+            "reentry_observed_count": self.reentry_observed_count,
+            "demand_label_count": self.demand_label_count,
+            "exact_boundary_call_coverage": self.exact_boundary_call_coverage,
+            "exact_boundary_decode_time_coverage": (
+                self.exact_boundary_decode_time_coverage
+            ),
+            "reentry_cause_coverage": self.reentry_cause_coverage,
+            "demand_label_completeness": self.demand_label_completeness,
+        }
+
+
+def characterize_action_frontier_coverage(
+    snapshots: Iterable[ActionFrontierSnapshot],
+) -> ActionFrontierCoverage:
+    values = tuple(snapshots)
+    action_calls = tuple(
+        item
+        for item in values
+        if item.action_event_kind is not None
+        or item.action_kind != StructuredActionKind.UNKNOWN
+    )
+    exact = sum(
+        item.boundary_token_index is not None
+        and item.boundary_source == "native_incremental_parser"
+        for item in action_calls
+    )
+    runtime_only = sum(
+        item.parser_status == ParserStatus.VALID
+        and item.boundary_token_index is None
+        for item in action_calls
+    )
+    reentry_eligible = tuple(
+        item
+        for item in action_calls
+        if item.action_kind
+        in {
+            StructuredActionKind.FUNCTION_CALL,
+            StructuredActionKind.SPAWN,
+            StructuredActionKind.HANDOFF,
+        }
+    )
+    return ActionFrontierCoverage(
+        call_count=len(values),
+        action_call_count=len(action_calls),
+        exact_boundary_call_count=exact,
+        runtime_only_boundary_call_count=runtime_only,
+        unknown_call_count=sum(
+            item.parser_status == ParserStatus.UNKNOWN for item in values
+        ),
+        malformed_call_count=sum(
+            item.parser_status == ParserStatus.INVALID for item in values
+        ),
+        reentry_eligible_call_count=len(reentry_eligible),
+        reentry_observed_count=sum(
+            item.reentry_ts_ms is not None for item in reentry_eligible
+        ),
+        demand_label_count=sum(
+            item.generated_tokens > 0 and item.started_ts_ms <= item.updated_ts_ms
+            for item in values
+        ),
+    )
+
+
 class ActionFrontierObserver:
     """Correlate parser validity with subsequent causal/runtime transitions."""
 
@@ -179,12 +307,19 @@ class ActionFrontierObserver:
         RuntimeEventKind.TOOL_END,
         RuntimeEventKind.REACTIVATE,
         RuntimeEventKind.MESSAGE,
+        RuntimeEventKind.JOIN_SATISFIED,
     }
 
     def __init__(self) -> None:
         self._states: dict[str, ActionFrontierSnapshot] = {}
         self._latest_request_by_invocation: dict[str, str] = {}
+        self._join_waiter_by_id: dict[str, str] = {}
         self._events: list[ActionFrontierAuditEvent] = []
+        self._revision = 0
+
+    @property
+    def revision(self) -> int:
+        return self._revision
 
     def begin(
         self,
@@ -229,6 +364,7 @@ class ActionFrontierObserver:
         )
         self._states[request_id] = state
         self._latest_request_by_invocation[invocation_id] = request_id
+        self._revision += 1
         return state
 
     def observe_parser_update(
@@ -278,6 +414,7 @@ class ActionFrontierObserver:
             boundary_source=boundary_source,
         )
         self._states[request_id] = next_state
+        self._revision += 1
         self._events.append(
             ActionFrontierAuditEvent(
                 kind="action_frontier_updated",
@@ -301,10 +438,23 @@ class ActionFrontierObserver:
         runnable_frontier_after: tuple[str, ...] = (),
         context_gpu_bytes: int | None = None,
     ) -> ActionFrontierSnapshot | None:
+        if bool(event.attributes.get("runtime_internal", False)):
+            return None
+        if (
+            event.kind == RuntimeEventKind.JOIN_WAIT
+            and event.join_id
+            and event.invocation_id
+        ):
+            self._join_waiter_by_id[event.join_id] = event.invocation_id
         invocation_id = (
             event.target_invocation_id
             if event.kind == RuntimeEventKind.MESSAGE
-            else event.invocation_id
+            else (
+                self._join_waiter_by_id.get(event.join_id)
+                if event.kind == RuntimeEventKind.JOIN_SATISFIED
+                and event.join_id
+                else event.invocation_id
+            )
         )
         if event.kind == RuntimeEventKind.LLM_SUBMIT and event.invocation_id:
             request_id = str(event.attributes.get("request_id") or event.event_id)
@@ -360,6 +510,7 @@ class ActionFrontierObserver:
                 waiting_kv_bytes_after=context_gpu_bytes,
             )
             self._states[request_id] = next_state
+            self._revision += 1
             return next_state
         if event.kind in self._REENTRY_EVENTS:
             base_ts = state.action_event_ts_ms or state.valid_action_ts_ms
@@ -370,6 +521,7 @@ class ActionFrontierObserver:
                 reentry_delay_ms=(event.ts_ms - base_ts if base_ts is not None else None),
             )
             self._states[request_id] = next_state
+            self._revision += 1
             return next_state
         return state
 
@@ -378,6 +530,9 @@ class ActionFrontierObserver:
 
     def snapshots(self) -> tuple[ActionFrontierSnapshot, ...]:
         return tuple(self._states[key] for key in sorted(self._states))
+
+    def coverage(self) -> ActionFrontierCoverage:
+        return characterize_action_frontier_coverage(self.snapshots())
 
     def drain_audit_events(self) -> tuple[ActionFrontierAuditEvent, ...]:
         events = tuple(self._events)

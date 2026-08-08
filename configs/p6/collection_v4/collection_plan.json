@@ -1,0 +1,1101 @@
+{
+  "batch_count": 21,
+  "batches": [
+    {
+      "batch_id": "p6-001-calibration-mixed-r0",
+      "concurrency": 8,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.astropy_1776_astropy-12907:latest",
+        "swebench/sweb.eval.x86_64.astropy_1776_astropy-13033:latest",
+        "swebench/sweb.eval.x86_64.astropy_1776_astropy-13398:latest",
+        "swebench/sweb.eval.x86_64.astropy_1776_astropy-13579:latest",
+        "swebench/sweb.eval.x86_64.astropy_1776_astropy-14365:latest",
+        "swebench/sweb.eval.x86_64.astropy_1776_astropy-14369:latest",
+        "swebench/sweb.eval.x86_64.astropy_1776_astropy-14598:latest",
+        "swebench/sweb.eval.x86_64.astropy_1776_astropy-14995:latest"
+      ],
+      "instance_ids": [
+        "astropy__astropy-12907",
+        "astropy__astropy-13033",
+        "astropy__astropy-13398",
+        "astropy__astropy-13579",
+        "astropy__astropy-14365",
+        "astropy__astropy-14369",
+        "astropy__astropy-14598",
+        "astropy__astropy-14995"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "astropy/astropy"
+      ],
+      "rollout_index": 0,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/astropy__astropy",
+          "project": "astropy/astropy",
+          "url": "https://github.com/astropy/astropy.git"
+        }
+      ],
+      "split": "calibration",
+      "versions": [
+        "astropy/astropy:4.3",
+        "astropy/astropy:5.0",
+        "astropy/astropy:5.1",
+        "astropy/astropy:5.2"
+      ],
+      "workflow_count": 8,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-001-calibration-mixed-r0.json",
+      "workload_manifest_sha256": "e37f306fb4d4a92c1a93c8d8d3313e8fb2d014ab8b7c02ccd9270a2d2f134c46"
+    },
+    {
+      "batch_id": "p6-002-calibration-mixed-r0",
+      "concurrency": 8,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.astropy_1776_astropy-7606:latest",
+        "swebench/sweb.eval.x86_64.astropy_1776_astropy-7671:latest",
+        "swebench/sweb.eval.x86_64.astropy_1776_astropy-8707:latest",
+        "swebench/sweb.eval.x86_64.astropy_1776_astropy-8872:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-7462:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-7748:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-7757:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-7985:latest"
+      ],
+      "instance_ids": [
+        "astropy__astropy-7606",
+        "astropy__astropy-7671",
+        "astropy__astropy-8707",
+        "astropy__astropy-8872",
+        "sphinx-doc__sphinx-7462",
+        "sphinx-doc__sphinx-7748",
+        "sphinx-doc__sphinx-7757",
+        "sphinx-doc__sphinx-7985"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "astropy/astropy",
+        "sphinx-doc/sphinx"
+      ],
+      "rollout_index": 0,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/astropy__astropy",
+          "project": "astropy/astropy",
+          "url": "https://github.com/astropy/astropy.git"
+        },
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/sphinx-doc__sphinx",
+          "project": "sphinx-doc/sphinx",
+          "url": "https://github.com/sphinx-doc/sphinx.git"
+        }
+      ],
+      "split": "calibration",
+      "versions": [
+        "astropy/astropy:1.3",
+        "astropy/astropy:3.1",
+        "sphinx-doc/sphinx:3.1",
+        "sphinx-doc/sphinx:3.2"
+      ],
+      "workflow_count": 8,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-002-calibration-mixed-r0.json",
+      "workload_manifest_sha256": "a1fb2e9f55bdfb45a4c79b2ee28d98a69df5d23b886d710726dcd9b0452c2799"
+    },
+    {
+      "batch_id": "p6-003-calibration-mixed-r0",
+      "concurrency": 8,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-8035:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-8056:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-8459:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-8548:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-8551:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-8593:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-8595:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-9229:latest"
+      ],
+      "instance_ids": [
+        "sphinx-doc__sphinx-8035",
+        "sphinx-doc__sphinx-8056",
+        "sphinx-doc__sphinx-8459",
+        "sphinx-doc__sphinx-8548",
+        "sphinx-doc__sphinx-8551",
+        "sphinx-doc__sphinx-8593",
+        "sphinx-doc__sphinx-8595",
+        "sphinx-doc__sphinx-9229"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "sphinx-doc/sphinx"
+      ],
+      "rollout_index": 0,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/sphinx-doc__sphinx",
+          "project": "sphinx-doc/sphinx",
+          "url": "https://github.com/sphinx-doc/sphinx.git"
+        }
+      ],
+      "split": "calibration",
+      "versions": [
+        "sphinx-doc/sphinx:3.2",
+        "sphinx-doc/sphinx:3.4",
+        "sphinx-doc/sphinx:3.5",
+        "sphinx-doc/sphinx:4.1"
+      ],
+      "workflow_count": 8,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-003-calibration-mixed-r0.json",
+      "workload_manifest_sha256": "24e09575576b3615bc7d9cf761c18f4fef016057cf1d8f9b819d3078fdde5072"
+    },
+    {
+      "batch_id": "p6-004-calibration-mixed-r0",
+      "concurrency": 4,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-9230:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-9320:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-9658:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-9673:latest"
+      ],
+      "instance_ids": [
+        "sphinx-doc__sphinx-9230",
+        "sphinx-doc__sphinx-9320",
+        "sphinx-doc__sphinx-9658",
+        "sphinx-doc__sphinx-9673"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "sphinx-doc/sphinx"
+      ],
+      "rollout_index": 0,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/sphinx-doc__sphinx",
+          "project": "sphinx-doc/sphinx",
+          "url": "https://github.com/sphinx-doc/sphinx.git"
+        }
+      ],
+      "split": "calibration",
+      "versions": [
+        "sphinx-doc/sphinx:4.1",
+        "sphinx-doc/sphinx:4.3"
+      ],
+      "workflow_count": 4,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-004-calibration-mixed-r0.json",
+      "workload_manifest_sha256": "7d74ea459ea3da37fb4a9ed261fb664e64d10e25e5d56cb19e7191615d515809"
+    },
+    {
+      "batch_id": "p6-005-calibration-mixed-r1",
+      "concurrency": 7,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.astropy_1776_astropy-7606:latest",
+        "swebench/sweb.eval.x86_64.astropy_1776_astropy-8872:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-7748:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-7985:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-9229:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-9230:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-9320:latest"
+      ],
+      "instance_ids": [
+        "astropy__astropy-7606",
+        "astropy__astropy-8872",
+        "sphinx-doc__sphinx-7748",
+        "sphinx-doc__sphinx-7985",
+        "sphinx-doc__sphinx-9229",
+        "sphinx-doc__sphinx-9230",
+        "sphinx-doc__sphinx-9320"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "astropy/astropy",
+        "sphinx-doc/sphinx"
+      ],
+      "rollout_index": 1,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/astropy__astropy",
+          "project": "astropy/astropy",
+          "url": "https://github.com/astropy/astropy.git"
+        },
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/sphinx-doc__sphinx",
+          "project": "sphinx-doc/sphinx",
+          "url": "https://github.com/sphinx-doc/sphinx.git"
+        }
+      ],
+      "split": "calibration",
+      "versions": [
+        "astropy/astropy:1.3",
+        "astropy/astropy:3.1",
+        "sphinx-doc/sphinx:3.1",
+        "sphinx-doc/sphinx:3.2",
+        "sphinx-doc/sphinx:4.1"
+      ],
+      "workflow_count": 7,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-005-calibration-mixed-r1.json",
+      "workload_manifest_sha256": "d82dc4b76e17c73f87dd5738283d51a0ceaa38ecd938d10efc9954e55efb8878"
+    },
+    {
+      "batch_id": "p6-006-calibration-mixed-r2",
+      "concurrency": 7,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.astropy_1776_astropy-7606:latest",
+        "swebench/sweb.eval.x86_64.astropy_1776_astropy-8872:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-7748:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-7985:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-9229:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-9230:latest",
+        "swebench/sweb.eval.x86_64.sphinx-doc_1776_sphinx-9320:latest"
+      ],
+      "instance_ids": [
+        "astropy__astropy-7606",
+        "astropy__astropy-8872",
+        "sphinx-doc__sphinx-7748",
+        "sphinx-doc__sphinx-7985",
+        "sphinx-doc__sphinx-9229",
+        "sphinx-doc__sphinx-9230",
+        "sphinx-doc__sphinx-9320"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "astropy/astropy",
+        "sphinx-doc/sphinx"
+      ],
+      "rollout_index": 2,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/astropy__astropy",
+          "project": "astropy/astropy",
+          "url": "https://github.com/astropy/astropy.git"
+        },
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/sphinx-doc__sphinx",
+          "project": "sphinx-doc/sphinx",
+          "url": "https://github.com/sphinx-doc/sphinx.git"
+        }
+      ],
+      "split": "calibration",
+      "versions": [
+        "astropy/astropy:1.3",
+        "astropy/astropy:3.1",
+        "sphinx-doc/sphinx:3.1",
+        "sphinx-doc/sphinx:3.2",
+        "sphinx-doc/sphinx:4.1"
+      ],
+      "workflow_count": 7,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-006-calibration-mixed-r2.json",
+      "workload_manifest_sha256": "281dcca47c9f3c5e4623a5ce8515491dfb460e262445b5d10da9aab332333b92"
+    },
+    {
+      "batch_id": "p6-007-test_id-mixed-r0",
+      "concurrency": 8,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-13989:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-14623:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-20488:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-20826:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-21568:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-22865:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-22871:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-23299:latest"
+      ],
+      "instance_ids": [
+        "matplotlib__matplotlib-13989",
+        "matplotlib__matplotlib-14623",
+        "matplotlib__matplotlib-20488",
+        "matplotlib__matplotlib-20826",
+        "matplotlib__matplotlib-21568",
+        "matplotlib__matplotlib-22865",
+        "matplotlib__matplotlib-22871",
+        "matplotlib__matplotlib-23299"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "matplotlib/matplotlib"
+      ],
+      "rollout_index": 0,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/matplotlib__matplotlib",
+          "project": "matplotlib/matplotlib",
+          "url": "https://github.com/matplotlib/matplotlib.git"
+        }
+      ],
+      "split": "test_id",
+      "versions": [
+        "matplotlib/matplotlib:3.0",
+        "matplotlib/matplotlib:3.1",
+        "matplotlib/matplotlib:3.4",
+        "matplotlib/matplotlib:3.5"
+      ],
+      "workflow_count": 8,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-007-test_id-mixed-r0.json",
+      "workload_manifest_sha256": "f7b8c8833c3bdb4300d455de0b723ac613cd7a1a2c08d105c0498a2c70c8d271"
+    },
+    {
+      "batch_id": "p6-008-test_id-mixed-r0",
+      "concurrency": 8,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-24026:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-24627:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-24637:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-24870:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-25775:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-25960:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-26342:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-26466:latest"
+      ],
+      "instance_ids": [
+        "matplotlib__matplotlib-24026",
+        "matplotlib__matplotlib-24627",
+        "matplotlib__matplotlib-24637",
+        "matplotlib__matplotlib-24870",
+        "matplotlib__matplotlib-25775",
+        "matplotlib__matplotlib-25960",
+        "matplotlib__matplotlib-26342",
+        "matplotlib__matplotlib-26466"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "matplotlib/matplotlib"
+      ],
+      "rollout_index": 0,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/matplotlib__matplotlib",
+          "project": "matplotlib/matplotlib",
+          "url": "https://github.com/matplotlib/matplotlib.git"
+        }
+      ],
+      "split": "test_id",
+      "versions": [
+        "matplotlib/matplotlib:3.6",
+        "matplotlib/matplotlib:3.7"
+      ],
+      "workflow_count": 8,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-008-test_id-mixed-r0.json",
+      "workload_manifest_sha256": "750a817080a5d06bca49e51eecf4ca60c02e06a552f514b2a75d082e9fd7dd0e"
+    },
+    {
+      "batch_id": "p6-009-test_id-mixed-r0",
+      "concurrency": 8,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-10297:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-10844:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-10908:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-11578:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-12973:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-13124:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-13135:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-13142:latest"
+      ],
+      "instance_ids": [
+        "scikit-learn__scikit-learn-10297",
+        "scikit-learn__scikit-learn-10844",
+        "scikit-learn__scikit-learn-10908",
+        "scikit-learn__scikit-learn-11578",
+        "scikit-learn__scikit-learn-12973",
+        "scikit-learn__scikit-learn-13124",
+        "scikit-learn__scikit-learn-13135",
+        "scikit-learn__scikit-learn-13142"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "scikit-learn/scikit-learn"
+      ],
+      "rollout_index": 0,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/scikit-learn__scikit-learn",
+          "project": "scikit-learn/scikit-learn",
+          "url": "https://github.com/scikit-learn/scikit-learn.git"
+        }
+      ],
+      "split": "test_id",
+      "versions": [
+        "scikit-learn/scikit-learn:0.20",
+        "scikit-learn/scikit-learn:0.21"
+      ],
+      "workflow_count": 8,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-009-test_id-mixed-r0.json",
+      "workload_manifest_sha256": "b46fcf89dbbb6ee0c7602bc4def0428c9954ecb0dbf028f929b227d79039ef94"
+    },
+    {
+      "batch_id": "p6-010-test_id-mixed-r0",
+      "concurrency": 8,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-14053:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-14629:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-14710:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-14894:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-25102:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-25747:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-25931:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-26194:latest"
+      ],
+      "instance_ids": [
+        "scikit-learn__scikit-learn-14053",
+        "scikit-learn__scikit-learn-14629",
+        "scikit-learn__scikit-learn-14710",
+        "scikit-learn__scikit-learn-14894",
+        "scikit-learn__scikit-learn-25102",
+        "scikit-learn__scikit-learn-25747",
+        "scikit-learn__scikit-learn-25931",
+        "scikit-learn__scikit-learn-26194"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "scikit-learn/scikit-learn"
+      ],
+      "rollout_index": 0,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/scikit-learn__scikit-learn",
+          "project": "scikit-learn/scikit-learn",
+          "url": "https://github.com/scikit-learn/scikit-learn.git"
+        }
+      ],
+      "split": "test_id",
+      "versions": [
+        "scikit-learn/scikit-learn:0.22",
+        "scikit-learn/scikit-learn:1.3"
+      ],
+      "workflow_count": 8,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-010-test_id-mixed-r0.json",
+      "workload_manifest_sha256": "fa4325a907cdbdc2d2cb73648106b0e46c6b8a7eb6ad6bf1ade08d9d71281c71"
+    },
+    {
+      "batch_id": "p6-011-test_id-mixed-r1",
+      "concurrency": 7,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-22871:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-24627:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-26342:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-26466:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-10844:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-14710:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-26194:latest"
+      ],
+      "instance_ids": [
+        "matplotlib__matplotlib-22871",
+        "matplotlib__matplotlib-24627",
+        "matplotlib__matplotlib-26342",
+        "matplotlib__matplotlib-26466",
+        "scikit-learn__scikit-learn-10844",
+        "scikit-learn__scikit-learn-14710",
+        "scikit-learn__scikit-learn-26194"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "matplotlib/matplotlib",
+        "scikit-learn/scikit-learn"
+      ],
+      "rollout_index": 1,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/matplotlib__matplotlib",
+          "project": "matplotlib/matplotlib",
+          "url": "https://github.com/matplotlib/matplotlib.git"
+        },
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/scikit-learn__scikit-learn",
+          "project": "scikit-learn/scikit-learn",
+          "url": "https://github.com/scikit-learn/scikit-learn.git"
+        }
+      ],
+      "split": "test_id",
+      "versions": [
+        "matplotlib/matplotlib:3.5",
+        "matplotlib/matplotlib:3.6",
+        "matplotlib/matplotlib:3.7",
+        "scikit-learn/scikit-learn:0.20",
+        "scikit-learn/scikit-learn:0.22",
+        "scikit-learn/scikit-learn:1.3"
+      ],
+      "workflow_count": 7,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-011-test_id-mixed-r1.json",
+      "workload_manifest_sha256": "d63d0e2dfbf9ecc9406c09e7d8fd2352ec8768e6656bfbe3524667ebf8d59f9a"
+    },
+    {
+      "batch_id": "p6-012-test_id-mixed-r2",
+      "concurrency": 7,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-22871:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-24627:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-26342:latest",
+        "swebench/sweb.eval.x86_64.matplotlib_1776_matplotlib-26466:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-10844:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-14710:latest",
+        "swebench/sweb.eval.x86_64.scikit-learn_1776_scikit-learn-26194:latest"
+      ],
+      "instance_ids": [
+        "matplotlib__matplotlib-22871",
+        "matplotlib__matplotlib-24627",
+        "matplotlib__matplotlib-26342",
+        "matplotlib__matplotlib-26466",
+        "scikit-learn__scikit-learn-10844",
+        "scikit-learn__scikit-learn-14710",
+        "scikit-learn__scikit-learn-26194"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "matplotlib/matplotlib",
+        "scikit-learn/scikit-learn"
+      ],
+      "rollout_index": 2,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/matplotlib__matplotlib",
+          "project": "matplotlib/matplotlib",
+          "url": "https://github.com/matplotlib/matplotlib.git"
+        },
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/scikit-learn__scikit-learn",
+          "project": "scikit-learn/scikit-learn",
+          "url": "https://github.com/scikit-learn/scikit-learn.git"
+        }
+      ],
+      "split": "test_id",
+      "versions": [
+        "matplotlib/matplotlib:3.5",
+        "matplotlib/matplotlib:3.6",
+        "matplotlib/matplotlib:3.7",
+        "scikit-learn/scikit-learn:0.20",
+        "scikit-learn/scikit-learn:0.22",
+        "scikit-learn/scikit-learn:1.3"
+      ],
+      "workflow_count": 7,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-012-test_id-mixed-r2.json",
+      "workload_manifest_sha256": "37121326323087d3b00d7aba938bd8e68ccc024639fba3d3c2a5ae69c8599e43"
+    },
+    {
+      "batch_id": "p6-013-train-mixed-r0",
+      "concurrency": 8,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.django_1776_django-10554:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-11138:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-11400:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-11885:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-12708:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-13344:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-13449:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-13837:latest"
+      ],
+      "instance_ids": [
+        "django__django-10554",
+        "django__django-11138",
+        "django__django-11400",
+        "django__django-11885",
+        "django__django-12708",
+        "django__django-13344",
+        "django__django-13449",
+        "django__django-13837"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "django/django"
+      ],
+      "rollout_index": 0,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/django__django",
+          "project": "django/django",
+          "url": "https://github.com/django/django.git"
+        }
+      ],
+      "split": "train",
+      "versions": [
+        "django/django:3.0",
+        "django/django:3.1",
+        "django/django:3.2"
+      ],
+      "workflow_count": 8,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-013-train-mixed-r0.json",
+      "workload_manifest_sha256": "622206891765d989975fe87cc830bc09a41a21f28779e627ec27cc9fd9d2bbd4"
+    },
+    {
+      "batch_id": "p6-014-train-mixed-r0",
+      "concurrency": 8,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.django_1776_django-14007:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-14011:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-14631:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-15128:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-15503:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-15629:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-15957:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-16263:latest"
+      ],
+      "instance_ids": [
+        "django__django-14007",
+        "django__django-14011",
+        "django__django-14631",
+        "django__django-15128",
+        "django__django-15503",
+        "django__django-15629",
+        "django__django-15957",
+        "django__django-16263"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "django/django"
+      ],
+      "rollout_index": 0,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/django__django",
+          "project": "django/django",
+          "url": "https://github.com/django/django.git"
+        }
+      ],
+      "split": "train",
+      "versions": [
+        "django/django:4.0",
+        "django/django:4.1",
+        "django/django:4.2"
+      ],
+      "workflow_count": 8,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-014-train-mixed-r0.json",
+      "workload_manifest_sha256": "090255206eb47f59f3efc0aeaa6012850c1503e039a74c0612db8c6eddb921c0"
+    },
+    {
+      "batch_id": "p6-015-train-mixed-r0",
+      "concurrency": 8,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.mwaskom_1776_seaborn-3187:latest",
+        "swebench/sweb.eval.x86_64.pallets_1776_flask-5014:latest",
+        "swebench/sweb.eval.x86_64.psf_1776_requests-1142:latest",
+        "swebench/sweb.eval.x86_64.psf_1776_requests-1766:latest",
+        "swebench/sweb.eval.x86_64.psf_1776_requests-1921:latest",
+        "swebench/sweb.eval.x86_64.psf_1776_requests-2317:latest",
+        "swebench/sweb.eval.x86_64.psf_1776_requests-5414:latest",
+        "swebench/sweb.eval.x86_64.psf_1776_requests-6028:latest"
+      ],
+      "instance_ids": [
+        "mwaskom__seaborn-3187",
+        "pallets__flask-5014",
+        "psf__requests-1142",
+        "psf__requests-1766",
+        "psf__requests-1921",
+        "psf__requests-2317",
+        "psf__requests-5414",
+        "psf__requests-6028"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "mwaskom/seaborn",
+        "pallets/flask",
+        "psf/requests"
+      ],
+      "rollout_index": 0,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/mwaskom__seaborn",
+          "project": "mwaskom/seaborn",
+          "url": "https://github.com/mwaskom/seaborn.git"
+        },
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pallets__flask",
+          "project": "pallets/flask",
+          "url": "https://github.com/pallets/flask.git"
+        },
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/psf__requests",
+          "project": "psf/requests",
+          "url": "https://github.com/psf/requests.git"
+        }
+      ],
+      "split": "train",
+      "versions": [
+        "mwaskom/seaborn:0.12",
+        "pallets/flask:2.3",
+        "psf/requests:1.1",
+        "psf/requests:2.0",
+        "psf/requests:2.26",
+        "psf/requests:2.27",
+        "psf/requests:2.3",
+        "psf/requests:2.4"
+      ],
+      "workflow_count": 8,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-015-train-mixed-r0.json",
+      "workload_manifest_sha256": "ffc33a856acda3afff7e5265aaaf69ba11c32e1e2265ff8cdc95f1e432cc58dd"
+    },
+    {
+      "batch_id": "p6-016-train-mixed-r0",
+      "concurrency": 8,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-3095:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-3677:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-3993:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-6461:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-6599:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-6721:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-6744:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-6938:latest"
+      ],
+      "instance_ids": [
+        "pydata__xarray-3095",
+        "pydata__xarray-3677",
+        "pydata__xarray-3993",
+        "pydata__xarray-6461",
+        "pydata__xarray-6599",
+        "pydata__xarray-6721",
+        "pydata__xarray-6744",
+        "pydata__xarray-6938"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "pydata/xarray"
+      ],
+      "rollout_index": 0,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pydata__xarray",
+          "project": "pydata/xarray",
+          "url": "https://github.com/pydata/xarray.git"
+        }
+      ],
+      "split": "train",
+      "versions": [
+        "pydata/xarray:0.12",
+        "pydata/xarray:2022.03",
+        "pydata/xarray:2022.06"
+      ],
+      "workflow_count": 8,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-016-train-mixed-r0.json",
+      "workload_manifest_sha256": "851f5ea53568c03346cc8922b4c07b5c959576e74905aaf2030ca49746909dce"
+    },
+    {
+      "batch_id": "p6-017-train-mixed-r0",
+      "concurrency": 8,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-7229:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-7233:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-7393:latest",
+        "swebench/sweb.eval.x86_64.pylint-dev_1776_pylint-4551:latest",
+        "swebench/sweb.eval.x86_64.pylint-dev_1776_pylint-4661:latest",
+        "swebench/sweb.eval.x86_64.pylint-dev_1776_pylint-6386:latest",
+        "swebench/sweb.eval.x86_64.pylint-dev_1776_pylint-7080:latest",
+        "swebench/sweb.eval.x86_64.pylint-dev_1776_pylint-8898:latest"
+      ],
+      "instance_ids": [
+        "pydata__xarray-7229",
+        "pydata__xarray-7233",
+        "pydata__xarray-7393",
+        "pylint-dev__pylint-4551",
+        "pylint-dev__pylint-4661",
+        "pylint-dev__pylint-6386",
+        "pylint-dev__pylint-7080",
+        "pylint-dev__pylint-8898"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "pydata/xarray",
+        "pylint-dev/pylint"
+      ],
+      "rollout_index": 0,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pydata__xarray",
+          "project": "pydata/xarray",
+          "url": "https://github.com/pydata/xarray.git"
+        },
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pylint-dev__pylint",
+          "project": "pylint-dev/pylint",
+          "url": "https://github.com/pylint-dev/pylint.git"
+        }
+      ],
+      "split": "train",
+      "versions": [
+        "pydata/xarray:2022.09",
+        "pylint-dev/pylint:2.10",
+        "pylint-dev/pylint:2.14",
+        "pylint-dev/pylint:2.15",
+        "pylint-dev/pylint:2.9",
+        "pylint-dev/pylint:3.0"
+      ],
+      "workflow_count": 8,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-017-train-mixed-r0.json",
+      "workload_manifest_sha256": "105cbc9a5a8d24a725454fec4bc023350abbf6083b8e13e27fb9ac2e9667286b"
+    },
+    {
+      "batch_id": "p6-018-train-mixed-r0",
+      "concurrency": 8,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-10051:latest",
+        "swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-10356:latest",
+        "swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-5262:latest",
+        "swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-5787:latest",
+        "swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-5840:latest",
+        "swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-6197:latest",
+        "swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-6202:latest",
+        "swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-7236:latest"
+      ],
+      "instance_ids": [
+        "pytest-dev__pytest-10051",
+        "pytest-dev__pytest-10356",
+        "pytest-dev__pytest-5262",
+        "pytest-dev__pytest-5787",
+        "pytest-dev__pytest-5840",
+        "pytest-dev__pytest-6197",
+        "pytest-dev__pytest-6202",
+        "pytest-dev__pytest-7236"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "pytest-dev/pytest"
+      ],
+      "rollout_index": 0,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pytest-dev__pytest",
+          "project": "pytest-dev/pytest",
+          "url": "https://github.com/pytest-dev/pytest.git"
+        }
+      ],
+      "split": "train",
+      "versions": [
+        "pytest-dev/pytest:4.5",
+        "pytest-dev/pytest:5.1",
+        "pytest-dev/pytest:5.2",
+        "pytest-dev/pytest:5.4",
+        "pytest-dev/pytest:7.2"
+      ],
+      "workflow_count": 8,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-018-train-mixed-r0.json",
+      "workload_manifest_sha256": "31bd4c4d2b719fde13f7576ec854db38b7681bd775f1dd37026d10fde685345c"
+    },
+    {
+      "batch_id": "p6-019-train-mixed-r0",
+      "concurrency": 3,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-7324:latest",
+        "swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-7490:latest",
+        "swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-7571:latest"
+      ],
+      "instance_ids": [
+        "pytest-dev__pytest-7324",
+        "pytest-dev__pytest-7490",
+        "pytest-dev__pytest-7571"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "pytest-dev/pytest"
+      ],
+      "rollout_index": 0,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pytest-dev__pytest",
+          "project": "pytest-dev/pytest",
+          "url": "https://github.com/pytest-dev/pytest.git"
+        }
+      ],
+      "split": "train",
+      "versions": [
+        "pytest-dev/pytest:5.4",
+        "pytest-dev/pytest:6.0"
+      ],
+      "workflow_count": 3,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-019-train-mixed-r0.json",
+      "workload_manifest_sha256": "64a7cb5b3176c12b5272ccb474b88daaecdef659ada0134eac8aea7f80c467fb"
+    },
+    {
+      "batch_id": "p6-020-train-mixed-r1",
+      "concurrency": 8,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.django_1776_django-10554:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-11138:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-11885:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-13344:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-13837:latest",
+        "swebench/sweb.eval.x86_64.psf_1776_requests-2317:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-7229:latest",
+        "swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-5262:latest"
+      ],
+      "instance_ids": [
+        "django__django-10554",
+        "django__django-11138",
+        "django__django-11885",
+        "django__django-13344",
+        "django__django-13837",
+        "psf__requests-2317",
+        "pydata__xarray-7229",
+        "pytest-dev__pytest-5262"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "django/django",
+        "psf/requests",
+        "pydata/xarray",
+        "pytest-dev/pytest"
+      ],
+      "rollout_index": 1,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/django__django",
+          "project": "django/django",
+          "url": "https://github.com/django/django.git"
+        },
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/psf__requests",
+          "project": "psf/requests",
+          "url": "https://github.com/psf/requests.git"
+        },
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pydata__xarray",
+          "project": "pydata/xarray",
+          "url": "https://github.com/pydata/xarray.git"
+        },
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pytest-dev__pytest",
+          "project": "pytest-dev/pytest",
+          "url": "https://github.com/pytest-dev/pytest.git"
+        }
+      ],
+      "split": "train",
+      "versions": [
+        "django/django:3.0",
+        "django/django:3.1",
+        "django/django:3.2",
+        "psf/requests:2.4",
+        "pydata/xarray:2022.09",
+        "pytest-dev/pytest:4.5"
+      ],
+      "workflow_count": 8,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-020-train-mixed-r1.json",
+      "workload_manifest_sha256": "d85bc39a1deb59890db75130ddf16714b63ba2d0a7985db0b1e1f0cba4e36e7d"
+    },
+    {
+      "batch_id": "p6-021-train-mixed-r2",
+      "concurrency": 8,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.django_1776_django-10554:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-11138:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-11885:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-13344:latest",
+        "swebench/sweb.eval.x86_64.django_1776_django-13837:latest",
+        "swebench/sweb.eval.x86_64.psf_1776_requests-2317:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-7229:latest",
+        "swebench/sweb.eval.x86_64.pytest-dev_1776_pytest-5262:latest"
+      ],
+      "instance_ids": [
+        "django__django-10554",
+        "django__django-11138",
+        "django__django-11885",
+        "django__django-13344",
+        "django__django-13837",
+        "psf__requests-2317",
+        "pydata__xarray-7229",
+        "pytest-dev__pytest-5262"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "django/django",
+        "psf/requests",
+        "pydata/xarray",
+        "pytest-dev/pytest"
+      ],
+      "rollout_index": 2,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/django__django",
+          "project": "django/django",
+          "url": "https://github.com/django/django.git"
+        },
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/psf__requests",
+          "project": "psf/requests",
+          "url": "https://github.com/psf/requests.git"
+        },
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pydata__xarray",
+          "project": "pydata/xarray",
+          "url": "https://github.com/pydata/xarray.git"
+        },
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pytest-dev__pytest",
+          "project": "pytest-dev/pytest",
+          "url": "https://github.com/pytest-dev/pytest.git"
+        }
+      ],
+      "split": "train",
+      "versions": [
+        "django/django:3.0",
+        "django/django:3.1",
+        "django/django:3.2",
+        "psf/requests:2.4",
+        "pydata/xarray:2022.09",
+        "pytest-dev/pytest:4.5"
+      ],
+      "workflow_count": 8,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-021-train-mixed-r2.json",
+      "workload_manifest_sha256": "0d4c7b15861e6179919fb15db1e4c73c54597f238f8492e3a2f21ae2c4bdacab"
+    }
+  ],
+  "dataset": "princeton-nlp/SWE-bench_Verified",
+  "dataset_revision": "91aa3ed51b709be6457e12d00300a6a596d4c6a3",
+  "frozen": true,
+  "plan_id": "p6-agent-semantics-v1",
+  "predictive_actions_enabled": false,
+  "predictor_enabled": false,
+  "repeat_fraction": 0.2,
+  "repeat_rollouts": 3,
+  "repository_count": 11,
+  "runtime_policy": "frozen_p5_observed",
+  "schema_version": 1,
+  "source_root": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified",
+  "split_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/swebench_verified_split_v1.json",
+  "tasks_per_project_cap": 16,
+  "unique_task_count": 111,
+  "unique_task_counts_by_split": {
+    "calibration": 28,
+    "test_id": 32,
+    "train": 51
+  },
+  "workflow_count": 155,
+  "workflow_counts_by_split": {
+    "calibration": 42,
+    "test_id": 46,
+    "train": 67
+  }
+}

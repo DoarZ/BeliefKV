@@ -13,6 +13,7 @@ class RuntimeEventKind(str, Enum):
     INVOCATION_CREATE = "invocation_create"
     INVOCATION_CANCEL = "invocation_cancel"
     CONTEXT_ADVANCE = "context_advance"
+    CONTEXT_COMPACT = "context_compact"
     CALL = "call"
     SPAWN = "spawn"
     RETURN = "return"
@@ -27,6 +28,7 @@ class RuntimeEventKind(str, Enum):
     TOOL_END = "tool_end"
     LLM_SUBMIT = "llm_submit"
     LLM_RESULT = "llm_result"
+    CALL_CENSORED = "call_censored"
     STRUCTURED_ACTION = "structured_action"
 
 

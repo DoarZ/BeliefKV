@@ -130,7 +130,10 @@ class PredictorTrainingTest(unittest.TestCase):
             artifact = Path(temporary) / "predictor.json"
             predictor.save(artifact, metadata={"dataset": "unit-test"})
             raw = json.loads(artifact.read_text(encoding="utf-8"))
-            self.assertEqual(raw["schema_version"], 1)
+            self.assertEqual(
+                raw["schema_version"],
+                RemainingTimePredictor.ARTIFACT_SCHEMA_VERSION,
+            )
             loaded = RemainingTimePredictor.load(artifact)
             after = loaded.tool_model.predict(
                 context_id="ctx",
