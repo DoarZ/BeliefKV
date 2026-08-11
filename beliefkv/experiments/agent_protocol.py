@@ -570,6 +570,7 @@ class AgentLoopGuardMiddleware(AgentMiddleware[LoopGuardState, Any, Any]):
         return str(state.get("guard_reason", "")) in {
             "graph_step_hard_limit_low",
             "activation_wall_clock_exhausted",
+            "repeated_suppressed_tool_intent",
         }
 
     def _graph_budget(self) -> tuple[int, int, int, int] | None:
@@ -766,7 +767,20 @@ class AgentLoopGuardMiddleware(AgentMiddleware[LoopGuardState, Any, Any]):
         if activation_started_now:
             update["guard_activation_started_monotonic"] = now
 
-        reason = snapshot.reason if self.policy.enforce_semantic_guard else None
+        # A suppressed repeat has already been proven to be the same failed
+        # physical call by ToolCircuitBreakerMiddleware. Unlike heuristic loop
+        # signals, repeating it cannot change the workspace or add evidence, so
+        # keep this safety circuit active even when semantic guards are observe-only.
+        mandatory_safety_reason = (
+            snapshot.reason
+            if snapshot.reason == "repeated_suppressed_tool_intent"
+            else None
+        )
+        reason = (
+            snapshot.reason
+            if self.policy.enforce_semantic_guard
+            else mandatory_safety_reason
+        )
         observed_patterns = set(state.get("guard_observed_patterns", ()))
         if snapshot.reason is not None and snapshot.reason not in observed_patterns:
             self._audit(

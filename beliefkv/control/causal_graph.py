@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from beliefkv.core.events import (
     ContextMode,
@@ -132,6 +132,161 @@ class RuntimeCausalContextGraph:
         self._last_ts_by_workflow: dict[str, float] = {}
         self._graph_version = 0
         self.strict_timestamps = strict_timestamps
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        raw: Mapping[str, object],
+    ) -> "RuntimeCausalContextGraph":
+        """Rebuild a read-only planning graph from ``snapshot()`` output."""
+
+        nested = raw.get("rccg")
+        if isinstance(nested, Mapping):
+            raw = nested
+        graph = cls(strict_timestamps=False)
+        workflows = raw.get("workflows", {})
+        invocations = raw.get("invocations", {})
+        contexts = raw.get("contexts", {})
+        joins = raw.get("joins", {})
+        communication_edges = raw.get("communication_edges", ())
+        if not all(
+            isinstance(item, Mapping)
+            for item in (workflows, invocations, contexts, joins)
+        ) or not isinstance(communication_edges, (list, tuple)):
+            raise ValueError("invalid RCCG snapshot shape")
+
+        for workflow_id, value in workflows.items():
+            if not isinstance(value, Mapping):
+                raise ValueError("invalid workflow snapshot")
+            graph.workflows[str(workflow_id)] = WorkflowRecord(
+                workflow_id=str(workflow_id),
+                start_ts_ms=float(value["start_ts_ms"]),
+                end_ts_ms=(
+                    float(value["end_ts_ms"])
+                    if value.get("end_ts_ms") is not None
+                    else None
+                ),
+                invocation_ids={str(item) for item in value.get("invocation_ids", ())},
+            )
+        for invocation_id, value in invocations.items():
+            if not isinstance(value, Mapping):
+                raise ValueError("invalid invocation snapshot")
+            graph.invocations[str(invocation_id)] = InvocationRecord(
+                workflow_id=str(value["workflow_id"]),
+                invocation_id=str(invocation_id),
+                context_id=str(value["context_id"]),
+                agent_definition_id=str(value["agent_definition_id"]),
+                agent_instance_id=str(value["agent_instance_id"]),
+                state=InvocationState(str(value["state"])),
+                created_ts_ms=float(value["created_ts_ms"]),
+                updated_ts_ms=float(value["updated_ts_ms"]),
+                parent_invocation_id=(
+                    str(value["parent_invocation_id"])
+                    if value.get("parent_invocation_id") is not None
+                    else None
+                ),
+                parent_context_id=(
+                    str(value["parent_context_id"])
+                    if value.get("parent_context_id") is not None
+                    else None
+                ),
+                relation_type=RelationType(str(value.get("relation_type", "root"))),
+                context_mode=ContextMode(str(value.get("context_mode", "fresh"))),
+                execution_mode=ExecutionMode(
+                    str(value.get("execution_mode", "foreground"))
+                ),
+                return_target_id=(
+                    str(value["return_target_id"])
+                    if value.get("return_target_id") is not None
+                    else None
+                ),
+                join_id=(
+                    str(value["join_id"])
+                    if value.get("join_id") is not None
+                    else None
+                ),
+                persistent=bool(value.get("persistent", False)),
+                pending_messages=int(value.get("pending_messages", 0)),
+                child_invocation_ids={
+                    str(item) for item in value.get("children", ())
+                },
+                blocking_child_ids={
+                    str(item) for item in value.get("blocking_children", ())
+                },
+                confidence=EventConfidence(
+                    str(value.get("confidence", "declared_runtime"))
+                ),
+                active_tool_family=(
+                    str(value["active_tool_family"])
+                    if value.get("active_tool_family") is not None
+                    else None
+                ),
+                active_tool_start_ms=(
+                    float(value["active_tool_start_ms"])
+                    if value.get("active_tool_start_ms") is not None
+                    else None
+                ),
+                llm_round=int(value.get("llm_round", 0)),
+            )
+        for context_id, value in contexts.items():
+            if not isinstance(value, Mapping):
+                raise ValueError("invalid context snapshot")
+            graph.contexts[str(context_id)] = ContextRecord(
+                workflow_id=str(value["workflow_id"]),
+                context_id=str(context_id),
+                epoch=int(value["epoch"]),
+                created_ts_ms=float(value["created_ts_ms"]),
+                updated_ts_ms=float(value["updated_ts_ms"]),
+                parent_context_id=(
+                    str(value["parent_context_id"])
+                    if value.get("parent_context_id") is not None
+                    else None
+                ),
+                context_mode=ContextMode(str(value.get("context_mode", "fresh"))),
+                invocation_ids={str(item) for item in value.get("invocation_ids", ())},
+                persistent=bool(value.get("persistent", False)),
+            )
+        for join_id, value in joins.items():
+            if not isinstance(value, Mapping):
+                raise ValueError("invalid join snapshot")
+            members = {str(item) for item in value.get("members", ())}
+            workflow_ids = {
+                graph.invocations[item].workflow_id
+                for item in members
+                if item in graph.invocations
+            }
+            waiters = {str(item) for item in value.get("waiters", ())}
+            workflow_ids.update(
+                graph.invocations[item].workflow_id
+                for item in waiters
+                if item in graph.invocations
+            )
+            if len(workflow_ids) != 1:
+                raise ValueError("join snapshot must resolve to one workflow")
+            graph.joins[str(join_id)] = JoinRecord(
+                workflow_id=next(iter(workflow_ids)),
+                join_id=str(join_id),
+                member_invocation_ids=members,
+                mode=JoinMode(str(value.get("mode", "all"))),
+                waiter_invocation_ids=waiters,
+                completed_member_ids={
+                    str(item) for item in value.get("completed", ())
+                },
+                satisfied=bool(value.get("satisfied", False)),
+            )
+        for value in communication_edges:
+            if not isinstance(value, Mapping):
+                raise ValueError("invalid communication edge snapshot")
+            source = str(value["source_invocation_id"])
+            target = str(value["target_invocation_id"])
+            graph.communication_edges[(source, target)] = CommunicationEdge(
+                source_invocation_id=source,
+                target_invocation_id=target,
+                count=int(value["count"]),
+                last_ts_ms=float(value["last_ts_ms"]),
+            )
+        graph._graph_version = int(raw.get("graph_version", 0))
+        return graph
 
     @property
     def graph_version(self) -> int:

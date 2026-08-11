@@ -1,0 +1,78 @@
+{
+  "arms": {
+    "p5_observed": {
+      "frontier_retraction": false,
+      "predictive_prepare": false
+    },
+    "predictive_joint": {
+      "frontier_retraction": true,
+      "predictive_prepare": true,
+      "predictive_prepare_limit": 1
+    }
+  },
+  "artifacts": {
+    "gpu_service": {
+      "path": "/home/longhao/experiment/BeliefKV/experiments/models/gpu_service_curve_cluster_cal_qwen3coder30b_rtx6000ada_20260804T060824Z.json",
+      "sha256": "fe9aae3706de3df3d634824a3268ea97689cdb3662b10265caa28ce7ee338af7"
+    },
+    "predictor": {
+      "path": "/home/longhao/experiment/BeliefKV/experiments/models/frontier_belief_mvp_v6_calibrated_dev.json",
+      "sha256": "51a50b896ab63668551eeefd876c5ea866470b3c34a0f8a53860d3a91d43e456"
+    },
+    "transfer_service": {
+      "path": "/home/longhao/experiment/BeliefKV/experiments/models/transfer_service_morphology_gpu0_dev_v2.json",
+      "sha256": "0d908fa9774f78b620816ca4a45394bb23d47b73297e87cd6c9bd224efa7db17"
+    }
+  },
+  "frozen": true,
+  "manifest_sha256": "71195babe4753b80f9c4e13d7bd88d7050d7f1c3f72fb30fe3b1a99a3368b318",
+  "p5_base_commit": "d1a04c8d6da28c234d9f07f482b250681bd13d1c",
+  "runtime": {
+    "context_length": 262144,
+    "gpu_index": 0,
+    "gpu_name": "NVIDIA RTX 6000 Ada Generation",
+    "host_cache_gib": 96,
+    "kv_pool_tokens": 163840,
+    "max_running_requests": 16,
+    "model": "/opt/downloaded_models/Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8",
+    "sglang_version": "0.5.2rc1"
+  },
+  "schema_version": 1,
+  "selection_contract": {
+    "adaptive_trace_selection": false,
+    "paired_order": [
+      "A-B",
+      "B-A",
+      "A-B"
+    ],
+    "paired_run_count": 3,
+    "same_tasks_and_arrivals": true
+  },
+  "source_tree": {
+    "file_count": 186,
+    "roots": [
+      "beliefkv",
+      "scripts",
+      "patches"
+    ],
+    "sha256": "879414be04b166393a809fe7ffb4dc426d4d2834db674cf5060da7e3b663a4f0",
+    "suffixes": [
+      ".patch",
+      ".py",
+      ".sh"
+    ]
+  },
+  "workload": {
+    "arrival_schedule": {
+      "interval_ms": 1500,
+      "policy": "fixed_interval"
+    },
+    "concurrency": 8,
+    "fanout_profile": "parallel_analysis_2to3",
+    "manifest": {
+      "path": "/home/longhao/experiment/BeliefKV/configs/p6/decision_relevance_v2/workload_manifest.json",
+      "sha256": "da056e46e85f0e122bc3d5850152f29a0fd2cb9fe7839923f92739fc11b7fd78"
+    },
+    "random_seed": 20260811
+  }
+}

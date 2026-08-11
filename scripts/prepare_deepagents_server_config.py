@@ -58,10 +58,62 @@ def main() -> int:
         "--enable-joint-predictive",
         action="store_true",
         help=(
-            "Make the validated JointPlan consume FrontierBelief predictions "
-            "for within-workflow ordering and residency victim selection. "
-            "Requires --enable-online-joint and --predictor-model."
+            "Deprecated compatibility switch. Predictions are attached as "
+            "metadata only and never change the observed JointPlan."
         ),
+    )
+    parser.add_argument(
+        "--enable-predictive-risk-shadow",
+        action="store_true",
+        help=(
+            "Evaluate A0/PREPARE_HOST/PREFETCH_GPU with the P6 scenario-risk "
+            "planner without dispatching predictive actions."
+        ),
+    )
+    parser.add_argument(
+        "--enable-predictive-joint-overlay",
+        action="store_true",
+        help=(
+            "Allow non-destructive semantic prediction intents to join the "
+            "observed JointPlan and be rematerialized at a scheduler safe point."
+        ),
+    )
+    parser.add_argument(
+        "--enable-predictive-prefetch-canary",
+        action="store_true",
+        help=(
+            "Enable the bounded PREFETCH_GPU canary (one in flight and at most "
+            "5 percent of the configured KV pool)."
+        ),
+    )
+    parser.add_argument(
+        "--predictive-prepare-canary-limit",
+        type=int,
+        default=0,
+        help=(
+            "Maximum PREPARE_HOST commands admitted during this server run; "
+            "zero leaves the normal policy unlimited."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-service-model",
+        type=Path,
+        default=None,
+        help="Calibrated GPUServiceCurveModel used by P6 risk shadow.",
+    )
+    parser.add_argument(
+        "--transfer-service-model",
+        type=Path,
+        default=None,
+        help=(
+            "Persistent PCIe/HiCache service artifact used to warm-start H2D/D2H "
+            "latency before online telemetry has enough samples."
+        ),
+    )
+    parser.add_argument(
+        "--transfer-service-hardware-key",
+        default=None,
+        help="Optional exact hardware/model key required from the transfer artifact.",
     )
     parser.add_argument(
         "--enable-running-retraction",
@@ -72,6 +124,23 @@ def main() -> int:
         "--allow-running-retraction-recompute-drop",
         action="store_true",
         help="Allow P5 residency transactions to drop GPU-only KV for recompute.",
+    )
+    parser.add_argument(
+        "--enable-frontier-retraction-shadow",
+        action="store_true",
+        help=(
+            "Compare observed and FrontierBelief-annotated selective retraction "
+            "without changing the online victim."
+        ),
+    )
+    parser.add_argument(
+        "--frontier-retraction-canary-limit",
+        type=int,
+        default=0,
+        help=(
+            "Maximum retraction transactions whose victim/replacement may be "
+            "changed by frontier annotations; zero keeps the path shadow-only."
+        ),
     )
     parser.add_argument(
         "--enable-restore-micro-gate",
@@ -115,6 +184,11 @@ def main() -> int:
         help="Maximum number of fair workflows eligible for tickets per epoch.",
     )
     parser.add_argument(
+        "--subagent-fanout-profile",
+        choices=("natural", "parallel_analysis_2to3"),
+        default="natural",
+    )
+    parser.add_argument(
         "--disable-policy-shadow",
         action="store_true",
         help="Disable both reference snapshots and P4 JointPlan shadow work.",
@@ -139,12 +213,53 @@ def main() -> int:
         parser.error(
             "--enable-running-retraction requires --enable-observed-admission"
         )
+    if args.frontier_retraction_canary_limit < 0:
+        parser.error("--frontier-retraction-canary-limit must be non-negative")
+    if (
+        args.enable_frontier_retraction_shadow
+        or args.frontier_retraction_canary_limit > 0
+    ) and not (
+        args.enable_running_retraction
+        and args.enable_predictive_risk_shadow
+        and args.predictor_model is not None
+    ):
+        parser.error(
+            "frontier-aware retraction requires --enable-running-retraction, "
+            "--enable-predictive-risk-shadow, and --predictor-model"
+        )
     if args.enable_online_joint and args.disable_policy_shadow:
         parser.error("--enable-online-joint cannot be combined with --disable-policy-shadow")
     if args.enable_joint_predictive and not args.enable_online_joint:
         parser.error("--enable-joint-predictive requires --enable-online-joint")
     if args.enable_joint_predictive and args.predictor_model is None:
         parser.error("--enable-joint-predictive requires --predictor-model")
+    if args.enable_predictive_risk_shadow and args.predictor_model is None:
+        parser.error(
+            "--enable-predictive-risk-shadow requires --predictor-model"
+        )
+    if args.enable_predictive_risk_shadow and args.gpu_service_model is None:
+        parser.error(
+            "--enable-predictive-risk-shadow requires --gpu-service-model"
+        )
+    if args.enable_predictive_risk_shadow and args.disable_policy_shadow:
+        parser.error(
+            "--enable-predictive-risk-shadow cannot use --disable-policy-shadow"
+        )
+    if args.enable_predictive_joint_overlay and not (
+        args.enable_online_joint and args.enable_predictive_risk_shadow
+    ):
+        parser.error(
+            "--enable-predictive-joint-overlay requires --enable-online-joint "
+            "and --enable-predictive-risk-shadow"
+        )
+    if (
+        args.enable_predictive_prefetch_canary
+        and not args.enable_predictive_joint_overlay
+    ):
+        parser.error(
+            "--enable-predictive-prefetch-canary requires "
+            "--enable-predictive-joint-overlay"
+        )
     if args.enable_restore_micro_gate and not (
         args.enable_online_joint
         and args.enable_observed_admission
@@ -211,6 +326,12 @@ def main() -> int:
         "resource_telemetry_interval_ms": 50.0,
         "service_curve_window": 256,
         "service_curve_min_samples": 8,
+        "transfer_service_model_path": (
+            str(args.transfer_service_model.expanduser().resolve())
+            if args.transfer_service_model is not None
+            else None
+        ),
+        "transfer_service_hardware_key": args.transfer_service_hardware_key,
         "queue_service_observer_enabled": args.queue_service_observer,
         "queue_service_observer_include_runtime_batches": (
             args.queue_service_observer
@@ -245,6 +366,30 @@ def main() -> int:
         "joint_policy_shadow_mode": not args.disable_policy_shadow,
         "joint_observed_mode_enabled": not args.disable_policy_shadow,
         "joint_predictive_enabled": args.enable_joint_predictive,
+        "predictive_risk_shadow_enabled": args.enable_predictive_risk_shadow,
+        "predictive_joint_overlay_enabled": args.enable_predictive_joint_overlay,
+        "predictive_prepare_host_enabled": True,
+        "predictive_prepare_host_canary_limit": (
+            args.predictive_prepare_canary_limit
+        ),
+        "predictive_prefetch_canary_enabled": (
+            args.enable_predictive_prefetch_canary
+        ),
+        "predictive_prefetch_canary_max_inflight": 1,
+        "predictive_prefetch_canary_max_hbm_ratio": 0.05,
+        "predictive_prefetch_min_hbm_feasibility": 0.95,
+        "predictive_commit_guard_ms": 25.0,
+        "predictive_prefetch_desired_lead_ms": 100.0,
+        "predictive_intent_max_age_ms": 60_000.0,
+        "gpu_service_model_path": (
+            str(args.gpu_service_model.expanduser().resolve())
+            if args.gpu_service_model is not None
+            else None
+        ),
+        "predictive_risk_particle_count": 128,
+        "predictive_risk_top_k": 8,
+        "predictive_risk_max_candidates": 8,
+        "predictive_risk_min_calibration_coverage": 0.9,
         "observed_admission_scheduling_enabled": (
             args.enable_observed_admission
         ),
@@ -264,6 +409,12 @@ def main() -> int:
         "running_batch_retraction_allow_recompute_drop": (
             args.allow_running_retraction_recompute_drop
         ),
+        "frontier_aware_retraction_shadow_enabled": (
+            args.enable_frontier_retraction_shadow
+        ),
+        "frontier_aware_retraction_canary_limit": (
+            args.frontier_retraction_canary_limit
+        ),
         "restore_obligation_max_active": 8,
         "restore_obligation_escalation_ms": 2000.0,
         "restore_obligation_max_blocked_ms": 30_000.0,
@@ -282,6 +433,7 @@ def main() -> int:
         "restore_micro_gate_min_private_bytes": (
             args.restore_micro_gate_min_private_mib * 1024 * 1024
         ),
+        "workload_subagent_fanout_profile": args.subagent_fanout_profile,
         "fairness_lag_budget_ms": 50.0,
         "residency_hysteresis_ms": 100.0,
         "joint_emergency_hbm_ratio": 0.98,

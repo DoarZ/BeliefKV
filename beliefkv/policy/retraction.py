@@ -20,6 +20,10 @@ class RunningRetractionCandidate:
     workflow_fair_rank: int
     prior_retraction_count: int = 0
     policy_eligible: bool = True
+    frontier_class: str = "unknown"
+    prediction_support: str = "unavailable"
+    service_to_boundary_tokens: float | None = None
+    join_criticality: float = 0.0
 
     def __post_init__(self) -> None:
         if any(
@@ -44,6 +48,19 @@ class RunningRetractionCandidate:
             raise ValueError("retraction candidate counters must be non-negative")
         if not math.isfinite(self.stale_for_ms) or self.stale_for_ms < 0:
             raise ValueError("retraction service age must be non-negative")
+        if self.frontier_class not in {"expand", "close", "hold", "unknown"}:
+            raise ValueError("unsupported retraction frontier class")
+        if self.prediction_support not in {"exact", "backoff", "unavailable"}:
+            raise ValueError("unsupported retraction prediction support")
+        if self.service_to_boundary_tokens is not None and (
+            not math.isfinite(self.service_to_boundary_tokens)
+            or self.service_to_boundary_tokens < 0
+        ):
+            raise ValueError("service-to-boundary demand must be non-negative")
+        if not math.isfinite(self.join_criticality) or not (
+            0.0 <= self.join_criticality <= 1.0
+        ):
+            raise ValueError("join criticality must be in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -66,12 +83,29 @@ class RetractionLockedExtent:
 class RetractionReplacement:
     request_id: str
     estimated_incremental_bytes: int
+    frontier_class: str = "unknown"
+    prediction_support: str = "unavailable"
+    service_to_boundary_tokens: float | None = None
+    join_criticality: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.request_id:
             raise ValueError("replacement request id must be non-empty")
         if self.estimated_incremental_bytes < 0:
             raise ValueError("replacement bytes must be non-negative")
+        if self.frontier_class not in {"expand", "close", "hold", "unknown"}:
+            raise ValueError("unsupported replacement frontier class")
+        if self.prediction_support not in {"exact", "backoff", "unavailable"}:
+            raise ValueError("unsupported replacement prediction support")
+        if self.service_to_boundary_tokens is not None and (
+            not math.isfinite(self.service_to_boundary_tokens)
+            or self.service_to_boundary_tokens < 0
+        ):
+            raise ValueError("replacement service demand must be non-negative")
+        if not math.isfinite(self.join_criticality) or not (
+            0.0 <= self.join_criticality <= 1.0
+        ):
+            raise ValueError("replacement join criticality must be in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -186,6 +220,7 @@ class ObservedRetractionConfig:
     minimum_admission_stall_ms: float = 100.0
     minimum_reclaim_bytes: int = 64 * 1024 * 1024
     maximum_retractions_per_request: int = 3
+    frontier_aware_enabled: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -234,7 +269,8 @@ class ObservedRetractionPlanner:
                 candidate_count=len(snapshot.candidates),
             )
 
-        first_replacement_bytes = snapshot.replacements[0].estimated_incremental_bytes
+        replacements = self._ordered_replacements(snapshot.replacements)
+        first_replacement_bytes = replacements[0].estimated_incremental_bytes
         replacement_deficit = max(
             0,
             first_replacement_bytes - snapshot.native_reclaim_capacity_bytes,
@@ -262,6 +298,7 @@ class ObservedRetractionPlanner:
             and item.service_status == "stale"
             and item.prior_retraction_count
             < self.config.maximum_retractions_per_request
+            and not self._frontier_protected(item)
         }
         max_victims = max(
             0,
@@ -329,7 +366,7 @@ class ObservedRetractionPlanner:
                     for request_id in additions
                 )
                 amplification = marginal / max(1, recompute_bytes)
-                key = (
+                observed_key = (
                     amplification,
                     marginal,
                     causal_rank,
@@ -340,6 +377,18 @@ class ObservedRetractionPlanner:
                     -len(additions),
                     tuple(sorted(additions)),
                 )
+                if self.config.frontier_aware_enabled:
+                    frontier_tier = min(
+                        self._frontier_victim_tier(eligible[request_id])
+                        for request_id in additions
+                    )
+                    boundary_distance = min(
+                        eligible[request_id].service_to_boundary_tokens or 0.0
+                        for request_id in additions
+                    )
+                    key = (frontier_tier, boundary_distance, *observed_key)
+                else:
+                    key = observed_key
                 if best is None or key > best[0]:
                     best = (key, frozenset(additions), reclaim)
             if best is None:
@@ -368,6 +417,11 @@ class ObservedRetractionPlanner:
             sorted(
                 selected,
                 key=lambda request_id: (
+                    *(
+                        (-self._frontier_victim_tier(eligible[request_id]),)
+                        if self.config.frontier_aware_enabled
+                        else ()
+                    ),
                     -eligible[request_id].causal_rank,
                     -eligible[request_id].workflow_fair_rank,
                     -eligible[request_id].stale_for_ms,
@@ -385,7 +439,7 @@ class ObservedRetractionPlanner:
         remaining_capacity = (
             snapshot.native_reclaim_capacity_bytes + current_reclaim
         )
-        for replacement in snapshot.replacements:
+        for replacement in replacements:
             if replacement.estimated_incremental_bytes > remaining_capacity:
                 break
             replacement_ids.append(replacement.request_id)
@@ -405,7 +459,11 @@ class ObservedRetractionPlanner:
             page_revision=snapshot.page_revision,
             topology_revision=snapshot.topology_revision,
             observed_ts_ms=snapshot.observed_ts_ms,
-            reason="observed_lock_closure_reclaim",
+            reason=(
+                "frontier_aware_lock_closure_reclaim"
+                if self.config.frontier_aware_enabled
+                else "observed_lock_closure_reclaim"
+            ),
         )
         return ObservedRetractionDecision(
             plan=plan,
@@ -415,6 +473,51 @@ class ObservedRetractionPlanner:
             eligible_candidate_count=len(eligible),
             fully_attributed_extent_count=len(fully_attributed_extents),
             reclaim_capacity_bytes=current_reclaim,
+        )
+
+    def _frontier_protected(self, item: RunningRetractionCandidate) -> bool:
+        if not self.config.frontier_aware_enabled:
+            return False
+        if item.prediction_support != "exact":
+            return False
+        return item.frontier_class == "expand" or (
+            item.frontier_class == "close" and item.join_criticality > 0.0
+        )
+
+    @staticmethod
+    def _frontier_victim_tier(item: RunningRetractionCandidate) -> int:
+        if item.prediction_support == "unavailable":
+            return 1
+        if item.frontier_class == "hold":
+            return 4
+        if item.frontier_class == "close":
+            return 3 if item.join_criticality == 0.0 else 0
+        if item.frontier_class == "unknown":
+            return 1
+        return 0
+
+    def _ordered_replacements(
+        self,
+        replacements: tuple[RetractionReplacement, ...],
+    ) -> tuple[RetractionReplacement, ...]:
+        if not self.config.frontier_aware_enabled:
+            return replacements
+
+        def priority(item: RetractionReplacement) -> int:
+            if item.prediction_support != "exact":
+                return 2
+            if item.frontier_class == "expand":
+                return 0
+            if item.frontier_class == "close" and item.join_criticality > 0.0:
+                return 1
+            return 2
+
+        return tuple(
+            item
+            for _, item in sorted(
+                enumerate(replacements),
+                key=lambda indexed: (priority(indexed[1]), indexed[0]),
+            )
         )
 
     @staticmethod

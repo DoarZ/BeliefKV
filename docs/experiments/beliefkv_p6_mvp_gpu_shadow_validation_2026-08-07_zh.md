@@ -323,7 +323,27 @@ frontier_shadow 记录            1045               99（同比例）
   本阶段结果仅作为 MVP 管线验证。正式 test evidence 需要在预测器关闭状态下重采。
 - test_id 数据只用于评估，不用于模型选择/在线更新，避免污染。
 
-## 预测型 Joint Plan GPU 实验（2026-08-07 完成，prediction_used=true）
+## 2026-08-08 审计更正
+
+后续代码与物理日志审计推翻了本节“预测型 Joint Plan”作为有效 P6 方案的资格：
+
+1. 在线 heuristic 将 `predicted_external_wait_ms` 与 token demand 混入同一
+   `predicted_idle_ms` 排序，量纲不一致；
+2. test-ID 上全部 composite prediction 为 `backoff`，不应获得 destructive
+   residency 或 retraction 权限；
+3. `victim_prediction_selected` 在物理 victim 真正选中前计数，不能证明预测
+   导致了实际迁移；
+4. 124 次对照迁移中 42 次只是 `drop_terminal_private`，旧统计不能等同于
+   predictive D2H/H2D；
+5. agent 自主轨迹在两组间不同，n=1 的 JCT/工具数差异不能归因于策略。
+
+旧实现现已撤回：P5 JointPlanner 固定使用 observed ordering/LRU residency，
+`joint_predictive_enabled` 仅保留为弃用兼容字段；在线汇总必须保持
+`prediction_used=false`。新的 P6 路径使用完整局部分布、closure-complete scope、
+候选相关物理化和 timeline risk evaluation，当前仅发布 read-only
+`predictive_risk_shadow`。以下两节保留为历史失败记录，不再作为性能证据。
+
+## 预测型 Joint Plan GPU 实验（2026-08-07 历史无效实验）
 
 > 改动者：deepseek；用户决策：跳过 shadow 直接验证预测器的调度作用，
 > 以 MVP 模型快速做端到端验证（不改变跨 workflow 公平性语义）。
@@ -636,9 +656,14 @@ training_eligible true               true（runtime_source_stable）
   _restore_funding_preview -> _offload_previews -> _owner_blockers`；
   高压下（`/get_load` 190K > KV pool 163,840）restore funding 的 offload
   预览是 O(页面 x owner) 重计算，单步极慢，表现为调度器假死。
-- 恢复：终止批次 -> 重启服务器并将 `MAX_TOTAL_TOKENS` 从 163,840 提到
-  327,680（8 x 32K 上下文上限 256K，留余量）-> 重跑 p6-014 成功，
-  峰值压力 0.494（原 0.955）。`_offload_previews` 本身仍是后续可优化点。
+- 当时将恢复误归因于把 `MAX_TOTAL_TOKENS` 从 163,840 提到 327,680。
+  服务端实际明确报告 requested 327,680 超过 profiled 167,816，并继续只分配
+  167,816 tokens；因此“KV pool 扩容成功”和由此计算的 0.494 压力均不成立。
+  重跑成功只能视为 workload/运行轨迹差异，不能证明扩容解决了卡死。
+- 2026-08-08 修复将 funding preview 改为从 revision-cached migratable roots
+  有界物化局部 bundle，避免每次扫描所有 context page/owner；实验 runner 也会
+  查询 `/get_server_info`，实际 pool 小于要求时直接拒绝采集。该优化尚待一次
+  固定高压 trace 的 GPU 验证。
 
 ### v6 训练与评估（train_frontier_mvp.py 已支持多 --data-dir）
 
@@ -678,8 +703,9 @@ frontier_belief_mvp_v6_calibrated_dev.json  v5 + 2 个 rollout（114,711 行，�
 ### 已解决/已处理的问题
 
 1. **高压调度假死**（p6-014 首轮）：restore funding offload 预览在
-   KV 压力超池时单步极慢；恢复方案为加大 `MAX_TOTAL_TOKENS` 至 327,680
-   并重跑成功。`_offload_previews` 后续可继续优化。
+   KV 压力下单步极慢。请求 327,680 tokens 被服务端裁剪为实际 167,816，
+   因而不能把重跑成功归因于扩容；当前已完成有界 root-preview 代码修复，
+   尚待固定 trace GPU 验证。
 2. **rollout 导出布局**：新批次无 `gpu0` 层，数据集平铺在根目录，
    训练 loader 期望 `p6-0*/**/dataset/` 布局；已把平铺文件移入
    `dataset/` 子目录并扩展 `train_frontier_mvp.py --data-dir` 支持多目录。
@@ -692,9 +718,36 @@ frontier_belief_mvp_v6_calibrated_dev.json  v5 + 2 个 rollout（114,711 行，�
 
 ### 待办（未执行）
 
-1. 用 v6 在 test_id 上重跑预测式 joint plan 高压 A/B
-   （v6 的 decode 信号已有状态区分度，验证调度净收益）。
+1. 在开发 split 上验证新的 read-only risk shadow 的 coverage、OOD gate、
+   candidate/scenario P99、publish age 和 would-action regret；不要重跑旧 heuristic
+   predictive A/B。
 2. 继续追加 rollout（其余 train 批次 p6-015~021 或再跑 r2），
    进一步提升细键支持；或按需调整 `empirical_minimum_support`。
-3. 修复 2 个 `test_sglang_adapter` 既有失败（P5D 遗留，与本轮无关）。
-4. 论文级 test evidence 仍需预测器关闭状态下重采 test_id。
+3. 用固定高压 trace 验证 funding preview 开销和 scheduler progress，不比较 JCT。
+4. 预测动作开放前执行一次短时 w8 correctness smoke；论文级 test evidence
+   仍需在模型/策略冻结后采集。
+
+## P6 risk shadow 实现检查点（2026-08-08）
+
+本轮已完成但尚未做 GPU 性能实验：
+
+- `LocalFrontierPrediction` 完整分布序列化，避免只透传少量 p50 字段；
+- `BeliefScope` 按 JOIN/blocker/message 形成 closure-complete scope；
+- `FrontierScenarioComposer` 生成联合 particles、top-K 和 OTHER；
+- `CandidateTimelineEvaluator` 在候选 GPU/PCIe 时间线上解析 child completion 与
+  JOIN reentry，不再对 raw demand 直接取 max/min；
+- 第一版只生成 `A0/PREPARE_HOST/PREFETCH_GPU`；backoff/OOD 禁止 prefetch；
+- `PredictiveRiskShadowObserver` 位于异步 latest-wins worker，异常不会使 P5
+  observed plan 失效；审计字段固定 `decision_authority=read_only_shadow`；
+- P5 在线 ordering/victim 已移除预测影响；
+- P6 batch runner 使用服务端实际 KV pool 做压力分母和最低容量 preflight。
+
+当前限制：局部分布查表仍在 safe-point capture 中同步、有界执行；候选 timeline
+已模拟 GPU service、PCIe 和 JOIN/reentry，但 future KV growth 的 HBM chance
+constraint 尚未接入。下一轮必须分别测量 lookup 与 worker P99，并补齐 future HBM
+feasibility，不能把当前 shadow 称为完整 schedulability test。
+
+验证：完整 serving 回归 `570 passed, 3 skipped, 3 subtests passed`，
+agent/runtime 回归 `126 passed`。下一次
+GPU 实验应先验证 shadow coverage/开销和 funding preview progress，不评价 P6 JCT
+收益，也不生成旧式 prediction-used A/B 结论。

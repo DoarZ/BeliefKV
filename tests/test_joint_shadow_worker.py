@@ -2,23 +2,30 @@ from __future__ import annotations
 
 import threading
 from dataclasses import replace
+from types import SimpleNamespace
 
 from beliefkv.control.controller import BeliefKVController
+from beliefkv.control.causal_graph import RuntimeCausalContextGraph
 from beliefkv.core.config import BeliefKVConfig
 from beliefkv.core.events import RuntimeEvent, RuntimeEventKind
 from beliefkv.policy.joint_scheduler import (
     JointPlannerConfig,
     ObservedJointPlanner,
 )
-from beliefkv.policy.reference import MetadataSource, RunnableInvocation
+from beliefkv.policy.reference import MetadataSource, MetadataValue, RunnableInvocation
 from beliefkv.policy.resource_snapshot import RuntimeResourceObservation
 from beliefkv.runtime.joint_shadow import (
     IncrementalPolicyInputAssembler,
     JointShadowDelta,
     JointShadowStateStamp,
     LatestWinsJointPlanWorker,
+    LatestWinsPredictiveRiskWorker,
     WorkflowFairnessReplica,
     coalesce_joint_shadow_deltas,
+)
+from beliefkv.policy.risk_shadow import (
+    PredictiveEligibility,
+    PrefetchTarget,
 )
 from beliefkv.runtime.protocol import PageHandle
 from tests.test_joint_scheduler import _invocation, _with_runtime_state
@@ -129,6 +136,50 @@ class _FailingPlanner:
         raise ValueError("expected failure")
 
 
+class _FixedEligibilityIndex:
+    def probe(self, policy_input):
+        return PredictiveEligibility(
+            source_snapshot_id=policy_input.snapshot_id,
+            prefetch_targets=(
+                PrefetchTarget(
+                    invocation_id="invocation-target",
+                    context_id="ctx-target",
+                    state="wait_tool",
+                    missing_gpu_bytes=100,
+                ),
+            ),
+            prepare_host_victims=(),
+            probe_ms=0.01,
+            trigger_signature=(("ctx-target", "wait_tool", 1), (), 1, 1),
+            belief_signature=(("fixed",),),
+        )
+
+
+class _BlockingRiskObserver:
+    def __init__(self) -> None:
+        self.eligibility_index = _FixedEligibilityIndex()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def evaluate(self, *_args, cancel_check=None, **_kwargs):
+        self.started.set()
+        while not self.release.wait(timeout=0.01):
+            if cancel_check is not None and cancel_check():
+                return "cancelled"
+        return "risk-result"
+
+
+class _RecordingRiskObserver:
+    def __init__(self, *, selected_action: str) -> None:
+        self.eligibility_index = _FixedEligibilityIndex()
+        self.selected_action = selected_action
+        self.calls: list[tuple[str, int]] = []
+
+    def evaluate(self, policy_input, *, source_plan, **_kwargs):
+        self.calls.append((policy_input.snapshot_id, id(source_plan)))
+        return SimpleNamespace(selected_action=self.selected_action)
+
+
 def test_coalesced_delta_keeps_events_and_latest_page_state() -> None:
     config = BeliefKVConfig(
         hbm_capacity_bytes=1_000,
@@ -203,6 +254,279 @@ def test_coalesced_delta_keeps_events_and_latest_page_state() -> None:
     assembler.apply(merged)
     assert assembler.page_index.require_page(handle).engine_lock_ref == 2
     assert assembler.graph.graph_version == controller.graph.graph_version
+
+
+def test_graph_snapshot_rebuild_preserves_planning_state() -> None:
+    controller = BeliefKVController(
+        BeliefKVConfig(
+            hbm_capacity_bytes=1_000,
+            host_capacity_bytes=1_000,
+            reserve_hbm_bytes=0,
+            predictor_enabled=False,
+            shadow_enabled=False,
+        )
+    )
+    controller.process_runtime_events(
+        (
+            _event(1, RuntimeEventKind.WORKFLOW_START),
+            _event(
+                2,
+                RuntimeEventKind.INVOCATION_CREATE,
+                invocation_id="root",
+                context_id="ctx",
+                context_epoch=0,
+            ),
+        )
+    )
+
+    rebuilt = RuntimeCausalContextGraph.from_snapshot(
+        controller.graph.snapshot()
+    )
+
+    assert rebuilt.snapshot() == controller.graph.snapshot()
+
+
+def test_predictive_worker_cannot_delay_observed_plan_publication() -> None:
+    observed_worker = LatestWinsJointPlanWorker()
+    policy_input = _policy_input()
+    graph_controller = BeliefKVController(
+        BeliefKVConfig(
+            hbm_capacity_bytes=1_000,
+            host_capacity_bytes=1_000,
+            reserve_hbm_bytes=0,
+            predictor_enabled=False,
+            shadow_enabled=False,
+        )
+    )
+    graph_controller.process_runtime_events(
+        (
+            _event(1, RuntimeEventKind.WORKFLOW_START),
+            _event(
+                2,
+                RuntimeEventKind.INVOCATION_CREATE,
+                invocation_id="root",
+                context_id="ctx",
+                context_epoch=0,
+            ),
+        )
+    )
+    policy_input = replace(
+        policy_input,
+        runtime_graph=replace(
+            policy_input.runtime_graph,
+            graph_version=graph_controller.graph.graph_version,
+            state=graph_controller.graph.snapshot(),
+        ),
+    )
+    observed_submission = observed_worker.submit(policy_input)
+    observed_result = None
+    for _ in range(100):
+        observed_result = observed_worker.latest(
+            after_sequence=observed_submission.sequence - 1
+        )
+        if observed_result is not None:
+            break
+        threading.Event().wait(0.01)
+    assert observed_result is not None
+    observed_result = replace(
+        observed_result,
+        state_stamp=JointShadowStateStamp(
+            graph_version=policy_input.runtime_graph.graph_version,
+            consumer_version=0,
+            event_sequence=0,
+            page_revision=policy_input.physical_kv.allocator_version,
+            topology_revision=policy_input.physical_kv.topology_version,
+            fairness_revision=0,
+            transfer_epoch=0,
+            runnable_signature=(),
+            hbm_used_bytes=policy_input.resources.hbm_used_bytes,
+            host_free_bytes=policy_input.resources.host_free_bytes,
+        ),
+    )
+    risk_observer = _BlockingRiskObserver()
+    risk_worker = LatestWinsPredictiveRiskWorker(risk_observer)
+    risk_worker.submit(observed_result)
+    assert risk_observer.started.wait(timeout=1)
+
+    second_submission = observed_worker.submit(policy_input)
+    second_result = None
+    for _ in range(100):
+        second_result = observed_worker.latest(
+            after_sequence=second_submission.sequence - 1
+        )
+        if second_result is not None:
+            break
+        threading.Event().wait(0.01)
+
+    assert second_result is not None
+    assert second_result.plan is not None
+    risk_observer.release.set()
+    assert risk_worker.close()
+    assert observed_worker.close()
+
+
+def test_predictive_worker_does_not_cancel_for_unchanged_action_bucket() -> None:
+    observed_worker = LatestWinsJointPlanWorker()
+    policy_input = _policy_input()
+    graph_controller = BeliefKVController(
+        BeliefKVConfig(
+            hbm_capacity_bytes=1_000,
+            host_capacity_bytes=1_000,
+            reserve_hbm_bytes=0,
+            predictor_enabled=False,
+            shadow_enabled=False,
+        )
+    )
+    graph_controller.process_runtime_events(
+        (
+            _event(1, RuntimeEventKind.WORKFLOW_START),
+            _event(
+                2,
+                RuntimeEventKind.INVOCATION_CREATE,
+                invocation_id="root",
+                context_id="ctx",
+                context_epoch=0,
+            ),
+        )
+    )
+    policy_input = replace(
+        policy_input,
+        runtime_graph=replace(
+            policy_input.runtime_graph,
+            graph_version=graph_controller.graph.graph_version,
+            state={"rccg": graph_controller.graph.snapshot()},
+        ),
+    )
+    submission = observed_worker.submit(policy_input)
+    observed_result = None
+    for _ in range(100):
+        observed_result = observed_worker.latest(
+            after_sequence=submission.sequence - 1
+        )
+        if observed_result is not None:
+            break
+        threading.Event().wait(0.01)
+    assert observed_result is not None
+    assert observed_result.policy_input is not None
+    observed_result = replace(
+        observed_result,
+        state_stamp=JointShadowStateStamp(
+            graph_version=observed_result.policy_input.runtime_graph.graph_version,
+            consumer_version=0,
+            event_sequence=0,
+            page_revision=observed_result.policy_input.physical_kv.allocator_version,
+            topology_revision=observed_result.policy_input.physical_kv.topology_version,
+            fairness_revision=0,
+            transfer_epoch=0,
+            runnable_signature=(),
+            hbm_used_bytes=observed_result.policy_input.resources.hbm_used_bytes,
+            host_free_bytes=observed_result.policy_input.resources.host_free_bytes,
+        ),
+    )
+    risk_observer = _BlockingRiskObserver()
+    risk_worker = LatestWinsPredictiveRiskWorker(risk_observer)
+    first = risk_worker.submit(observed_result)
+    assert first.enqueued
+    assert risk_observer.started.wait(timeout=1)
+
+    duplicate = risk_worker.submit(
+        replace(observed_result, sequence=observed_result.sequence + 1)
+    )
+
+    assert not duplicate.enqueued
+    assert duplicate.sequence == first.sequence
+    assert duplicate.suppression_reason == "unchanged_action_bucket"
+    risk_observer.release.set()
+    completed = None
+    for _ in range(100):
+        completed = risk_worker.latest(after_sequence=0)
+        if completed is not None:
+            break
+        threading.Event().wait(0.01)
+    assert completed is not None
+    assert completed.error is None
+    assert risk_worker.close()
+    assert observed_worker.close()
+
+
+def test_predictive_worker_evaluates_one_unified_model() -> None:
+    observed_worker = LatestWinsJointPlanWorker()
+    policy_input = _policy_input()
+    graph_controller = BeliefKVController(
+        BeliefKVConfig(
+            hbm_capacity_bytes=1_000,
+            host_capacity_bytes=1_000,
+            reserve_hbm_bytes=0,
+            predictor_enabled=False,
+            shadow_enabled=False,
+        )
+    )
+    graph_controller.process_runtime_events(
+        (
+            _event(1, RuntimeEventKind.WORKFLOW_START),
+            _event(
+                2,
+                RuntimeEventKind.INVOCATION_CREATE,
+                invocation_id="root",
+                context_id="ctx",
+                context_epoch=0,
+            ),
+        )
+    )
+    policy_input = replace(
+        policy_input,
+        runtime_graph=replace(
+            policy_input.runtime_graph,
+            graph_version=graph_controller.graph.graph_version,
+            state=graph_controller.graph.snapshot(),
+        ),
+    )
+    submission = observed_worker.submit(policy_input)
+    observed_result = None
+    for _ in range(100):
+        observed_result = observed_worker.latest(
+            after_sequence=submission.sequence - 1
+        )
+        if observed_result is not None:
+            break
+        threading.Event().wait(0.01)
+    assert observed_result is not None
+    assert observed_result.policy_input is not None
+    observed_result = replace(
+        observed_result,
+        state_stamp=JointShadowStateStamp(
+            graph_version=observed_result.policy_input.runtime_graph.graph_version,
+            consumer_version=0,
+            event_sequence=0,
+            page_revision=observed_result.policy_input.physical_kv.allocator_version,
+            topology_revision=observed_result.policy_input.physical_kv.topology_version,
+            fairness_revision=0,
+            transfer_epoch=0,
+            runnable_signature=(),
+            hbm_used_bytes=observed_result.policy_input.resources.hbm_used_bytes,
+            host_free_bytes=observed_result.policy_input.resources.host_free_bytes,
+        ),
+    )
+    primary = _RecordingRiskObserver(selected_action="prepare_host")
+    risk_worker = LatestWinsPredictiveRiskWorker(primary)
+    predictive_submission = risk_worker.submit(observed_result)
+    result = None
+    for _ in range(100):
+        result = risk_worker.latest(
+            after_sequence=predictive_submission.sequence - 1
+        )
+        if result is not None:
+            break
+        threading.Event().wait(0.01)
+
+    assert result is not None
+    assert result.error is None
+    assert result.shadow is not None
+    assert primary.calls == [
+        (policy_input.snapshot_id, id(observed_result.plan))
+    ]
+    assert risk_worker.close()
+    assert observed_worker.close()
 
 
 def test_worker_replaces_only_the_pending_snapshot() -> None:
@@ -300,6 +624,7 @@ def test_assembler_attaches_frontier_predictions_to_policy_input() -> None:
     assert metadata is not None
     assert metadata.source == MetadataSource.PREDICTED
     assert metadata.value["root"]["remaining_decode_tokens_p50"] == 64.0
+    assert "beliefkv_transfer_model_mode" not in policy_input.optional_metadata
     assert policy_input.runnable_frontier[0].predicted_remaining_decode_tokens == 64.0
 
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
@@ -23,6 +23,7 @@ from beliefkv.predictor.frontier_belief import (
     FrontierBeliefSnapshot,
     OtherResidualPolicy,
     PredictiveEvidenceReadSet,
+    ScenarioProjection,
 )
 
 
@@ -177,6 +178,64 @@ class LocalFrontierPrediction:
     calibrated_intervals: Mapping[str, tuple[float, float]] = field(
         default_factory=dict
     )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "invocation_id": self.invocation_id,
+            "boundary_distribution": dict(self.boundary_distribution),
+            "current_sequence_tokens": self.current_sequence_tokens,
+            "remaining_decode_tokens": self.remaining_decode_tokens.to_dict(),
+            "remaining_external_wait": self.remaining_external_wait.to_dict(),
+            "tool_terminal_distribution": dict(self.tool_terminal_distribution),
+            "prompt_growth_tokens": self.prompt_growth_tokens.to_dict(),
+            "next_output_tokens": self.next_output_tokens.to_dict(),
+            "support_level": self.support_level,
+            "calibration_coverage": self.calibration_coverage,
+            "ood_reasons": list(self.ood_reasons),
+            "calibrated_intervals": {
+                name: list(interval)
+                for name, interval in sorted(self.calibrated_intervals.items())
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "LocalFrontierPrediction":
+        intervals = raw.get("calibrated_intervals", {})
+        return cls(
+            invocation_id=str(raw["invocation_id"]),
+            boundary_distribution={
+                str(name): float(probability)
+                for name, probability in raw.get(
+                    "boundary_distribution", {}
+                ).items()
+            },
+            current_sequence_tokens=int(raw.get("current_sequence_tokens", 0)),
+            remaining_decode_tokens=EmpiricalDistribution.from_dict(
+                raw.get("remaining_decode_tokens", {})
+            ),
+            remaining_external_wait=EmpiricalDistribution.from_dict(
+                raw.get("remaining_external_wait", {})
+            ),
+            tool_terminal_distribution={
+                str(name): float(probability)
+                for name, probability in raw.get(
+                    "tool_terminal_distribution", {}
+                ).items()
+            },
+            prompt_growth_tokens=EmpiricalDistribution.from_dict(
+                raw.get("prompt_growth_tokens", {})
+            ),
+            next_output_tokens=EmpiricalDistribution.from_dict(
+                raw.get("next_output_tokens", {})
+            ),
+            support_level=str(raw.get("support_level", "unavailable")),
+            calibration_coverage=float(raw.get("calibration_coverage", 0.0)),
+            ood_reasons=tuple(str(item) for item in raw.get("ood_reasons", ())),
+            calibrated_intervals={
+                str(name): (float(value[0]), float(value[1]))
+                for name, value in intervals.items()
+            },
+        )
 
 
 class _HierarchicalEmpiricalModel:
@@ -963,7 +1022,34 @@ class FrontierScenarioComposer:
         evidence_read_set: PredictiveEvidenceReadSet,
         seed: int = 0,
         horizon: FinitePlanningHorizon = FinitePlanningHorizon(),
+        projection: ScenarioProjection = ScenarioProjection.FULL,
+        target_invocation_id: str | None = None,
     ) -> FrontierBeliefSnapshot:
+        particles = self.sample_particles(
+            graph=graph,
+            scope=scope,
+            local_predictions=local_predictions,
+            seed=seed,
+        )
+        return self.reduce_particles(
+            particles=particles,
+            scope=scope,
+            local_predictions=local_predictions,
+            generated_ts_ms=generated_ts_ms,
+            evidence_read_set=evidence_read_set,
+            horizon=horizon,
+            projection=projection,
+            target_invocation_id=target_invocation_id,
+        )
+
+    def sample_particles(
+        self,
+        *,
+        graph: RuntimeCausalContextGraph,
+        scope: BeliefScope,
+        local_predictions: Mapping[str, LocalFrontierPrediction],
+        seed: int = 0,
+    ) -> tuple[tuple[FrontierDemandOutcome, ...], ...]:
         missing = set(scope.invocation_ids).difference(local_predictions)
         if missing:
             raise ValueError(f"local predictions missing scoped invocations: {sorted(missing)}")
@@ -983,23 +1069,38 @@ class FrontierScenarioComposer:
                     graph, invocation_id, prediction, q, rng.random()
                 )
             particle_outcomes.append(tuple(outcomes[key] for key in sorted(outcomes)))
+        return tuple(particle_outcomes)
 
-        counts: Counter[tuple[Any, ...]] = Counter()
-        representatives: dict[tuple[Any, ...], tuple[FrontierDemandOutcome, ...]] = {}
-        for outcomes in particle_outcomes:
-            key = _scenario_key(outcomes)
-            counts[key] += 1
-            representatives.setdefault(key, outcomes)
-        ranked = sorted(counts, key=lambda key: (-counts[key], key))
-        selected = ranked[: self.top_k]
-        scenarios = tuple(
-            DemandScenario(
-                scenario_id=f"scenario-{index:03d}-{hashlib.blake2b(repr(key).encode(), digest_size=8).hexdigest()}",
-                outcomes=representatives[key],
-                probability_mass=counts[key] / self.particle_count,
+    def reduce_particles(
+        self,
+        *,
+        particles: tuple[tuple[FrontierDemandOutcome, ...], ...],
+        scope: BeliefScope,
+        local_predictions: Mapping[str, LocalFrontierPrediction],
+        generated_ts_ms: float,
+        evidence_read_set: PredictiveEvidenceReadSet,
+        horizon: FinitePlanningHorizon = FinitePlanningHorizon(),
+        projection: ScenarioProjection = ScenarioProjection.FULL,
+        target_invocation_id: str | None = None,
+    ) -> FrontierBeliefSnapshot:
+        projection = ScenarioProjection(projection)
+        if not particles:
+            raise ValueError("scenario reduction requires sampled particles")
+        if projection != ScenarioProjection.FULL and (
+            target_invocation_id not in scope.invocation_ids
+        ):
+            raise ValueError("action-projected reduction requires a scoped target")
+
+        if projection == ScenarioProjection.FULL:
+            scenarios, residual_mass = self._reduce_full_particles(particles)
+        else:
+            scenarios = self._reduce_action_projected_particles(
+                particles,
+                projection=projection,
+                target_invocation_id=str(target_invocation_id),
             )
-            for index, key in enumerate(selected)
-        )
+            residual_mass = 0.0
+
         selected_mass = sum(item.probability_mass for item in scenarios)
         ood = sorted(
             {
@@ -1016,7 +1117,11 @@ class FrontierScenarioComposer:
             else "exact"
         )
         digest = hashlib.blake2b(
-            f"{scope.scope_id}|{generated_ts_ms}|{evidence_read_set.model_version}".encode(),
+            (
+                f"{scope.scope_id}|{generated_ts_ms}|"
+                f"{evidence_read_set.model_version}|{projection.value}|"
+                f"{target_invocation_id or ''}"
+            ).encode(),
             digest_size=16,
             person=b"bkv-frontier",
         ).hexdigest()
@@ -1025,7 +1130,9 @@ class FrontierScenarioComposer:
             generated_ts_ms=generated_ts_ms,
             scope=scope,
             scenarios=scenarios,
-            other_probability_mass=max(0.0, 1.0 - selected_mass),
+            other_probability_mass=max(0.0, 1.0 - selected_mass)
+            if projection == ScenarioProjection.FULL
+            else residual_mass,
             calibration_coverage=min(
                 (item.calibration_coverage for item in local_predictions.values()),
                 default=0.0,
@@ -1034,8 +1141,75 @@ class FrontierScenarioComposer:
             ood_reasons=tuple(ood),
             evidence_read_set=evidence_read_set,
             horizon=horizon,
-            other_policy=OtherResidualPolicy(finite_risk_bound=not ood),
+            other_policy=OtherResidualPolicy(
+                finite_risk_bound=(projection != ScenarioProjection.FULL or not ood)
+            ),
         )
+
+    def _reduce_full_particles(
+        self,
+        particles: tuple[tuple[FrontierDemandOutcome, ...], ...],
+    ) -> tuple[tuple[DemandScenario, ...], float]:
+        counts: Counter[tuple[Any, ...]] = Counter()
+        representatives: dict[tuple[Any, ...], tuple[FrontierDemandOutcome, ...]] = {}
+        for outcomes in particles:
+            key = _scenario_key(outcomes)
+            counts[key] += 1
+            representatives.setdefault(key, outcomes)
+        ranked = sorted(counts, key=lambda key: (-counts[key], key))
+        selected = ranked[: self.top_k]
+        scenarios = tuple(
+            DemandScenario(
+                scenario_id=f"scenario-{index:03d}-{hashlib.blake2b(repr(key).encode(), digest_size=8).hexdigest()}",
+                outcomes=representatives[key],
+                probability_mass=counts[key] / len(particles),
+            )
+            for index, key in enumerate(selected)
+        )
+        return scenarios, max(
+            0.0, 1.0 - sum(item.probability_mass for item in scenarios)
+        )
+
+    def _reduce_action_projected_particles(
+        self,
+        particles: tuple[tuple[FrontierDemandOutcome, ...], ...],
+        *,
+        projection: ScenarioProjection,
+        target_invocation_id: str,
+    ) -> tuple[DemandScenario, ...]:
+        vectors = tuple(
+            _action_projection_vector(
+                outcomes,
+                projection=projection,
+                target_invocation_id=target_invocation_id,
+            )
+            for outcomes in particles
+        )
+        clusters = _deterministic_medoid_clusters(vectors, self.top_k)
+        scenarios: list[DemandScenario] = []
+        for index, (medoid_index, member_indices) in enumerate(clusters):
+            medoid = particles[medoid_index]
+            members = tuple(particles[item] for item in member_indices)
+            conservative = _conservative_cluster_outcomes(medoid, members)
+            identity = (
+                projection.value,
+                target_invocation_id,
+                _scenario_key(medoid),
+                tuple(member_indices),
+            )
+            scenarios.append(
+                DemandScenario(
+                    scenario_id=(
+                        f"{projection.value}-cluster-{index:03d}-"
+                        f"{hashlib.blake2b(repr(identity).encode(), digest_size=8).hexdigest()}"
+                    ),
+                    outcomes=medoid,
+                    conservative_outcomes=conservative,
+                    probability_mass=len(member_indices) / len(particles),
+                    projection=projection,
+                )
+            )
+        return tuple(scenarios)
 
     @staticmethod
     def _sample_local(
@@ -1944,6 +2118,202 @@ def _sample_categorical(distribution: Mapping[str, float], quantile: float) -> s
         if quantile <= cumulative:
             return _normalize_boundary(key) or BoundaryEvent.UNKNOWN.value
     return BoundaryEvent.UNKNOWN.value
+
+
+def _action_projection_vector(
+    outcomes: tuple[FrontierDemandOutcome, ...],
+    *,
+    projection: ScenarioProjection,
+    target_invocation_id: str,
+) -> tuple[float, ...]:
+    by_id = {item.invocation_id: item for item in outcomes}
+    target = by_id[target_invocation_id]
+    target_wait = _external_reentry_proxy_ms(target_invocation_id, by_id, set())
+    target_gpu_demand = float(
+        target.remaining_decode_tokens
+        + target.prompt_growth_tokens
+        + target.next_output_tokens
+    )
+    aggregate_growth = float(
+        sum(
+            item.remaining_decode_tokens
+            + item.prompt_growth_tokens
+            + item.next_output_tokens
+            for item in outcomes
+        )
+    )
+    pressure_arrival = min(
+        (
+            _external_reentry_proxy_ms(item.invocation_id, by_id, set())
+            for item in outcomes
+            if item.invocation_id != target_invocation_id
+        ),
+        default=target_wait,
+    )
+    if projection == ScenarioProjection.PREFETCH:
+        return (
+            target_wait,
+            float(target.prompt_growth_tokens),
+            aggregate_growth,
+            target_gpu_demand,
+            float(target.current_sequence_tokens),
+        )
+    if projection == ScenarioProjection.PREPARE_HOST:
+        return (
+            target_wait,
+            pressure_arrival,
+            aggregate_growth,
+            float(target.current_sequence_tokens),
+        )
+    raise ValueError(f"unsupported action projection: {projection.value}")
+
+
+def _external_reentry_proxy_ms(
+    invocation_id: str,
+    outcomes: Mapping[str, FrontierDemandOutcome],
+    visiting: set[str],
+) -> float:
+    if invocation_id in visiting:
+        return 0.0
+    outcome = outcomes[invocation_id]
+    if outcome.dependency_mode == DependencyMode.EXTERNAL:
+        return sum(item.residual_delay_ms for item in outcome.external_segments)
+    dependencies = tuple(
+        item
+        for item in outcome.dependency_invocation_ids
+        if item in outcomes
+    )
+    if not dependencies:
+        return 0.0
+    nested_visiting = {*visiting, invocation_id}
+    values = tuple(
+        _external_reentry_proxy_ms(item, outcomes, nested_visiting)
+        for item in dependencies
+    )
+    if outcome.dependency_mode == DependencyMode.JOIN_ALL:
+        return max(values)
+    if outcome.dependency_mode in {
+        DependencyMode.JOIN_ANY,
+        DependencyMode.PRODUCER,
+    }:
+        return min(values)
+    return 0.0
+
+
+def _deterministic_medoid_clusters(
+    vectors: tuple[tuple[float, ...], ...],
+    max_clusters: int,
+) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """Small deterministic k-medoids for equal-mass action particles."""
+
+    if not vectors:
+        return ()
+    dimensions = len(vectors[0])
+    if any(len(item) != dimensions for item in vectors):
+        raise ValueError("projected scenario vectors must have equal dimensions")
+    minima = tuple(min(item[index] for item in vectors) for index in range(dimensions))
+    maxima = tuple(max(item[index] for item in vectors) for index in range(dimensions))
+    normalized = tuple(
+        tuple(
+            0.0
+            if maxima[index] <= minima[index]
+            else (value - minima[index]) / (maxima[index] - minima[index])
+            for index, value in enumerate(item)
+        )
+        for item in vectors
+    )
+    unique_count = len(set(normalized))
+    cluster_count = min(max_clusters, max(1, unique_count), len(vectors))
+    ordered = sorted(range(len(vectors)), key=lambda item: (normalized[item], item))
+    medoids = [
+        ordered[min(len(ordered) - 1, ((2 * index + 1) * len(ordered)) // (2 * cluster_count))]
+        for index in range(cluster_count)
+    ]
+    medoids = list(dict.fromkeys(medoids))
+
+    def distance(left: int, right: int) -> float:
+        return sum(
+            abs(a - b) for a, b in zip(normalized[left], normalized[right], strict=True)
+        )
+
+    assignments: dict[int, list[int]] = {}
+    for _ in range(4):
+        assignments = {item: [] for item in medoids}
+        for particle_index in range(len(vectors)):
+            selected = min(
+                medoids,
+                key=lambda item: (distance(particle_index, item), item),
+            )
+            assignments[selected].append(particle_index)
+        updated = []
+        for medoid in medoids:
+            members = assignments[medoid]
+            updated.append(
+                min(
+                    members,
+                    key=lambda candidate: (
+                        sum(distance(candidate, peer) for peer in members),
+                        candidate,
+                    ),
+                )
+            )
+        updated = list(dict.fromkeys(updated))
+        if updated == medoids:
+            break
+        medoids = updated
+
+    assignments = {item: [] for item in medoids}
+    for particle_index in range(len(vectors)):
+        selected = min(
+            medoids,
+            key=lambda item: (distance(particle_index, item), item),
+        )
+        assignments[selected].append(particle_index)
+    return tuple(
+        (medoid, tuple(assignments[medoid]))
+        for medoid in sorted(medoids, key=lambda item: (normalized[item], item))
+    )
+
+
+def _conservative_cluster_outcomes(
+    medoid: tuple[FrontierDemandOutcome, ...],
+    members: tuple[tuple[FrontierDemandOutcome, ...], ...],
+) -> tuple[FrontierDemandOutcome, ...]:
+    by_member = tuple(
+        {item.invocation_id: item for item in outcomes}
+        for outcomes in members
+    )
+    conservative = []
+    for base in medoid:
+        variants = tuple(item[base.invocation_id] for item in by_member)
+        segments = tuple(
+            replace(
+                segment,
+                residual_delay_ms=min(
+                    variant.external_segments[index].residual_delay_ms
+                    for variant in variants
+                    if len(variant.external_segments) > index
+                ),
+            )
+            for index, segment in enumerate(base.external_segments)
+        )
+        conservative.append(
+            replace(
+                base,
+                current_sequence_tokens=max(
+                    item.current_sequence_tokens for item in variants
+                ),
+                remaining_decode_tokens=max(
+                    item.remaining_decode_tokens for item in variants
+                ),
+                prompt_growth_tokens=max(
+                    item.prompt_growth_tokens for item in variants
+                ),
+                next_output_tokens=max(item.next_output_tokens for item in variants),
+                external_segments=segments,
+            )
+        )
+    return tuple(conservative)
 
 
 def _scenario_key(outcomes: Iterable[FrontierDemandOutcome]) -> tuple[Any, ...]:

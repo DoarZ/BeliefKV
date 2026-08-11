@@ -1,0 +1,63 @@
+{
+  "batch_count": 1,
+  "batches": [
+    {
+      "batch_id": "p6-confirm-xarray-v2-r0",
+      "concurrency": 8,
+      "docker_images": [
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-3305:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-4356:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-4629:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-4687:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-4695:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-4966:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-6992:latest",
+        "swebench/sweb.eval.x86_64.pydata_1776_xarray-7233:latest"
+      ],
+      "instance_ids": [
+        "pydata__xarray-7233",
+        "pydata__xarray-6992",
+        "pydata__xarray-4966",
+        "pydata__xarray-4629",
+        "pydata__xarray-4356",
+        "pydata__xarray-4695",
+        "pydata__xarray-3305",
+        "pydata__xarray-4687"
+      ],
+      "policy": "frozen_p5_observed",
+      "predictive_actions": false,
+      "preflight_command": null,
+      "projects": [
+        "pydata/xarray"
+      ],
+      "rollout_index": 0,
+      "source_repositories": [
+        {
+          "path": "/home/longhao/experiment/BeliefKV/workloads/sources/p6_swebench_verified/pydata__xarray",
+          "project": "pydata/xarray",
+          "url": "https://github.com/pydata/xarray.git"
+        }
+      ],
+      "split": "train",
+      "versions": [
+        "pydata/xarray:0.12",
+        "pydata/xarray:2022.06",
+        "pydata/xarray:2022.09"
+      ],
+      "workflow_count": 8,
+      "workload_manifest": "/home/longhao/experiment/BeliefKV/configs/p6/decision_relevance_v2/workload_manifest.json",
+      "workload_manifest_sha256": "da056e46e85f0e122bc3d5850152f29a0fd2cb9fe7839923f92739fc11b7fd78"
+    }
+  ],
+  "dataset": "princeton-nlp/SWE-bench_Verified",
+  "dataset_revision": "91aa3ed",
+  "frozen": true,
+  "plan_id": "p6-decision-confirmation-xarray-v2",
+  "predictive_actions_enabled": false,
+  "predictor_enabled": false,
+  "repository_count": 1,
+  "runtime_policy": "frozen_p5_observed",
+  "schema_version": 1,
+  "unique_task_count": 8,
+  "workflow_count": 8
+}

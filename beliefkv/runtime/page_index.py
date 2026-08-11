@@ -184,6 +184,7 @@ class PageOwnershipIndex:
         self._physical_breakdown = PhysicalKvStateBreakdown()
         self._engine_locked_pages: tuple[PhysicalPageRecord, ...] = ()
         self._migratable_gpu_handles: frozenset[PageHandle] = frozenset()
+        self._migratable_gpu_pages: tuple[PhysicalPageRecord, ...] = ()
         self._accounting_revision = 0
         self._workflow_charge_cache_revision = -1
         self._workflow_charge_cache: dict[str, float] = {}
@@ -992,6 +993,13 @@ class PageOwnershipIndex:
         self._physical_breakdown = breakdown
         self._engine_locked_pages = engine_locked_pages
         self._migratable_gpu_handles = migratable_handles
+        self._migratable_gpu_pages = tuple(
+            self.pages[handle]
+            for handle in sorted(
+                migratable_handles,
+                key=lambda item: (-self.pages[item].radix_depth, item),
+            )
+        )
         self._physical_breakdown_revision = self._physical_state_revision
         return self._physical_breakdown
 
@@ -1119,6 +1127,12 @@ class PageOwnershipIndex:
 
         self.physical_kv_state_breakdown()
         return self._engine_locked_pages
+
+    def migratable_gpu_pages(self) -> tuple[PhysicalPageRecord, ...]:
+        """Return revision-cached roots whose GPU descendant closure is open."""
+
+        self.physical_kv_state_breakdown()
+        return self._migratable_gpu_pages
 
     def workflow_gpu_charges(self) -> dict[str, float]:
         if self._workflow_charge_cache_revision == self._accounting_revision:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -579,30 +580,101 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             "-c",
             "while :; do sleep 3600; done",
         ]
-        started = time.monotonic()
-        result = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=120.0,
-        )
-        self.audit.emit(
-            "sandbox_start",
-            container_name=self._container_name,
-            image=self.image,
-            duration_ms=(time.monotonic() - started) * 1000.0,
-            returncode=result.returncode,
-            stderr=(result.stderr or "")[-2000:],
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"sandbox start failed: {result.stderr.strip()}")
+        result: subprocess.CompletedProcess[str] | None = None
+        for attempt in range(1, 3):
+            started = time.monotonic()
+            try:
+                result = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=120.0,
+                )
+            except subprocess.TimeoutExpired as error:
+                recovered = self._container_is_running()
+                self.audit.emit(
+                    "sandbox_start",
+                    container_name=self._container_name,
+                    image=self.image,
+                    attempt=attempt,
+                    duration_ms=(time.monotonic() - started) * 1000.0,
+                    returncode=None,
+                    status=(
+                        "timeout_recovered_running"
+                        if recovered
+                        else "timeout_retry"
+                        if attempt == 1
+                        else "timeout_failed"
+                    ),
+                    stderr=str(error)[-2000:],
+                )
+                if recovered:
+                    result = subprocess.CompletedProcess(
+                        command,
+                        0,
+                        stdout=self._container_name,
+                        stderr="",
+                    )
+                    break
+                self._remove_partial_container()
+                if attempt == 1:
+                    time.sleep(2.0)
+                    continue
+                raise RuntimeError(
+                    "sandbox start timed out twice without a running container"
+                ) from error
+            self.audit.emit(
+                "sandbox_start",
+                container_name=self._container_name,
+                image=self.image,
+                attempt=attempt,
+                duration_ms=(time.monotonic() - started) * 1000.0,
+                returncode=result.returncode,
+                status="completed" if result.returncode == 0 else "failed",
+                stderr=(result.stderr or "")[-2000:],
+            )
+            if result.returncode == 0:
+                break
+            self._remove_partial_container()
+            if attempt == 2:
+                raise RuntimeError(
+                    f"sandbox start failed: {result.stderr.strip()}"
+                )
+            time.sleep(2.0)
+        if result is None or result.returncode != 0:
+            raise RuntimeError("sandbox start failed without a terminal result")
         self._started = True
         try:
             self._preflight()
         except BaseException:
             self.close()
             raise
+
+    def _container_is_running(self) -> bool:
+        result = subprocess.run(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                self._container_name,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+        return result.returncode == 0 and result.stdout.strip() == "true"
+
+    def _remove_partial_container(self) -> None:
+        subprocess.run(
+            ["docker", "rm", "--force", self._container_name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+        )
 
     def execute(
         self,
@@ -979,6 +1051,23 @@ class DelegationPlan(BaseModel):
     )
 
 
+class ParallelAnalysisPlan(BaseModel):
+    rationale: str = Field(description="Brief reason for the analysis decomposition")
+    repository_analysis: str = Field(
+        description="Self-contained code-path and invariant analysis task"
+    )
+    test_analysis: str = Field(
+        description="Self-contained reproduction and regression-test analysis task"
+    )
+    compatibility_analysis: str | None = Field(
+        default=None,
+        description=(
+            "Optional independent dependency, protocol, serialization, or "
+            "compatibility analysis task"
+        ),
+    )
+
+
 class PartialAgentRunError(RuntimeError):
     def __init__(self, cause: BaseException, partial_result: dict[str, Any]) -> None:
         super().__init__(f"{type(cause).__name__}: {cause}")
@@ -1001,10 +1090,12 @@ class DeepAgentsExperimentConfig:
     instance_ids: tuple[str, ...] = ()
     max_workflows: int = 4
     concurrency: int = 4
+    workflow_arrival_interval_ms: float = 0.0
     gpu_index: int = 0
     pool_tokens: int = 163_840
     max_completion_tokens: int = 2048
     sampling_seed: int | None = None
+    subagent_fanout_profile: str = "natural"
     recursion_limit: int = 512
     request_timeout_s: float = 600.0
     sandbox_command_timeout_s: int = 600
@@ -1025,6 +1116,11 @@ class DeepAgentsExperimentConfig:
     def __post_init__(self) -> None:
         if self.mode not in {"autonomous", "planned"}:
             raise ValueError("mode must be autonomous or planned")
+        if self.subagent_fanout_profile not in {
+            "natural",
+            "parallel_analysis_2to3",
+        }:
+            raise ValueError("unsupported subagent fan-out profile")
         if min(
             self.max_workflows,
             self.concurrency,
@@ -1036,6 +1132,11 @@ class DeepAgentsExperimentConfig:
             raise ValueError("experiment limits must be positive")
         if self.completion_repair_attempts < 0:
             raise ValueError("completion_repair_attempts must be non-negative")
+        if (
+            not math.isfinite(self.workflow_arrival_interval_ms)
+            or self.workflow_arrival_interval_ms < 0
+        ):
+            raise ValueError("workflow arrival interval must be finite and non-negative")
         if self.sampling_seed is not None and self.sampling_seed < 0:
             raise ValueError("sampling_seed must be non-negative when configured")
         if self.runtime_event_ack_timeout_s <= 0 or self.runtime_event_ack_retries <= 0:
@@ -1063,6 +1164,30 @@ independent, issue their task calls together so they can run concurrently. Do no
 delegate trivial one-step work. Integrate child reports and leave the final patch in the
 shared workspace. Never access paths outside the mounted repository.
 """ + SANDBOX_PATH_CONTRACT
+
+
+PARALLEL_ANALYSIS_2TO3_PROMPT = """
+Before editing, delegate orthogonal analysis in one assistant turn so the task calls run
+in parallel. Always create exactly these two read-only children:
+1. repository-explorer: trace the code path and identify candidate symbols/invariants.
+2. test-analyst: reproduce the failure and identify focused regression tests.
+Create one compatibility-analyst child in that same turn only when the issue exposes an
+independent dependency, protocol, version, serialization, or compatibility question.
+Do not create more than three children. Children only inspect and report; they must not
+edit the workspace. Wait for the JOIN_ALL result, then the supervisor alone applies and
+tests the patch. Do not split adjacent parts of one call path into duplicate tasks.
+"""
+
+
+PARALLEL_ANALYSIS_PLANNER_PROMPT = """You decompose one SWE-bench issue into a
+controlled parallel analysis fan-out. Return two mandatory, orthogonal, self-contained
+tasks: repository_analysis traces code paths and invariants; test_analysis reproduces
+the failure and identifies focused regression tests. Add compatibility_analysis only
+when the issue contains an independent dependency, protocol, serialization, version,
+or compatibility question. Do not ask children to edit files. Do not duplicate work
+between tasks. Task descriptions and whether the optional third task is useful are your
+decision; the runtime only enforces the two-to-three child fan-out contract.
+"""
 
 
 PLANNER_SYSTEM_PROMPT = """You are a code-orchestrated planner for a SWE-bench task.
@@ -1396,6 +1521,29 @@ AUTONOMOUS_SUBAGENT_SPECS = (
 )
 
 
+PARALLEL_ANALYSIS_SUBAGENT_SPECS = (
+    (
+        "repository-explorer",
+        "Read-only code-path and invariant analysis for the delegated question.",
+        "Inspect repository code and report candidate symbols, call paths, and invariants. "
+        "Do not modify files. Finish with ChildCompletion.",
+    ),
+    (
+        "test-analyst",
+        "Read-only reproduction, failure-condition, and regression-test analysis.",
+        "Reproduce or analyze the failure and report commands, outcomes, and focused "
+        "regression tests. Do not modify files. Finish with ChildCompletion.",
+    ),
+    (
+        "compatibility-analyst",
+        "Read-only dependency, protocol, serialization, or compatibility analysis.",
+        "Investigate only the independent compatibility question assigned by the parent. "
+        "Do not duplicate code-path or test analysis and do not modify files. Finish "
+        "with ChildCompletion.",
+    ),
+)
+
+
 def _context_lifecycle_middleware(
     config: DeepAgentsExperimentConfig,
     backend: DockerWorkspaceBackend,
@@ -1423,7 +1571,13 @@ def _autonomous_subagents(
     summary_model: Any,
 ) -> list[dict[str, Any]]:
     subagents: list[dict[str, Any]] = []
-    for name, description, system_prompt in AUTONOMOUS_SUBAGENT_SPECS:
+    read_only = config.subagent_fanout_profile == "parallel_analysis_2to3"
+    specs = (
+        PARALLEL_ANALYSIS_SUBAGENT_SPECS
+        if read_only
+        else AUTONOMOUS_SUBAGENT_SPECS
+    )
+    for name, description, system_prompt in specs:
         scope = f"autonomous:{name}"
         subagents.append(
             {
@@ -1435,11 +1589,13 @@ def _autonomous_subagents(
                     + repository_sandbox_contract(workload)
                 ),
                 "model": model,
-                "tools": [_workspace_patch_tool(backend)],
+                "tools": [] if read_only else [_workspace_patch_tool(backend)],
                 "response_format": ToolStrategy(ChildCompletion),
                 "middleware": [
                     TodoListMiddleware(),
-                    _filesystem_middleware(backend, allow_direct_edits=True),
+                    _filesystem_middleware(
+                        backend, allow_direct_edits=not read_only
+                    ),
                     _context_lifecycle_middleware(
                         config,
                         backend,
@@ -1478,27 +1634,34 @@ def _build_autonomous_agent(
     workload: SweBenchWorkload,
     backend: DockerWorkspaceBackend,
     adapter: DeepAgentsRuntimeAdapter,
+    *,
+    delegation_enabled: bool = True,
 ) -> Any:
     model = _model(config, adapter)
     summary_model = model.model_copy(
         update={"max_tokens": config.context_lifecycle.summary_output_tokens}
     )
-    task_middleware = PrivateStateIsolatingSubAgentMiddleware(
-        backend=backend,
-        private_state_keys=CONTEXT_LIFECYCLE_PRIVATE_STATE_KEYS,
-        subagents=_autonomous_subagents(
-            config,
-            workload,
-            backend,
-            adapter,
-            model,
-            summary_model,
-        ),
-    )
     middleware: list[Any] = [
         TodoListMiddleware(),
         _filesystem_middleware(backend, allow_direct_edits=True),
-        task_middleware,
+    ]
+    if delegation_enabled:
+        middleware.append(
+            PrivateStateIsolatingSubAgentMiddleware(
+                backend=backend,
+                private_state_keys=CONTEXT_LIFECYCLE_PRIVATE_STATE_KEYS,
+                subagents=_autonomous_subagents(
+                    config,
+                    workload,
+                    backend,
+                    adapter,
+                    model,
+                    summary_model,
+                ),
+            )
+        )
+    middleware.extend(
+        [
         _context_lifecycle_middleware(
             config,
             backend,
@@ -1524,12 +1687,21 @@ def _build_autonomous_agent(
             audit=backend.audit,
             scope="autonomous:supervisor",
         ),
-    ]
+        ]
+    )
     return create_agent(
         model=model,
         tools=[_workspace_patch_tool(backend)],
         system_prompt=(
             AUTONOMOUS_SYSTEM_PROMPT
+            + (
+                PARALLEL_ANALYSIS_2TO3_PROMPT
+                if (
+                    config.subagent_fanout_profile == "parallel_analysis_2to3"
+                    and delegation_enabled
+                )
+                else ""
+            )
             + repository_sandbox_contract(workload)
             + "\n\n"
             + BASE_AGENT_PROMPT
@@ -1545,17 +1717,67 @@ def _run_autonomous(
     workload: SweBenchWorkload,
     backend: DockerWorkspaceBackend,
     adapter: DeepAgentsRuntimeAdapter,
-) -> dict[str, Any]:
-    agent = _build_autonomous_agent(config, workload, backend, adapter)
-    return _invoke_with_partial_state(
+    artifact_dir: Path,
+) -> tuple[dict[str, Any], dict[str, Any] | None, list[dict[str, Any]]]:
+    reports: list[dict[str, Any]] = []
+    plan_payload: dict[str, Any] | None = None
+    prompt = _task_prompt(workload)
+    delegation_enabled = True
+    if config.subagent_fanout_profile == "parallel_analysis_2to3":
+        planner = _model(config, adapter).with_structured_output(
+            ParallelAnalysisPlan,
+            method="function_calling",
+            strict=False,
+        )
+        plan = planner.invoke(
+            [
+                {"role": "system", "content": PARALLEL_ANALYSIS_PLANNER_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            config={
+                "callbacks": [adapter],
+                "metadata": {"beliefkv_mode": "parallel_analysis_planner"},
+            },
+        )
+        if not isinstance(plan, ParallelAnalysisPlan):
+            plan = ParallelAnalysisPlan.model_validate(plan)
+        tasks = _parallel_analysis_tasks(plan)
+        reports = _run_declared_analysis_children(
+            config,
+            workload,
+            backend,
+            adapter,
+            tasks,
+            artifact_dir,
+            group_id=f"parallel-analysis:{workload.instance_id}",
+        )
+        plan_payload = plan.model_dump(mode="json")
+        evidence = "\n\n".join(
+            f"[{item['role']}]\n{str(item['report'])[:24000]}" for item in reports
+        )
+        prompt += (
+            "\n\nThe controlled parallel analysis stage has completed. Verify and "
+            "integrate these read-only child reports; do not create additional "
+            f"subagents.\n\n{evidence}"
+        )
+        delegation_enabled = False
+    agent = _build_autonomous_agent(
+        config,
+        workload,
+        backend,
+        adapter,
+        delegation_enabled=delegation_enabled,
+    )
+    result = _invoke_with_partial_state(
         agent,
-        {"messages": [{"role": "user", "content": _task_prompt(workload)}]},
+        {"messages": [{"role": "user", "content": prompt}]},
         {
             "callbacks": [adapter],
             "recursion_limit": config.recursion_limit,
             "metadata": {"beliefkv_mode": "autonomous"},
         },
     )
+    return result, plan_payload, reports
 
 
 def _run_planned_child(
@@ -1654,39 +1876,39 @@ def _run_planned_child(
         child_backend.close()
 
 
-def _run_planned(
+def _parallel_analysis_tasks(plan: ParallelAnalysisPlan) -> list[DelegatedTask]:
+    repository = plan.repository_analysis.strip()
+    tests = plan.test_analysis.strip()
+    if not repository or not tests:
+        raise ValueError("parallel analysis requires two non-empty mandatory tasks")
+    tasks = [
+        DelegatedTask(role="repository-explorer", description=repository),
+        DelegatedTask(role="test-analyst", description=tests),
+    ]
+    compatibility = (plan.compatibility_analysis or "").strip()
+    if compatibility:
+        tasks.append(
+            DelegatedTask(
+                role="compatibility-analyst",
+                description=compatibility,
+            )
+        )
+    return tasks
+
+
+def _run_declared_analysis_children(
     config: DeepAgentsExperimentConfig,
     workload: SweBenchWorkload,
     backend: DockerWorkspaceBackend,
     adapter: DeepAgentsRuntimeAdapter,
+    tasks: Sequence[DelegatedTask],
     artifact_dir: Path,
-) -> tuple[dict[str, Any], DelegationPlan, list[dict[str, Any]]]:
-    planner_model = _model(config, adapter)
-    planner = planner_model.with_structured_output(
-        DelegationPlan,
-        method="function_calling",
-        strict=False,
-    )
-    plan = planner.invoke(
-        [
-            {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
-            {"role": "user", "content": _task_prompt(workload)},
-        ],
-        config={
-            "callbacks": [adapter],
-            "metadata": {"beliefkv_mode": "planned_planner"},
-        },
-    )
-    if not isinstance(plan, DelegationPlan):
-        plan = DelegationPlan.model_validate(plan)
-    write_json(artifact_dir / "plan.json", plan.model_dump(mode="json"))
-    planned_tasks = [
-        DelegatedTask(role=f"analysis-{index + 1}", description=description)
-        for index, description in enumerate(plan.tasks)
-    ]
+    *,
+    group_id: str,
+) -> list[dict[str, Any]]:
     handles = adapter.declare_runtime_tasks(
-        [(item.role, item.description) for item in planned_tasks],
-        group_id=f"planned:{workload.instance_id}",
+        [(item.role, item.description) for item in tasks],
+        group_id=group_id,
     )
     reports: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=max(1, len(handles))) as executor:
@@ -1700,7 +1922,7 @@ def _run_planned(
                 handle,
                 task,
             ): (handle, task)
-            for handle, task in zip(handles, planned_tasks)
+            for handle, task in zip(handles, tasks)
         }
         for future in as_completed(futures):
             handle, task = futures[future]
@@ -1744,6 +1966,48 @@ def _run_planned(
                 }
             )
             write_json(artifact_dir / "child_reports.json", reports)
+    return reports
+
+
+def _run_planned(
+    config: DeepAgentsExperimentConfig,
+    workload: SweBenchWorkload,
+    backend: DockerWorkspaceBackend,
+    adapter: DeepAgentsRuntimeAdapter,
+    artifact_dir: Path,
+) -> tuple[dict[str, Any], DelegationPlan, list[dict[str, Any]]]:
+    planner_model = _model(config, adapter)
+    planner = planner_model.with_structured_output(
+        DelegationPlan,
+        method="function_calling",
+        strict=False,
+    )
+    plan = planner.invoke(
+        [
+            {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+            {"role": "user", "content": _task_prompt(workload)},
+        ],
+        config={
+            "callbacks": [adapter],
+            "metadata": {"beliefkv_mode": "planned_planner"},
+        },
+    )
+    if not isinstance(plan, DelegationPlan):
+        plan = DelegationPlan.model_validate(plan)
+    write_json(artifact_dir / "plan.json", plan.model_dump(mode="json"))
+    planned_tasks = [
+        DelegatedTask(role=f"analysis-{index + 1}", description=description)
+        for index, description in enumerate(plan.tasks)
+    ]
+    reports = _run_declared_analysis_children(
+        config,
+        workload,
+        backend,
+        adapter,
+        planned_tasks,
+        artifact_dir,
+        group_id=f"planned:{workload.instance_id}",
+    )
 
     evidence = "\n\n".join(
         f"[{item['role']}]\n{str(item['report'])[:24000]}" for item in reports
@@ -1969,6 +2233,41 @@ def _trace_summary(path: Path) -> dict[str, Any]:
         if item.get("kind") == "return"
         and item.get("invocation_id") in children
     }
+    children_by_parent: dict[str, list[str]] = {}
+    child_start_ms: dict[str, float] = {}
+    child_return_ms: dict[str, float] = {}
+    for item in records:
+        if item.get("kind") == "invocation_create" and item.get(
+            "parent_invocation_id"
+        ) is not None:
+            child_id = str(item.get("invocation_id"))
+            parent_id = str(item.get("parent_invocation_id"))
+            children_by_parent.setdefault(parent_id, []).append(child_id)
+            child_start_ms[child_id] = float(item.get("ts_ms", 0.0))
+        elif item.get("kind") == "return" and item.get("invocation_id") is not None:
+            child_return_ms[str(item["invocation_id"])] = float(
+                item.get("ts_ms", 0.0)
+            )
+    transitions = []
+    for child_id, start_ms in child_start_ms.items():
+        transitions.append((start_ms, 1))
+        if child_id in child_return_ms:
+            transitions.append((child_return_ms[child_id], -1))
+    active_children = 0
+    peak_concurrent_children = 0
+    for _ts_ms, delta in sorted(transitions, key=lambda item: (item[0], -item[1])):
+        active_children += delta
+        peak_concurrent_children = max(peak_concurrent_children, active_children)
+    return_spans = []
+    for child_ids in children_by_parent.values():
+        returned = [child_return_ms[item] for item in child_ids if item in child_return_ms]
+        if len(returned) >= 2:
+            return_spans.append(max(returned) - min(returned))
+    join_type_counts = Counter(
+        str((item.get("attributes") or {}).get("mode", "unknown"))
+        for item in records
+        if item.get("kind") == "join_create"
+    )
     tool_status_observations = 0
     mutating_tool_ends = 0
     workspace_digest_observations = 0
@@ -1999,6 +2298,14 @@ def _trace_summary(path: Path) -> dict[str, Any]:
         "event_count": len(records),
         "event_counts": dict(sorted(counts.items())),
         "dynamic_subagent_count": counts["spawn"],
+        "fanout_parent_count": len(children_by_parent),
+        "fanout_by_parent": {
+            parent: len(child_ids)
+            for parent, child_ids in sorted(children_by_parent.items())
+        },
+        "peak_concurrent_children": peak_concurrent_children,
+        "join_type_counts": dict(sorted(join_type_counts.items())),
+        "child_return_span_ms": max(return_spans) if return_spans else 0.0,
         "llm_request_count": external_llm_submits,
         "llm_result_count": external_llm_results,
         "llm_pairing_valid": external_llm_submits == external_llm_results,
@@ -2205,7 +2512,13 @@ def _run_workflow(
         backend.start()
         adapter.start()
         if config.mode == "autonomous":
-            result = _run_autonomous(config, workload, backend, adapter)
+            result, plan_payload, child_reports = _run_autonomous(
+                config,
+                workload,
+                backend,
+                adapter,
+                workflow_dir,
+            )
         else:
             result, plan, child_reports = _run_planned(
                 config, workload, backend, adapter, workflow_dir
@@ -2374,7 +2687,8 @@ def run_experiment(config: DeepAgentsExperimentConfig) -> dict[str, Any]:
         "dataset_revision": bundle.dataset_revision,
         "workload_manifest_sha256": bundle.manifest_sha256,
         "instance_ids": [item.instance_id for item in workloads],
-        "dynamic_subagent_policy": "runtime-selected; no fixed count",
+        "dynamic_subagent_policy": config.subagent_fanout_profile,
+        "workflow_arrival_interval_ms": config.workflow_arrival_interval_ms,
         "evaluation_scope": (
             "load_and_kv_migration_measurement; official correctness requires "
             "SWE-bench harness"
@@ -2394,10 +2708,16 @@ def run_experiment(config: DeepAgentsExperimentConfig) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     try:
         with ThreadPoolExecutor(max_workers=config.concurrency) as executor:
-            futures = {
-                executor.submit(_run_workflow, config, bundle, workload): workload
-                for workload in workloads
-            }
+            futures = {}
+            for index, workload in enumerate(workloads):
+                futures[
+                    executor.submit(_run_workflow, config, bundle, workload)
+                ] = workload
+                if (
+                    config.workflow_arrival_interval_ms > 0
+                    and index + 1 < len(workloads)
+                ):
+                    time.sleep(config.workflow_arrival_interval_ms / 1000.0)
             for future in as_completed(futures):
                 workload = futures[future]
                 try:
@@ -2481,6 +2801,41 @@ def run_experiment(config: DeepAgentsExperimentConfig) -> dict[str, Any]:
         "dynamic_subagent_count": sum(
             int(item.get("trace", {}).get("dynamic_subagent_count", 0))
             for item in results
+        ),
+        "subagent_fanout_profile": config.subagent_fanout_profile,
+        "fanout_parent_count": sum(
+            int(item.get("trace", {}).get("fanout_parent_count", 0))
+            for item in results
+        ),
+        "fanout_values": sorted(
+            int(fanout)
+            for item in results
+            for fanout in item.get("trace", {})
+            .get("fanout_by_parent", {})
+            .values()
+        ),
+        "peak_concurrent_children": max(
+            (
+                int(item.get("trace", {}).get("peak_concurrent_children", 0))
+                for item in results
+            ),
+            default=0,
+        ),
+        "join_type_counts": dict(
+            sorted(
+                sum(
+                    (
+                        Counter(item.get("trace", {}).get("join_type_counts", {}))
+                        for item in results
+                    ),
+                    Counter(),
+                ).items()
+            )
+        ),
+        "child_return_span_ms": sorted(
+            float(item.get("trace", {}).get("child_return_span_ms", 0.0))
+            for item in results
+            if float(item.get("trace", {}).get("child_return_span_ms", 0.0)) > 0
         ),
         "llm_request_count": sum(
             int(item.get("trace", {}).get("llm_request_count", 0))

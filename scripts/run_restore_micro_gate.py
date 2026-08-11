@@ -19,6 +19,16 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--runtime-audit", type=Path, required=True)
+    parser.add_argument("--gate-id", default="p5g-restore-v1")
+    parser.add_argument(
+        "--no-d2h-control",
+        action="store_true",
+        help=(
+            "Run only victim and anchor. The victim should naturally finish at "
+            "the treatment's D2H trigger position, leaving a matched batch-1 "
+            "anchor interval without an explicit transfer."
+        ),
+    )
     parser.add_argument("--base-url", default="http://127.0.0.1:18000/v1")
     parser.add_argument(
         "--model", default="Qwen3-Coder-30B-A3B-Instruct-FP8"
@@ -27,6 +37,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor-prompt-words", type=int, default=48_000)
     parser.add_argument("--replacement-prompt-words", type=int, default=64_000)
     parser.add_argument("--holder-output-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--victim-output-tokens",
+        type=int,
+        default=None,
+        help="Override holder-output-tokens for the retracted request.",
+    )
+    parser.add_argument(
+        "--anchor-output-tokens",
+        type=int,
+        default=None,
+        help="Override holder-output-tokens for the uninterrupted anchor request.",
+    )
     parser.add_argument("--replacement-output-tokens", type=int, default=256)
     parser.add_argument(
         "--required-max-running-requests",
@@ -38,6 +60,16 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--service-wait-seconds", type=float, default=300.0)
+    parser.add_argument(
+        "--replacement-submit-delay-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Submit the replacement after this fixed delay instead of waiting for "
+            "asynchronously persisted GPU-service telemetry. Intended for controlled "
+            "microbenchmarks only."
+        ),
+    )
     parser.add_argument("--request-timeout-seconds", type=float, default=1800.0)
     return parser.parse_args()
 
@@ -160,6 +192,16 @@ def _wait_for_initial_service(
 
 def main() -> int:
     args = _parse_args()
+    victim_output_tokens = (
+        args.holder_output_tokens
+        if args.victim_output_tokens is None
+        else args.victim_output_tokens
+    )
+    anchor_output_tokens = (
+        args.holder_output_tokens
+        if args.anchor_output_tokens is None
+        else args.anchor_output_tokens
+    )
     pause_file = Path(
         os.environ.get(
             "BELIEFKV_EXPERIMENT_PAUSE_FILE",
@@ -174,6 +216,8 @@ def main() -> int:
         args.anchor_prompt_words,
         args.replacement_prompt_words,
         args.holder_output_tokens,
+        victim_output_tokens,
+        anchor_output_tokens,
         args.replacement_output_tokens,
         args.required_max_running_requests,
         args.service_wait_seconds,
@@ -181,6 +225,8 @@ def main() -> int:
     )
     if any(value <= 0 for value in positive):
         raise ValueError("micro-gate sizes and timeouts must be positive")
+    if args.replacement_submit_delay_seconds < 0:
+        raise ValueError("replacement submit delay cannot be negative")
     server_info = _server_info(args.base_url, min(10.0, args.request_timeout_seconds))
     actual_max_running = int(server_info.get("max_running_requests", 0) or 0)
     if actual_max_running != args.required_max_running_requests:
@@ -202,12 +248,12 @@ def main() -> int:
         "victim": (
             "restore-micro-gate:victim",
             args.victim_prompt_words,
-            args.holder_output_tokens,
+            victim_output_tokens,
         ),
         "anchor": (
             "restore-micro-gate:anchor",
             args.anchor_prompt_words,
-            args.holder_output_tokens,
+            anchor_output_tokens,
         ),
         "replacement": (
             "restore-micro-gate:replacement",
@@ -227,31 +273,44 @@ def main() -> int:
             for role, (workflow_id, words, output_tokens) in specs.items()
             if role != "replacement"
         }
-        _wait_for_initial_service(
-            args.runtime_audit.expanduser().resolve(),
-            tuple(first.values()),
-            args.service_wait_seconds,
-        )
-        replacement_spec = specs["replacement"]
-        replacement = executor.submit(
-            _post,
-            endpoint,
-            _payload(
-                args.model,
-                replacement_spec[0],
-                "replacement",
-                replacement_spec[1],
-                replacement_spec[2],
-            ),
-            args.request_timeout_seconds,
-        )
-        for role, future in {**first, "replacement": replacement}.items():
+        if not args.no_d2h_control:
+            if args.replacement_submit_delay_seconds > 0:
+                time.sleep(args.replacement_submit_delay_seconds)
+                for future in first.values():
+                    if future.done() and future.exception() is not None:
+                        future.result()
+            else:
+                _wait_for_initial_service(
+                    args.runtime_audit.expanduser().resolve(),
+                    tuple(first.values()),
+                    args.service_wait_seconds,
+                )
+        submitted = dict(first)
+        if not args.no_d2h_control:
+            replacement_spec = specs["replacement"]
+            submitted["replacement"] = executor.submit(
+                _post,
+                endpoint,
+                _payload(
+                    args.model,
+                    replacement_spec[0],
+                    "replacement",
+                    replacement_spec[1],
+                    replacement_spec[2],
+                ),
+                args.request_timeout_seconds,
+            )
+        for role, future in submitted.items():
             results[role] = future.result()
     finished_at = datetime.now(timezone.utc)
     manifest = {
         "schema_version": 1,
-        "kind": "deterministic_restore_micro_gate",
-        "gate_id": "p5g-restore-v1",
+        "kind": (
+            "d2h_overlap_no_d2h_control"
+            if args.no_d2h_control
+            else "deterministic_restore_micro_gate"
+        ),
+        "gate_id": None if args.no_d2h_control else args.gate_id,
         "started_at": started_at.isoformat(),
         "finished_at": finished_at.isoformat(),
         "duration_seconds": (finished_at - started_at).total_seconds(),
@@ -261,6 +320,9 @@ def main() -> int:
             "max_total_num_tokens": server_info.get("max_total_num_tokens"),
             "status": server_info.get("status"),
         },
+        "replacement_submit_delay_seconds": (
+            args.replacement_submit_delay_seconds
+        ),
         "request_specs": {
             role: {
                 "workflow_id": workflow_id,
@@ -268,6 +330,7 @@ def main() -> int:
                 "max_tokens": output_tokens,
             }
             for role, (workflow_id, words, output_tokens) in specs.items()
+            if not args.no_d2h_control or role != "replacement"
         },
         "results": results,
     }

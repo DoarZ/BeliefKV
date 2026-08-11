@@ -671,15 +671,9 @@ class _Candidate:
 
     @property
     def order_key(self) -> tuple[object, ...]:
-        return (
-            self.causal_rank,
-            -self.unblock_depth,
-            -self.pending_messages,
-            self.prediction_order_key,
-            self.request.submitted_ts_ms,
-            self.request.invocation_id,
-            self.request.request_id,
-        )
+        # P5 remains an observed-state policy. P6 predictions are evaluated in
+        # a separate read-only risk planner and cannot alter this ordering.
+        return self.observed_order_key
 
 
 class ObservedJointPlanner:
@@ -1038,22 +1032,8 @@ class ObservedJointPlanner:
             policy_input,
             tuple(candidates_by_workflow),
         )
-        influence: Counter[str] = Counter()
         for items in candidates_by_workflow.values():
-            items.sort(key=lambda item: item.order_key)
-            observed = sorted(items, key=lambda item: item.observed_order_key)
-            predictive_index = {
-                item.request.invocation_id: index
-                for index, item in enumerate(items)
-            }
-            for index, item in enumerate(observed):
-                if predictive_index.get(item.request.invocation_id) != index:
-                    influence["ordering_changed"] += 1
-        for items in candidates_by_workflow.values():
-            for item in items:
-                if item.prediction_support_level:
-                    influence["prediction_available"] += 1
-                    influence[f"support_{item.prediction_support_level}"] += 1
+            items.sort(key=lambda item: item.observed_order_key)
         ordered: list[_Candidate] = []
         for index in range(self.config.max_frontier_candidates_per_workflow):
             for workflow_id in workflow_order:
@@ -1062,7 +1042,7 @@ class ObservedJointPlanner:
                     ordered.append(items[index])
                     if len(ordered) >= self.config.max_total_frontier_candidates:
                         return tuple(ordered), fairness, influence
-        return tuple(ordered), fairness, influence
+        return tuple(ordered), fairness, Counter()
 
     def _bounded_seed(
         self,
@@ -1691,42 +1671,6 @@ class AsyncSemanticJointPlanner(ObservedJointPlanner):
                 ),
             )
 
-        predicted_idle_ms: dict[str, float] = {}
-        prediction_metadata = policy_input.optional_metadata.get(
-            "frontier_predictions"
-        )
-        if (
-            prediction_metadata is not None
-            and isinstance(prediction_metadata.value, Mapping)
-        ):
-            invocations = _mapping(rccg.get("invocations"))
-            invocation_contexts = {
-                str(invocation_id): str(_mapping(raw).get("context_id", ""))
-                for invocation_id, raw in invocations.items()
-            }
-            for invocation_id, raw in prediction_metadata.value.items():
-                if not isinstance(raw, Mapping):
-                    continue
-                idle: float | None = None
-                for key in (
-                    "remaining_external_wait_ms_p50",
-                    "next_output_tokens_p50",
-                    "remaining_decode_tokens_p50",
-                ):
-                    candidate = raw.get(key)
-                    if isinstance(candidate, (int, float)) and candidate >= 0:
-                        idle = float(candidate)
-                        break
-                if idle is None:
-                    continue
-                context_id = invocation_contexts.get(str(invocation_id), "")
-                if not context_id:
-                    continue
-                predicted_idle_ms[context_id] = min(
-                    predicted_idle_ms.get(context_id, idle),
-                    idle,
-                )
-
         targets: list[SemanticResidencyTarget] = []
         reclaimed = 0
         victims = sorted(
@@ -1743,17 +1687,10 @@ class AsyncSemanticJointPlanner(ObservedJointPlanner):
                 and context_id in context_epochs
             ),
             key=lambda item: (
-                (
-                    -predicted_idle_ms[item[0]]
-                    if item[0] in predicted_idle_ms
-                    else item[2]
-                ),
+                item[2],
                 -item[1],
                 item[0],
             ),
-        )
-        victim_prediction_count = sum(
-            1 for item in victims if item[0] in predicted_idle_ms
         )
         for context_id, reclaimable, _last_access in victims:
             if reclaimed >= reclaim_goal:
@@ -1789,7 +1726,7 @@ class AsyncSemanticJointPlanner(ObservedJointPlanner):
             seen_prefetch_contexts.add(context_id)
             if len(seen_prefetch_contexts) >= self.config.max_workflow_candidates:
                 break
-        return tuple(targets), victim_prediction_count
+        return tuple(targets), 0
 
 
 def _phase_timings(values: Mapping[str, float]) -> tuple[tuple[str, float], ...]:

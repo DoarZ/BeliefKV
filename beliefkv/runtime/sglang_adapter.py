@@ -363,6 +363,7 @@ class SGLangSourceContract:
             "allow_eviction: bool = True",
             "beliefkv_callback_errors",
             "beliefkv_source: Optional[str] = None",
+            '"on_hicache_transfer_submitted"',
             '"on_hicache_transfer_completed"',
         ),
     }

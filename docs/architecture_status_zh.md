@@ -1,10 +1,29 @@
 # BeliefKV 最新架构与实现状态
 
-更新日期：2026-08-01
+更新日期：2026-08-11
 
-状态基线：P5G system correctness gate 已通过并冻结架构；P6.0 已在最新 autonomous w4 上完成严格
-identity coverage 与版本化训练证据导出。P6 online path 仍关闭。本文描述
-当前磁盘上的实际代码，不只描述已提交文件。
+状态基线：P5G system correctness gate 已通过并冻结架构；最新版 P6 R0--R5 代码路径和实验
+基础设施已经实现，GPU gate 尚未全部执行。2026-08-10 的 GPU0 受控矩阵表明，相同 2.659 GB KV 从
+7 个 extents 增加到 106 个 extents 时，D2H 均值由 185.69 ms 增至 765.17 ms。当前模型首版
+只以 bytes 和 extent count 为条件。后续冻结 Xarray w8 characterization 发现
+`PREPARE_HOST` 被错误施加 future-HBM gate；修正后曾在 post-hoc development replay 中出现
+promotion/veto，但这不能通过预声明的 M5 gate。随后完成 veto-only 在线 treatment：7/8 workflow 完成，
+P5 shutdown/事务守恒通过，但发现在线 `min_samples=8` 错误覆盖了 artifact 的 3-run 校准门槛，
+使两个 arm 都回退静态带宽并产生 16 个伪 veto。修复后重放 14 个可用源 snapshot，byte-only 与
+shape-aware 均选择 2 个 PREPARE，promotion/veto/selected-action change 全为 0。按预声明 gate，
+morphology 降级为 transfer cost/OOD safety 辅助模型；M6 在线收益仍未证明。
+
+2026-08-11 已修复该实验暴露的 service contract：runtime 在线样本门槛与 artifact 校准门槛
+独立，启动时验证 warm-start 至少支持一个代表性 query，并把契约摘要写入初始化审计。进一步
+审计发现历史 1,922 次 native D2H 的 owner 均为空，根因是完成回调才查询已变化的 ownership；
+现在改为 submit 时冻结 owner context/epoch、extent size 和 ownership revision。旧 trace 无法
+追溯恢复这些标签。最新执行路线不再把独立 causal useful-action oracle 设为在线动作的前置 gate，
+而是在端到端 A/B 中同步记录 useful/wasted/too-late/censored 动作归因。
+
+当前 P6 权威实施顺序见
+[`beliefkv_p6_predictive_joint_execution_plan_2026-08-11_zh.md`](beliefkv_p6_predictive_joint_execution_plan_2026-08-11_zh.md)。
+该计划删除 morphology 独立策略，增加受控 2--3 child fan-out workload，并把 FrontierBelief 接入
+现有 admission 与 selective running retraction；历史 P6 段落只用于追溯。
 
 本文回答三个问题：
 
@@ -20,6 +39,62 @@ identity coverage 与版本化训练证据导出。P6 online path 仍关闭。�
 - **部分完成**：核心代码存在，仍缺少关键接入、信号或实验；
 - **Shadow/Replay**：可以生成和比较决策，但不能改变真实请求队列或 KV residency；
 - **未实现**：仅存在设计和接口计划。
+
+## 0. 2026-08-11 技术主线与状态覆盖
+
+本节覆盖本文后续历史段落中的旧 P6 优先级；P5/P5G 的实现记录仍保留作为追溯依据。
+
+```text
+Runtime events + RCCG + FrontierBelief
+  -> EXPAND / CLOSE / HOLD causal frontier
+  -> reentry / future-pressure / demand scenarios
+                         +
+SafePointPhysicalSnapshot + Radix ownership
+  -> live PhysicalBundle + calibrated transfer cost
+                         |
+                         v
+JointPlan
+  -> execution priority + admission
+  -> bounded PREPARE_HOST
+  -> optional selective retraction + replacement
+  -> existing P5 transaction / ACK / restore path
+```
+
+物理可行性仍使用以下判据，但它只是 transfer cost 约束，不是当前核心创新主张：
+
+```text
+transfer_slack = min(pressure_deadline, reentry_deadline)
+                 - Q90(T_transfer | bytes, extent_count, contention)
+                 - safety_guard
+```
+
+`transfer_slack` 为负、transfer cost unsupported、future HBM 不可行或 certificate 失效时，
+预测 overlay 不发布动作，系统保持 P5 observed seed。该机制不引入第二个 KV planner，
+也不改变现有 restore transaction。
+
+当前模块状态：
+
+| 模块 | 状态 | 下一项产物 |
+|---|---|---|
+| P5 observed JointPlan/restore | 在线完成并冻结 | 仅修 correctness bug |
+| predictive intent/rematerialization/ACK 路径 | 机制完成 | 单个自然正收益动作 canary |
+| GPU0 同 bytes、不同 shape 测量 | development evidence 完成 | 7/106 extents 为 185.69/765.17 ms |
+| 自然 agent trace 形态审计 | 完成 | 13 个稳定 parked episode；5 个高碎片 episode 分布在 3/5 个 context |
+| extent-count-aware transfer model | development artifact 完成 | 仅以 bytes/count 为条件，完整 morphology 尚未闭合 |
+| transfer service contract | 在线完成 | runtime/artifact 独立门槛、hardware key、supported query fail-fast |
+| native HiCache ownership telemetry | 机制完成 | submit-time owner/epoch/extent/revision；等待新 trace 验证 coverage |
+| morphology 独立策略 | 已删除 | 仅保留统一 bytes/extent-count/contention transfer cost/OOD guard |
+| bytes-only 对照 replay | 实现完成，稳定 decision gate 未通过 | 修正 service contract 后 14 snapshot 中 0 action flip |
+| R3 单动作 PREPARE canary | 机制完成 | 新统一 analyzer 已完成；自然 GPU 动作待验证 |
+| 受控 2--3 child fan-out workload | 机制完成 | fake-backend 通过；短 GPU smoke 待执行 |
+| Frontier-Aware Retraction | 机制完成 | 默认 shadow，最多一笔在线变化；GPU gate 待执行 |
+| 在线动作归因 | 机制完成 | useful/wasted/too-late/censored/failed ledger 已接入 |
+| R5 配对 A/B | 基础设施完成 | v9 run plan 冻结为 A-B/B-A/A-B；六次 GPU run 待执行 |
+| 端到端收益 | 未证明 | 以 clean workflows/hour 和完整归因链共同判断 |
+
+GPU1 crossover、small-size 完整矩阵、progressive slicing、KV compaction、自定义 DMA、
+PREFETCH_GPU 和 P8 baseline 适配均暂缓。当前只实现对现有 selective retraction 的轻量预测注解，
+不新增物理抢占机制。
 
 ## 1. 当前最重要的架构结论
 
@@ -48,6 +123,15 @@ RCCG + consumer index + PageOwnershipIndex + resource observation
   -> current PhysicalBundle materialization (at most one transfer transaction)
   -> JointPlanEpoch -> ticket / residency / retraction
 
+预测联合路径（P6，默认关闭）
+FrontierBelief scenarios + RCCG causal deadlines
+  + live PhysicalTransferShape + calibrated transfer model
+  -> action-specific risk/benefit under causal slack
+  -> ScenarioRiskPlanner
+  -> semantic PredictiveIntent merged into the same JointPlan
+  -> safe-point live-shape rematerialization
+  -> existing P5 transaction / ACK / restore path
+
 延后比较路径（P8，默认关闭）
 immutable PolicyInput + frozen trace
   -> 按届时论文接口重新实现的有效 baseline
@@ -63,9 +147,20 @@ retraction 必须有显式 `RetractionIntent` 和 `source_joint_plan_id`。
 两者统一进入 transfer timeline，并用 `telemetry_origin` 区分；native 路径仍绕过 BeliefKV
 command queue，因此控制归因与数据面完成事件必须分开解释。
 
-因此，当前版本可以描述为“在线 JointPlan 代码路径已接入，P6.0/P6.1 训练前基础设施开始实现”，
-但不能描述为“P5 已通过实验门槛”或“预测策略已在线启用”。P5G GPU clean-completion gate
-通过前，P6 只允许离线 analyzer/coverage 工作。
+native HiCache callback 的 attribution 语义已改为：submit 时从 `PageOwnershipIndex` 冻结
+generation-aware `PageHandle`、owner context、context epoch、extent size 和 revision，complete 时
+只消费该快照。telemetry 显式记录 generation/owner/extent coverage；旧记录没有 submit snapshot 时
+才使用 `completion_lookup` 兼容路径。该修改解决 context 在 DMA 完成前解绑或 node ID 重用导致
+归因漂移的问题。
+
+transfer artifact 加载后执行 service-contract preflight。合法状态允许
+`runtime_min_samples=8`、`artifact_min_samples=3`；关键是 warm-start bucket 按 artifact 自身门槛
+保持 supported。若加载样本为零或所有代表性 query 都 unsupported，server 在 workload 前失败，
+而不是回退静态带宽后继续发布预测结果。
+
+因此，当前版本可以描述为“P5 在线 JointPlan 已通过系统正确性 gate，P6 预测 overlay 的
+控制路径已实现并默认关闭”。不能描述为“形态感知策略已在线启用”或“预测策略已经产生
+端到端收益”；后续历史段落中关于 P5G 尚未通过的表述只记录当时状态，以本页第 0 节为准。
 
 2026-07-28 增加 P5E running-retraction restore obligation。此前 retraction 只保证 victim D2H 和
 replacement admission，没有持久保证被 requeue 的 victim 能再次完成 H2D 并获得 GPU service；真实
@@ -1065,10 +1160,13 @@ service。这样 JOIN 只对完成时刻取 max/min，不会对 raw token demand
     的 terminal ACK 必须通知所有 restore subscribers。
 19. `RESTORE_DRAIN_ACTIVE` 期间 coordinator 是唯一 admission/residency authority，普通 JointPlan
     不得提交在线动作。
+20. transfer estimate 必须绑定候选的真实 closure shape，不能只按 context bytes 计费。
+21. safe point 必须重建 live shape；它超出 intent 收益包络时，预测动作 fail closed。
+22. shape model unsupported/OOD 时必须退化到 P5 observed seed，不得跨 extent bucket 乐观外推。
 
 ## 15. 当前关键缺口与优先级
 
-建议下一阶段按以下顺序推进：
+以下先记录已经闭合的 P5 基线；它不是下一阶段待办。
 
 P5G full CPU gate 已完成。旧固定 w4 的失败被拆成两个独立问题：人工 peer orchestration 的
 self-handoff/终态语义，以及没有覆盖 restore 事务的 workload 偶然性。当前主 gate 已改为原生
@@ -1092,39 +1190,59 @@ system correctness gate 已关闭，接口可以冻结，P6 预测性物理动�
 不用于性能/JCT 结论。完整报告见
 `docs/experiments/beliefkv_p5g_autonomous_w4_system_gate_2026-08-01_zh.md`。
 
-1. **冻结 P5 接口并推进 P6 标签**：P5G system correctness gate 已通过；后续只修 correctness bug，
-   不再改变 P5 架构。继续区分 incremental action boundary、runtime transition boundary
-   和 reentry boundary。当前 remaining-decode-demand 标签可用，但 exact incremental action boundary 为 0%；
-   它需要在线增量 parser 或原始 token 的可靠离线 parser replay，不能由 SPAWN/RETURN/JOIN runtime
-   事件代替。
-2. **执行短时 w8 correctness smoke**：只验证超过 12 个可见 request 时的 ownership transition、
-   request ID 重用和并发 native operation；不做性能比较。通过前预测模块只输出 offline/shadow
-   `would_prepare/would_prefetch`，不得发送预测性物理动作。
-3. **继续验证 native HiCache telemetry**：request-admission demand-load、native write-back 与 BeliefKV
-   command DMA 去重已在 autonomous w4 覆盖 1,535 条物理 telemetry。资源图已将误导性的 `Protected` 改为
-   `Untracked allocator delta`，并增加 engine-locked、closure-blocked、migratable 和
-   dual-resident physical KV。
-4. **修复复合事件可见性**：同一 runtime step 的 join/target-create/handoff 原子交付；无法
-   原子交付时标记 transition-open，禁止 transient READY 触发不可撤销 prefetch。
-5. **闭合可终止的动态 workload**：保留 blocking、cyclic peer 和 mixed 结构，为单次 activation
-   加入语义完成与墙钟/调用预算，使正式 GPU run 能产生可解释的 RETURN/JOIN 和 JCT。
-6. **闭合 P2 性能 gate**：使用同 manifest 重跑 P1.5/P2，补 controller timing 和更保守的
-   transfer service curve。
-7. **采集局部 Jointness Audit**：只在真实 trace 中出现多个 READY agent、HBM/PCIe pressure 和
-   可选 physical action 的决策点保存短窗口快照；统计 execution/KV 双向决策反转和 local synergy。
-   语义分支不可识别的样本明确排除，不要求现在运行完整动态 O0-O3 模拟。
-8. **后置 rolling replay 深化**：系统路径稳定后再按 overlap episode 重建 GPU service model，
-   对齐真实 page/node extent、PCIe、request-private allocation 和 fairness；它不阻塞 P5 完整实现。
-9. **先做 P6.3 offline risk gate**：只比较 A0、PREPARE_HOST、PREFETCH_GPU，满足发布年龄、CVaR、
-   stale 和开销门槛后才进入 runtime shadow；shadow 只记录 `would_prepare/would_prefetch`，不发送
-   真实传输。开放预测性物理动作前运行一次短时 w8 correctness smoke；w24/w32 留到功能冻结后。
-10. **最后做新版 HiCache 和 P8 竞品对比**：系统和 workload 冻结后，再按真实 metadata
-   条件实现有效 adaptation、oracle 与可运行原生系统。
+M1--M6 本轮执行结果如下：
+
+1. **M1 自然形态审计，完成**：57 个候选 epoch 对应 51 个 physical generation，但稳定 parked
+   episode 只有 13 个；5 个高 extent-count WAIT_JOIN/WAIT_TOOL episode 分布在 3/5 个 context。
+   physical generation 不是独立 workload 样本，该结果只证明问题存在，不估计 prevalence。
+2. **M2 extent-count-aware 首版，完成 development artifact**：使用 GPU0 7/106-extents 结果 warm-start，
+   以 `bytes + extent_count` 邻域给出 P50/P90；删除会跨 extent bucket 抹平形态的
+   bytes-only fallback，样本不足返回 unsupported。extent-size 与 closure depth 尚未进入模型。
+3. **M3 精确 shape plumbing，完成**：从候选真实 Radix closure 构造 shape，PolicyInput 携带
+   immutable service snapshot，risk 使用被选 closure 的 bytes/count。
+4. **M4 JointPlan 接入，完成机制与测试**：在 PREPARE recourse 中使用
+   `causal slack - morphology debt`，继续复用 P5 certificate、transaction、ACK 和 fallback。
+   不修改 Frontier predictor、RCCG、fairness、restore protocol，也不增加动作类型。
+5. **M5 初始固定 trace 对照，只通过 timing gate**：124 个配对 snapshot、229 个候选
+   epoch 对应 58 个 context-physical-shape key（不是独立 workload 样本）；87 个 epoch/24 个 key
+   有 extent-count support。timing
+   estimate 与 feasibility reason 分别变化 87/147 次，但 promotion/veto/selected-action 均变化 0 次。
+6. **M6 单动作 canary，基础设施完成**：已实现 run-level 单 PREPARE 上限、
+   safe-point shape/cost envelope，以及 commit/queue/telemetry/ACK/terminal 五段 ID 守恒归因。
+   初始 trace 未开放 GPU；后续 Xarray characterization 曾出现 3 promotion/17 veto，但 veto
+   treatment 证明其 service sample-gate 不一致，修复后的同源 replay 为 0 action flip。一次
+   morphology-aware autonomous w8 虽然 8/8 正常结束，也未自然产生 PREPARE。因此 M6 在线
+   收益和 decision-relevance gate 均未通过。
+
+下一阶段不再为 morphology action flip 扩大 GPU matrix。extent-count-aware curve 作为统一
+transfer service/OOD safety 模型保留；P6 核心回到 FrontierBelief 对 agent causal slack、reentry
+demand、future pressure 和 action boundary 的预测，并检验它与 admission、KV 和 selective
+retraction 联合后能否提高 workflow throughput。任何新在线 arm 必须先验证 runtime 与 artifact 的
+service-contract 一致性。当前实施顺序以 2026-08-11 P6 执行计划为准：
+
+1. 删除 morphology 独立策略，并补齐 generation-aware attribution 与 observer fail-open；
+2. 实现 `parallel_analysis_2to3` fan-out workload，第一轮保持模型冻结并在 SPAWN 后预测；
+3. 直接完成一笔自然 PREPARE_HOST canary，同时记录 useful/wasted/too-late/censored；
+4. 用 EXPAND/CLOSE/HOLD 注解现有 running retraction，先 shadow 后完成一笔 canary；
+5. 在相同 fan-out profile 上比较 P5 observed 与完整 predictive JointPlan 的 workflow throughput。
+
+独立 causal useful-action oracle 不再是前置 gate；动作结果归因随 canary 和 A/B 一起完成。
+
+2026-08-11 的 R5 v7 第一笔 observed A arm 完成 8/8 workflow，但第二笔 predictive B arm 在
+高压 selective retraction 后触发 allocator/Radix duplicate device-index fail-closed，0/8 完成。
+B arm 在退出前没有选择 predictive physical action，因此该轮只暴露 P5 物理释放边界缺陷，不能
+用于比较 A/B。修复后 retraction suffix 必须排除 live Radix、already-free、invalid 和 duplicate
+page；确定性 high-fragment micro-gate 完成 2.659 GB D2H/H2D，14/14 correctness checks 通过。
+提交前完成可移植性修订后，新的 v9 A/B 已按相同 workload/artifact 和实验参数重新冻结，source
+tree SHA-256 为 `b95b5e4e7b91dce4698af5a964258698f25a19251ba8df411c548b9027a48a41`；v7/v8
+不再参与性能汇总。
+详见 `docs/experiments/beliefkv_p6_r5_retraction_ownership_repair_2026-08-11_zh.md`。
 
 当前最重要的研究问题已经不是“是否能迁移 KV”，而是：
 
-> 在真实动态 subagent/multi-agent workload 上，联合 execution、admission 和 KV 决策是否
-> 稳定优于 B0 以及最强的独立 Agent 调度或独立 KV oracle。
+> 动态 agent 的因果 frontier belief 能否识别即将扩张 TOOL/SPAWN 或闭合 RETURN/JOIN 的请求，
+> 并通过统一 admission、KV 和 selective retraction 提高 successful workflows/hour；extent count
+> 只负责 transfer cost 与 OOD 安全。
 
 长上下文的语义总结、tool-output 压缩和 checkpoint 由 agent 业务层负责。固定 SGLang 仅提供
 sliding-window、长度限制和物理 KV eviction，不提供 agent-aware 自动压缩；BeliefKV serving 层
@@ -1134,20 +1252,24 @@ sliding-window、长度限制和物理 KV eviction，不提供 agent-aware 自�
 
 建议按以下顺序理解当前版本：
 
-1. 本文：当前代码与阶段状态总览；
-2. [`beliefkv_hicache_joint_control_improvement_plan_2026-07-18_zh.md`](beliefkv_hicache_joint_control_improvement_plan_2026-07-18_zh.md)：
-   P0-P8 实施方案和 Go/No-Go 条件；
-3. [`experiments/beliefkv_p2_physical_bundle_2026-07-19_zh.md`](experiments/beliefkv_p2_physical_bundle_2026-07-19_zh.md)：
+1. [`beliefkv_design_2026-07-14_zh.md`](beliefkv_design_2026-07-14_zh.md)：
+   当前规范设计、算法主线和实施顺序；
+2. 本文：当前代码与阶段状态总览；
+3. [`experiments/beliefkv_p6_d2h_overlap_characterization_2026-08-09_zh.md`](experiments/beliefkv_p6_d2h_overlap_characterization_2026-08-09_zh.md)：
+   形态测量协议、GPU0 development evidence 与证据限制；
+4. [`experiments/beliefkv_p6_service_contract_and_native_ownership_2026-08-11_zh.md`](experiments/beliefkv_p6_service_contract_and_native_ownership_2026-08-11_zh.md)：
+   sample-gate 根因、修复契约、native ownership 标签边界和下一阶段 gate；
+5. [`beliefkv_hicache_joint_control_improvement_plan_2026-07-18_zh.md`](beliefkv_hicache_joint_control_improvement_plan_2026-07-18_zh.md)：
+   P0-P8 历史实施方案和 Go/No-Go 条件；
+6. [`experiments/beliefkv_p2_physical_bundle_2026-07-19_zh.md`](experiments/beliefkv_p2_physical_bundle_2026-07-19_zh.md)：
    P2 bundle 实现与 2026-07-21 真实复验；
-4. [`experiments/beliefkv_p3_dynamic_gpu_validation_2026-07-21_zh.md`](experiments/beliefkv_p3_dynamic_gpu_validation_2026-07-21_zh.md)：
+7. [`experiments/beliefkv_p3_dynamic_gpu_validation_2026-07-21_zh.md`](experiments/beliefkv_p3_dynamic_gpu_validation_2026-07-21_zh.md)：
    P3 12-workflow mixed characterization、迁移反例与 telemetry 边界；
-5. [`beliefkv_dynamic_agent_workflow_considerations_2026-07-20_zh.md`](beliefkv_dynamic_agent_workflow_considerations_2026-07-20_zh.md)：
+8. [`beliefkv_dynamic_agent_workflow_considerations_2026-07-20_zh.md`](beliefkv_dynamic_agent_workflow_considerations_2026-07-20_zh.md)：
    动态 workflow、consumer 和 prefix 关系边界；
-6. [`related_work_comparison_2026-07-21_zh.md`](related_work_comparison_2026-07-21_zh.md)：
+9. [`related_work_comparison_2026-07-21_zh.md`](related_work_comparison_2026-07-21_zh.md)：
    B0、P8 候选 baseline 和竞争边界；
-7. [`architecture.md`](architecture.md) 和
-   [`beliefkv_design_2026-07-14_zh.md`](beliefkv_design_2026-07-14_zh.md)：
-   基础控制面/数据面原则与历史设计背景。
+10. [`architecture.md`](architecture.md)：基础控制面/数据面原则。
 
 `figures/beliefkv_architecture_status.*` 和 `figures/beliefkv_phase_status.*` 仍是
 2026-07-15 的历史图，未覆盖 physical bundle、retry guard、P2.5 contract 和 P3。重新生成新版

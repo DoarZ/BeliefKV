@@ -29,7 +29,12 @@ from beliefkv.policy.resource_snapshot import (
 )
 from beliefkv.policy.service_curve import TransferServiceCurve
 from beliefkv.runtime.page_index import PageOwnershipIndex, PhysicalPageRecord
-from beliefkv.runtime.protocol import PageHandle, PhysicalResidency, TransferTelemetry
+from beliefkv.runtime.protocol import (
+    PageHandle,
+    PhysicalResidency,
+    TransferDirection,
+    TransferTelemetry,
+)
 
 
 class PolicySnapshotError(ValueError):
@@ -249,14 +254,31 @@ class PolicyInputSnapshotBuilder:
         )
         metadata = dict(optional_metadata or {})
         reserved_metadata_name = "beliefkv_resource_observation"
-        if reserved_metadata_name in metadata:
-            raise PolicySnapshotError(
-                f"optional metadata cannot override {reserved_metadata_name}"
-            )
+        transfer_metadata_name = "beliefkv_transfer_service_estimates"
+        transfer_curve_metadata_name = "beliefkv_transfer_service_curve_snapshot"
+        for name in (
+            reserved_metadata_name,
+            transfer_metadata_name,
+            transfer_curve_metadata_name,
+        ):
+            if name in metadata:
+                raise PolicySnapshotError(
+                    f"optional metadata cannot override {name}"
+                )
         metadata[reserved_metadata_name] = MetadataValue(
             source=MetadataSource.OBSERVED,
             value=dict(self.resource_builder.last_diagnostics),
             producer="resource_snapshot_builder",
+        )
+        metadata[transfer_metadata_name] = MetadataValue(
+            source=MetadataSource.OBSERVED,
+            value=self._transfer_service_estimates(bundles, observation),
+            producer="transfer_service_curve",
+        )
+        metadata[transfer_curve_metadata_name] = MetadataValue(
+            source=MetadataSource.OBSERVED,
+            value=self.service_curve.snapshot(),
+            producer="transfer_service_curve",
         )
         mappings = self._identity_mappings(frontier, identity_mappings)
         result = PolicyInput(
@@ -286,6 +308,84 @@ class PolicyInputSnapshotBuilder:
             allocator_version=self._allocator_version,
         )
         return result
+
+    def _transfer_service_estimates(
+        self,
+        bundles: tuple[PhysicalBundleSnapshot, ...],
+        observation: RuntimeResourceObservation,
+    ) -> dict[str, object]:
+        by_context: dict[str, list[PhysicalBundleSnapshot]] = {}
+        for bundle in bundles:
+            for context_id in bundle.owner_context_ids:
+                by_context.setdefault(context_id, []).append(bundle)
+        contexts: dict[str, object] = {}
+        for context_id, owned in sorted(by_context.items()):
+            h2d_bytes = sum(max(0, item.cpu_bytes - item.gpu_bytes) for item in owned)
+            d2h_bytes = sum(max(0, item.gpu_bytes - item.cpu_bytes) for item in owned)
+            page_count = sum(max(1, len(item.extent_ids)) for item in owned)
+            estimates: dict[str, object] = {}
+            for direction, size_bytes, command_kind, host_copy_state, native_bytes in (
+                (
+                    TransferDirection.H2D,
+                    h2d_bytes,
+                    "prefetch_context",
+                    "present",
+                    observation.urgent_h2d_bytes,
+                ),
+                (
+                    TransferDirection.D2H,
+                    d2h_bytes,
+                    "offload_context",
+                    "missing",
+                    observation.urgent_d2h_bytes,
+                ),
+            ):
+                if size_bytes <= 0:
+                    continue
+                estimate = self.service_curve.estimate(
+                    direction,
+                    size_bytes,
+                    page_count=page_count,
+                    command_kind=command_kind,
+                    host_copy_state=host_copy_state,
+                    pinned_host=True,
+                    native_concurrent_bytes=native_bytes,
+                )
+                estimates[direction.value] = {
+                    "size_bytes": size_bytes,
+                    "page_count": page_count,
+                    "command_kind": command_kind,
+                    "estimated_callback_ms": estimate.estimated_callback_ms,
+                    "setup_p90_ms": estimate.setup_p90_ms,
+                    "callback_floor_p90_ms": estimate.callback_floor_p90_ms,
+                    "fixed_overhead_p90_ms": estimate.fixed_overhead_p90_ms,
+                    "effective_bytes_per_ms_p10": (
+                        estimate.effective_bytes_per_ms_p10
+                    ),
+                    "sample_count": estimate.sample_count,
+                    "source": estimate.source,
+                    "nearest_bucket_distance": estimate.nearest_bucket_distance,
+                    "size_coverage_bytes": estimate.size_coverage_bytes,
+                    "extent_count_coverage": estimate.extent_count_coverage,
+                    "shape_bucket_distance": estimate.shape_bucket_distance,
+                    "shape_supported": estimate.shape_supported,
+                    "estimated_completion_p90_ms": (
+                        estimate.estimated_completion_p90_ms
+                    ),
+                    "estimated_unhidden_stall_p90_ms": (
+                        estimate.estimated_unhidden_stall_p90_ms
+                    ),
+                    "service_epoch": self.service_curve.warm_start_hardware_key,
+                }
+            if estimates:
+                contexts[context_id] = estimates
+        return {
+            "hardware_key": self.service_curve.warm_start_hardware_key,
+            "warm_start_sample_count": self.service_curve.warm_start_sample_count,
+            "warm_start_min_samples": self.service_curve.warm_start_min_samples,
+            "online_min_samples": self.service_curve.min_samples,
+            "contexts": contexts,
+        }
 
     def _workflow_fairness_state(
         self,

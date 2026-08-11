@@ -146,6 +146,41 @@ def test_unbounded_other_allows_prepare_but_rejects_prefetch() -> None:
     assert "other_has_no_finite_risk_bound" in summaries["prefetch"].reasons
 
 
+def test_prepare_host_reports_future_hbm_without_rejecting_shadow() -> None:
+    belief = _belief(finite_other=True)
+    baseline = _evaluation(
+        PredictiveActionPackage("a0", PredictiveActionKind.OBSERVED_BASELINE),
+        likely_delay=20.0,
+        other_delay=20.0,
+    )
+    package = PredictiveActionPackage(
+        "prepare", PredictiveActionKind.PREPARE_HOST, ("context",)
+    )
+    overflow = ScenarioCost(
+        action_unlock_delay_ms=1.0,
+        workflow_service_lag_ms=0.0,
+        future_hbm_feasible=False,
+        future_feasible=True,
+        future_hbm_peak_bytes=2_000,
+        future_hbm_overflow_bytes=1_000,
+    )
+    prepare = PackageScenarioEvaluation(
+        package=package,
+        costs_by_scenario={"likely": overflow},
+        other_cost=overflow,
+    )
+
+    decision = ScenarioRiskPlanner(
+        ScenarioRiskPlannerConfig(risk_budget_ms=100.0)
+    ).select(belief, baseline, (prepare,))
+
+    assert decision.selected_package_id == "prepare"
+    summary = decision.summaries[0]
+    assert summary.future_hbm_feasibility_probability == 0.0
+    assert summary.worst_future_hbm_overflow_bytes == 1_000
+    assert "future_hbm_chance_constraint" not in summary.reasons
+
+
 def test_unproven_restore_liveness_is_a_deterministic_rejection() -> None:
     belief = _belief(finite_other=True)
     baseline = _evaluation(

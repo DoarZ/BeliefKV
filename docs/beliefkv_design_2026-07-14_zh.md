@@ -1,10 +1,15 @@
 # BeliefKV 当前系统设计
 
-日期：2026-07-14
+日期：2026-07-14；最后更新：2026-08-11
 
-状态：设计与实现基线。核心控制面、模拟器和固定版本 SGLang patch 已落地；已完成单模型 CUDA 集成 smoke，论文级 GPU 实验尚未完成。
+状态：P5 observed-state JointPlan、迁移事务和 restore liveness 已通过定向正确性验证；P6 最新 R0--R5 的代码路径、fan-out workload、单动作 gate 和配对 A/B 基础设施已经实现，GPU gate 尚未全部执行。当前服务模型首版只以 bytes、extent count 和 contention 为条件，extent-size distribution 与 closure depth 尚未进入模型。2026-08-10 的单 GPU 受控实验发现：相同 2.659 GB KV 在 106 个 extents 下的 D2H 均值为 765.17 ms，在 7 个 extents 下为 185.69 ms，相差 4.12 倍。早期 promotion/veto 结论因 service-contract 错误和固定 trace 上无稳定 action flip 已失效；morphology 不再是独立策略，仅作为统一 transfer cost/OOD guard。预测式 PREPARE、Frontier-Aware Retraction 和端到端收益仍需最新版 GPU gate 证明。
 
 本文档取代 `technical_archive_2026-07-10.md` 作为当前设计的权威说明。旧文档保留为历史讨论记录，其中的 flat next-action predictor、静态 belief frontier 和以 `agent_id` 为核心的元数据设计不再代表当前方案。
+
+2026-08-11 之后的 P6 可执行顺序以
+[`beliefkv_p6_predictive_joint_execution_plan_2026-08-11_zh.md`](beliefkv_p6_predictive_joint_execution_plan_2026-08-11_zh.md)
+为准：删除 morphology 独立策略，取消独立 oracle 前置 gate，增加受控 2--3 child fan-out，并将
+FrontierBelief 作为现有 admission、KV 和 selective retraction 的统一 JointPlan 注解。
 
 ## 1. 研究目标
 
@@ -85,6 +90,63 @@ FORK/RESUME/PREFIX  物理 KV 共享策略
 
 Runtime Causal Context Graph 描述 context 的控制依赖和未来价值；SGLang Radix tree 描述 token prefix 的物理共享。二者之间是多对多关系，必须通过 page ownership/lineage bridge 连接。
 
+### 2.5 Agent 因果窗口必须使用可靠的物理迁移成本
+
+仅按 KV bytes 估算传输成本是不充分的。一次 context 级动作最终会物化为 Radix
+closure，其成本还取决于 extent/page 数量、extent 大小分布、closure 结构、Host
+copy 状态和并发传输条件。动态 agent workflow 则通过 `TOOL_WAIT`、`WAIT_CHILD`、
+`WAIT_JOIN` 和 message dependency 提供动作可以被隐藏的因果窗口。
+
+因此 P6 不再把“未来会不会再次调用该 agent”直接映射为 offload/prefetch，而是联合计算：
+
+```text
+agent/RCCG state       -> causal slack
+Radix physical closure -> morphology debt
+
+morphology_slack = min(pressure_deadline, reentry_deadline)
+                  - Q90(transfer_time | physical_shape, contention)
+                  - safety_guard
+```
+
+只有 `morphology_slack > 0`，且动作净收益、未来 HBM 和物理 certificate 均成立时，
+JointPlan 才能选择预测动作。预测 OOD、形态超出服务模型支持域或 safe point 重新物化
+后余量转负时，系统退化到 P5 observed policy。
+
+当前 GPU0 证据仅证明“物理成本估计不能只依赖 bytes”：相同 2,659,221,504 bytes
+下，7-extents 与 106-extents 的 D2H 均值分别为 185.69 ms 和 765.17 ms，三次重复
+方向一致。修复 transfer service sample-gate 后，同一冻结 trace 中该成本差异没有改变
+eligibility 或 selected action，因此 morphology 只保留为 transfer cost/OOD safety，不再
+承担核心创新主张。它也尚未证明 extent count 与成本的通用函数关系，或该差异由 agent
+workflow 独有地造成。测量协议、
+原始目录与证据限制见
+[`beliefkv_p6_d2h_overlap_characterization_2026-08-09_zh.md`](experiments/beliefkv_p6_d2h_overlap_characterization_2026-08-09_zh.md)。
+
+### 2.6 Transfer service 与 native ownership 是强数据契约
+
+P6 的收益判断依赖 transfer artifact，但在线观测与离线校准不能共用一个隐式样本门槛：
+
+- `runtime_min_samples` 只约束当前 server 在线积累的样本；
+- `artifact_min_samples` 由校准 artifact 自己声明并约束 warm-start 样本；
+- 加载 artifact 后必须至少有一个代表性 query 仍由校准证据支持；
+- hardware key、两个门槛、加载样本数、bucket 数和 supported query 数写入
+  `runtime_initialized.transfer_service_contract`；
+- 契约不成立时在 workload 启动前 fail fast，不能静默退化到静态 PCIe 带宽。
+
+native HiCache D2H/H2D 的 ownership 必须在 transfer submit 时冻结。完成回调时查询 live
+Radix tree 会受到 context unbind、node mutation 和 ID reuse 影响。新 telemetry 保存：
+
+```text
+owner_context_ids / owner_context_epochs
+extent_bytes
+ownership_revision
+ownership_attribution_semantics = submit_snapshot
+```
+
+旧 trace 中 1,922 次 native D2H 均缺少 owner attribution，不能用于判断某个 parked parent
+是否真正成为后续 reactive write-back victim，也不能据此计算 useful-shadow oracle 收益。
+旧记录只保留为总带宽/HBM 压力证据；需要新 trace 才能建立 context-level 因果归因。详细记录见
+[`beliefkv_p6_service_contract_and_native_ownership_2026-08-11_zh.md`](experiments/beliefkv_p6_service_contract_and_native_ownership_2026-08-11_zh.md)。
+
 ## 3. 非目标和已否定方向
 
 以下方向不作为当前核心创新：
@@ -150,9 +212,11 @@ Agent Runtime / Tool Dispatcher / Message Bus
 |       v                                          |
 |  Runtime Causal Context Graph                    |
 |       |                                          |
-|       +--> Reactive Causal Frontier Scheduler    |
-|       +--> Remaining-time Predictor (optional)   |
-|       +--> Prepare-Commit Migration Planner      |
+|       +--> Observed-state JointPlanner (P5)      |
+|       +--> FrontierBeliefModel (P6, optional)    |
+|       |        | causal deadlines                |
+|       |        v                                 |
+|       +--> Morphology-aware ScenarioRiskPlanner  |
 +--------------------------------------------------+
         |
         | context intents, admission decisions
@@ -161,7 +225,7 @@ Agent Runtime / Tool Dispatcher / Message Bus
 | SGLang Adapter                                   |
 |                                                  |
 |  KV Ownership / Lineage Index                    |
-|  Radix Arbitration Layer                         |
+|  Radix Closure Shape / Arbitration Layer         |
 |  Scheduler Command Queue                         |
 +--------------------------------------------------+
         |
@@ -172,11 +236,16 @@ SGLang Scheduler -> RadixCache/HiCache -> GPU/CPU KV
 核心职责边界：
 
 ```text
-BeliefKV：逻辑状态、因果关系、预测、策略和迁移意图
+BeliefKV：逻辑状态、因果关系、联合调度策略和迁移意图
 SGLang：token、Radix topology、allocator、物理页面和实际传输
 ```
 
 BeliefKV 不能直接修改 GPU tensor 或假设某个迁移命令已经成功。所有物理动作由 SGLang scheduler 在安全点执行，并通过 ACK 返回实际结果。
+
+P5 的 observed JointPlan 是在线安全下界。P6 风险规划器与 P5 共用同一
+`PolicyInput` 和物理快照；显式开关打开时，它只能把通过因果、形态、HBM 和
+certificate 检查的 semantic intent 合并进同一个 JointPlan，不能成为第二个调度器。
+默认配置仍为 read-only shadow。
 
 ## 6. Runtime Causal Context Graph
 
@@ -571,154 +640,215 @@ HiCache write-through/selective 主要基于通用 cache hit 和全局 write pol
 
 “PCIe 空闲时复制一份”本身不是创新；上述动态选择与安全 COMMIT 才构成 BeliefKV 的系统机制。
 
-## 13. Remaining-Time Predictor
+## 13. FrontierBelief 与候选相关风险规划
 
-### 13.1 预测目标
+### 13.1 单一预测接口
 
-预测器不输出单点 agent duration，而输出：
-
-```text
-P(context resumes within tau)
-p50/p90/p95 remaining time
-next event distribution
-confidence
-OOD score
-backoff level
-```
-
-其中 `tau` 由当前 KV 的 D2H/H2D 时间决定。
-
-### 13.2 三部分模型
+P6 对外只发布一个版本化 `FrontierBeliefSnapshot`。内部可以使用 context tree、
+competing-risk survival 和分位数分布，但它们不分别产生调度动作，避免再次形成
+多个策略源。模型只预测局部、负载无关的需求：
 
 ```text
-Tool Survival Model
-Agent Semi-Markov Context Tree
-LLM Service Cost Model
+FrontierDemandOutcome
+  next_runtime_boundary
+  dependency_mode
+  current_sequence_tokens
+  remaining_decode_tokens
+  prompt_growth_tokens
+  next_output_tokens
+  external_segments + censor state
 ```
 
-#### Tool Survival Model
+以下信息不由模型预测：RCCG 已知的 JOIN 关系、当前 Radix closure、当前 HBM
+占用，以及 keep/offload/prefetch 决策。
 
-工具时长具有长尾、timeout 和 right-censoring。模型预测生存函数：
+### 13.2 从局部需求到联合 scenario
 
 ```text
-S(t | x) = P(T_tool > t | x)
+local conditional distributions
+        |
+        v
+workflow-correlated particles
+        |
+        v
+closure-complete BeliefScope + RCCG dependencies
+        |
+        v
+top-K DemandScenario + OTHER
 ```
 
-工具已运行 `e` 后的剩余时间：
+BeliefScope 按原子因果组扩展：纳入 `JOIN_ALL` 就纳入全部未完成 child，纳入
+retraction 就纳入完整 blocker set。若组的建模成本超过预算，整组进入
+`OTHER/A0`，不能截断部分 invocation 后虚构可释放空间。
+
+JOIN 不在 raw token demand 上取 `max/min`。系统先在每个候选 JointPlan 下模拟
+共享 GPU、PCIe 和外部等待，得到 child completion time，最后才按照
+`JOIN_ALL=max(C_i)` 或 `JOIN_ANY=min(C_i)` 解析 reentry。
+
+### 13.3 候选相关物理化
+
+同一个 demand scenario 在不同调度和 KV residency 下会产生不同时间线：
 
 ```text
-P(T_remaining > u | T > e, x) = S(e+u | x) / S(e | x)
+DemandScenario + candidate ActionGroup + PhysicalSnapshot
+  -> Radix physicalizer
+  -> uncached prefill / transfer demand
+  -> GPUServiceCurveModel + TransferServiceModel
+  -> event-driven TimedScenario
+  -> ScenarioRiskPlanner
 ```
 
-实现建议：
+首版候选只使用当前可编译动作：`A0`、`PREPARE_HOST`、`PREFETCH_GPU`。
+`COMMIT_CPU`、预测性 retraction、run-to-action 和 recompute 在正确性与收益门槛
+通过前不开放。风险规划采用有限 receding horizon，并将当前 allocator、lock、
+restore obligation、lease/grace 作为确定性硬约束；未来 reentry 才使用随机约束。
 
-- hierarchical Kaplan-Meier survival curve；
-- 浅层 GBDT 预测 AFT time-scale residual；
-- global -> tool family -> exact backend/endpoint 分层回退；
-- online EWMA/quantile residual correction。
+### 13.4 Fail-closed 动作门槛
 
-#### Agent Semi-Markov Context Tree
+`PREFETCH_GPU` 必须同时满足：
 
-将 agent 轨迹归一化为：
+- local belief 为 exact support；
+- calibration coverage 达到配置门槛；
+- 没有 OOD reason；
+- 当前物理 snapshot 可构造完整 startup/restore dependency；
+- 候选在 HBM、PCIe 和 liveness 硬约束下可行。
+
+backoff、OOD、因果闭包不完整或无法给出有限风险界时，只允许 `A0` 或无损
+`PREPARE_HOST`。P5 observed policy 始终可独立运行。
+
+### 13.5 训练与服务模型边界
+
+语义模型不能使用旧负载下的 batch size 或 elapsed GPU service 作为需求标签。
+训练目标是 action、token demand、prompt growth 和条件外部等待。GPU 服务时间由
+独立受控微基准拟合：
 
 ```text
-LLM_TEXT
-LLM_TOOL_CALL
-TOOL_SHELL
-TOOL_SEARCH
-TOOL_FILE
-SPAWN_CHILD
-WAIT_CHILD
-WAIT_JOIN
-MESSAGE
-RETURN
+ServiceModel(
+  phase, token demand, batch composition,
+  sequence-length distribution, chunk position,
+  prefill/decode mixing, HiCache/PCIe contention
+) -> service-time distribution
 ```
 
-Variable-order context tree 预测下一状态，survival distribution 预测每个状态驻留时间，`RETURN` 为吸收状态。并发 join 的 parent resume time 由运行时已知的 min/max/join 语义组合。
+数据按 repository/task/episode 分组，train、calibration、test-ID 和 test-OOD
+严格隔离。当前 v6 artifact 仍是 development-only，composite support 大量回退到
+backoff，因此只能用于 shadow 与管线检查。
 
-#### LLM Service Cost Model
+### 13.6 当前接入状态
 
-不能直接学习旧调度器下的 agent wall time。应分离 intrinsic work 和系统服务时间：
+P5 observed planning 与 P6 predictive risk 使用两个独立 latest-wins worker。
+observed worker 完成 bounded plan 后立即发布；predictive worker 只能读取已发布的
+不可变 `PolicyInput/PhysicalSnapshot`，其排队、取消、失败和超时均不能阻塞 P5
+计划发布。predictive worker 输出候选成本、拒绝原因和 semantic
+`PredictiveIntent`；异步结果不发送命令，也不携带可长期执行的 Radix handle。
+默认 shadow 模式仍保持：
 
 ```text
-T_LLM = T_queue + T_prefill + T_decode
+planner = belief_joint_observed
+prediction_used = false
+decision_authority = read_only_shadow
 ```
 
-行为模型预测 remaining output tokens、future rounds 和 action transition；在线 cost model 根据 prompt/cache-hit tokens、batch、context length 和 GPU profile 转换为 wall time。
+predictive worker 提交前先执行 action-specific eligibility gate，分别维护
+`PrefetchTarget` 与 `PrepareHostVictim`，没有候选时不构造 belief、不提交 risk
+job。只有 target/state、候选 KV 字节桶或 HBM/Host headroom hysteresis bucket
+变化时才换代，避免每个 decode token 都取消并重算同一个 job。
 
-### 13.3 特征原则
+候选包括 `A0`、`HOST(v)`、`PREFETCH(t)`、
+`HOST(victim_set)->PREFETCH(t)` 和 `PARTIAL_PREFETCH(t,budget)`。确定性物理
+preflight 位于 scenario simulation 之前；当前 HBM/Host、Radix actionability 或
+private-suffix reclaim 不满足的候选不会进入多场景仿真。候选时间线已覆盖 GPU
+service、PCIe serialization、RCCG dependency/JOIN 和 future KV growth HBM chance
+constraint。
 
-使用稳定结构化特征：tool family、input size、文件/URL 数、timeout、command executable、endpoint class、并发度、prompt/cache-hit tokens、模型、调用深度、round 和最近 action suffix。
+缓存边界遵循“语义可复用、物理必须重验”：相同 closure/prediction/RCCG evidence
+可复用粒子化 demand belief；相同 `GPUServiceFeatures` 可复用有界 LRU 中的 service
+estimate。allocator capacity、bundle generation、lock/actionability 和 transfer
+feasibility 不跨 physical revision 缓存。
 
-避免 project/session ID、原始 agent 名称、完整 prompt embedding 和未来 result size。
+每个 predictive candidate 仍可携带 action certificate 作为诊断：相关 context epoch、
+invocation state/revision、JOIN 状态、Radix bundle generation/bytes、HBM/Host
+capacity floor、transfer epoch 和 model version。safe point 只校验该证书，不再用
+无关 workflow 的全局 graph/allocator revision 否决候选。但在线 overlay 不执行
+该旧证书，而是在 scheduler safe point 根据 semantic intent 重建 live bundle，重新
+检查 context epoch、invocation state、HBM/Host、restore authority、PCIe 和 closure。
 
-### 13.4 训练和泛化
+动作支持度按动作拆分：`PREPARE_HOST` 只要求 calibrated remaining-window 与
+transfer evidence，不受 absolute future-HBM overflow 拒绝，因为它保留 GPU copy；
+`PREFETCH_GPU` 要求 reentry-window、future KV growth 和 HBM chance constraint。
+boundary 分类不可用不会再阻断与其无关的 KV 动作。
 
-训练数据必须包含完整事件时间、timeout/cancel censoring、context relation、token/KV 大小和运行负载。
+在线授权必须显式打开 `predictive_joint_overlay_enabled`。overlay 只在 observed
+residency 没有动作时附加一个 `ALL_OR_NOTHING` ActionGroup；physical commit
+失败、超时或超过 safe-point budget 时，只丢弃预测 intent，observed seed 原样保留。
+`PREFETCH_GPU` 还要求 canary 开关、单 in-flight、copy bytes 不超过 KV pool 的 5%。
+预测性 retraction、partial prefetch 和 reclaim-and-prefetch 仅保留 shadow 评估，
+不能进入在线 intent。
 
-数据切分：
+控制面必须分别报告 eligibility、queue wait、risk compute 和 candidate certificate
+validation 开销。开放动作前的目标为：no-candidate gate P99 `<1 ms`、
+deterministic preflight P99 `<5 ms`、risk compute P99 `<20 ms`、
+trigger-to-validation P99 `<50 ms`、action-specific stale rate `<10%`。这些门槛
+尚未通过真实 GPU trace，因此不能宣称在线 schedulability 或性能收益。
+
+只有离线 regret、校准、shadow stale rate、safe-point validation 开销和 w8
+correctness smoke 均通过，才讨论给预测动作逐级授权。
+
+### 13.7 形态债务与因果松弛量
+
+P6 的 transfer estimate 必须绑定候选动作真实的 `PhysicalTransferShape`，最少包含：
 
 ```text
-group by project/session
-temporal holdout
-leave-one-workload-family-out
-leave-one-tool-family-out
-unseen agent-role test
+direction, actual_bytes, extent_count
+extent_bytes_min/p50/max, small_extent_ratio
+closure_generation, pinned_host, command_kind
+native_transfer_state, contention_bucket
 ```
 
-不能随机拆分同一 workflow 的 event。
+FrontierBelief/RCCG 给出 reentry、pressure 和 dependency release 的 scenario；物理
+snapshot 给出 closure shape。`ScenarioRiskPlanner` 在每个 scenario 中先计算
+`morphology_debt = Q90(shape-conditioned transfer time)`，再判断它是否能被 causal window
+隐藏。相对 byte-only estimate 的额外成本单独记为 `morphology_penalty`。`PREPARE_HOST` 的收益仅来自
+未来 pressure 到达前已经完成、并且未来 observed policy 确实会使用的 shadow bytes；
+`PREFETCH_GPU` 还必须扣除提前占用 HBM 的时间成本。
 
-评估指标：survival NLL、Integrated Brier Score、interval coverage、calibration error、ranking accuracy、最终 offload/prefetch regret 和 workflow latency。
+首版模型保持最小化：按 `GPU/model/direction/command_kind/pinned_host` 分层，在受支持的
+`bytes + extent_count` 邻域内插值并输出保守分位数。禁止退化为跨 extent-count 的纯
+bytes 外推；样本不足时返回 unsupported，由 P5 接管，而不是假造低成本估计。
 
-### 13.5 在线开销
-
-- 不使用 LLM 或大 Transformer 作为 predictor；
-- context tree 最大阶数先取 3-5；
-- 使用浅层 GBDT/查找表；
-- 只在事件和 elapsed-time bucket crossing 时更新；
-- 缓存同一状态的预测；
-- 目标为单 context 数十微秒、一次事件批量更新低于 0.5ms，最终以实测为准。
-
-### 13.6 OOD 回退
-
-预测区间持续失配、出现未知 tool family 或 calibration coverage 下降时：
-
-```text
-降低 confidence
-扩大区间
-退回上层 survival prior
-停止基于预测的 aggressive action
-保留 reactive causal frontier policy
-```
+safe point 不执行风险规划阶段保存的旧 physical handle。它重新物化 live closure，并检查
+实际 shape 是否仍落在 intent 的收益包络内；字节数、extent 数或 blocker 变化导致
+`morphology_slack <= 0` 时，丢弃 intent，不影响 observed seed。
 
 ## 14. 端到端在线算法
 
 ```text
-on_runtime_event(event):
-    1. normalize event and validate causal identity
-    2. update RCCG invocation/communication/context state
-    3. update context epoch and wake-up frontier
-    4. bind new requests/contexts to Radix ownership index
-    5. release semantic refs of DONE/CANCELLED invocations
-    6. process completed transfer ACKs
-    7. compute actual HBM free/marginal bytes
-    8. run workflow-level admission and fairness
-    9. if actual pressure:
-           free unowned pages
-           commit DUAL_CLEAN pages
-           select PARKED victims using causal constraints
-           issue urgent D2H until enough actual bytes are ACKed
-   10. mark READY/message/join targets as IMMINENT
-   11. issue urgent or deadline-aware H2D prefetch
-   12. if no urgent transfer and interference budget allows:
-           update remaining-time predictions
-           copy one shadow chunk from eligible PARKED context
-   13. select workflow by attained service
-   14. select request from workflow causal frontier
-   15. admit request into SGLang scheduler
+safe_point(epoch):
+  APPLY_EVENTS
+    drain runtime events, transfer ACK/native completion and cancellations
+    update RCCG, queue state, ownership, allocator and restore obligations
+
+  CAPTURE_AND_PLAN
+    lazily build one immutable SafePointPhysicalSnapshot(epoch)
+    publish the bounded observed-state JointPlan seed
+    async worker may improve the semantic plan
+    derive action-specific closure shape for predictive candidates
+    async P6 worker evaluates causal slack minus morphology debt
+
+  TRANSACTIONAL_COMMIT
+    validate each closed ActionGroup read-set
+    materialize current Radix bundle and recheck live shape/capacity/lock/lease/grace
+    commit the maximal valid group
+    attach source_joint_plan_id to execution/admission/residency/retraction
+
+  if any physical state changes during commit:
+    advance epoch before another planning decision
 ```
 
-预测器从不绕过 active lock、共享 owner、epoch 和 transfer ACK 检查。
+Restore obligation、debt-owned funding reservation 和 service-quantum grace 是
+liveness 硬约束。retraction 只有在同一事务中建立确定性恢复路径后才允许提交。
+P6 worker 读取快照后不得修改状态。显式 overlay 只发布 semantic intent；safe
+point 物理化失败、预测过时或 OOD 时，P5 observed JointPlan 不受影响。
 
 ## 15. Runtime 事件和动作接口
 
@@ -779,12 +909,18 @@ SET_WORKFLOW_BUDGET
 8. 初版保持 HiRadix leaf-first/prefix-closure 约束。
 9. prediction failure 不能破坏正确性或使系统无法运行。
 10. BeliefKV disabled 时必须保持上游 SGLang 行为。
+11. retraction、funding、restore 和 replacement admission 必须属于闭合 ActionGroup。
+12. safe point commit 后不得继续复用旧 PhysicalSnapshot。
+13. 实验压力只按 /get_server_info 返回的实际 KV pool 计算。
+14. transfer estimate 必须绑定实际 physical closure shape，不能只按 context bytes 计费。
+15. safe point 的 live shape 超出 intent 收益包络时必须 fail closed，不能沿用旧成本。
+16. 形态模型 unsupported/OOD 时必须回退 P5，不得用跨 bucket 的乐观外推补值。
 ```
 
 ## 17. 实际代码结构
 
-当前仓库只保留基于 RCCG、page ownership 和 scheduler safe point 的实现。早期
-snapshot planner 已删除，避免与实际在线控制面形成两套不一致的 API：
+当前关键模块如下；SGLang adapter 只承载状态捕获、safe-point commit 和命令
+ACK，策略仍位于 BeliefKV：
 
 ```text
 beliefkv/
@@ -796,39 +932,32 @@ beliefkv/
     causal_graph.py
     controller.py
   predictor/
-    taxonomy.py
-    tool_survival.py
-    action_context_tree.py
-    service_cost.py
+    frontier_belief.py
+    structured_frontier.py
+    hardware_service.py
     composer.py
-    calibration.py
-    training.py
   policy/
-    admission.py
-    workflow_fairness.py
-    causal_frontier.py
-    residency.py
-    shadow_controller.py
-    transfer_cost.py
+    joint_scheduler.py
+    online_joint.py
+    predictive_joint.py
+    predictive_timeline.py
+    risk_shadow.py
     transfer_planner.py
   runtime/
-    agent_runtime_adapter.py
     audit.py
-    event_channel.py
-    sglang_adapter.py
+    joint_shadow.py
+    bundles.py
     page_index.py
     radix_arbiter.py
-    command_queue.py
+    restore_obligation.py
     protocol.py
     sglang_v052rc1.py
   simulator/
-    schema.py
-    page_simulator.py
+    queue_service.py
   experiments/
-    matrix.py
-  traces/
-    normalizer.py
-    runtime_validation.py
+    p6_dataset.py
+    p6_decision_points.py
+    deepagents_swebench.py
   metrics/
     artifacts.py
     summary.py
@@ -838,69 +967,96 @@ SGLang patch 应保持窄接口，不把完整 BeliefKV policy 写入 scheduler 
 
 ## 18. 实施顺序
 
-### Phase 0：Trace 与离线模拟器
+### P0-P4：已完成的系统基座
 
-- 扩展 trace schema 支持 invocation/context/event identity；
-- 构建 RCCG event reducer；
-- 构建 page-level HBM/PCIe replay simulator；
-- 验证 causal state transition 和 nested workflow。
+已完成 RCCG、SGLang metadata/ownership bridge、Radix closure 仲裁、HiCache
+prepare/commit、Host 生命周期和迁移时间线观测。历史正确性问题及其修复过程保留在
+实验文档中，不再作为当前策略接口。
 
-退出条件：相同 trace 重放产生确定的 RCCG 和资源状态。
+### P5：Observed JointPlan 冻结
 
-### Phase 1：Reactive Baseline
+- observed-state execution/admission/residency/retraction 使用唯一 JointPlan 来源；
+- SafePointPhysicalSnapshot 按 epoch 惰性构建；
+- restore obligation、funding、grace 和 transaction ACK 保持守恒；
+- reactive planner 只作为 intent compiler/liveness fallback，不独立选 victim；
+- 继续允许修 correctness bug，但不再改变 P5 架构。
 
-- 实现四级 residency 分类；
-- 实现 continuation far-ancestor migration；
-- 实现 message-driven working set；
-- 实现 workflow admission/fairness；
-- 不使用 predictor。
+### P6.0-P6.1：数据与局部需求模型
 
-退出条件：在合成和真实 trace 上无非法迁移、无重复物理计费，并能与 offline oracle 比较。
+- 固定 project/task split，采集 event-point decision samples；
+- 区分 demand labels 与旧负载下 observed service time；
+- 训练并校准结构化局部模型和独立硬件 service curve；
+- 当前 v6 仅 development-only，不参与正式 test 结论。
 
-### Phase 2：SGLang Metadata 与 Ownership Bridge
+### P6.2：候选风险链路与受限在线 overlay（当前阶段）
 
-- 传播 workflow/invocation/context metadata；
-- 建立 page ownership index；
-- 接入 lock、insert、split、free 和 transfer ACK；
-- 实现 Radix arbitration 和 marginal byte reporting。
+- 构造 closure-complete BeliefScope；
+- 先采样联合 demand particles，再按候选动作投影到其实际依赖的随机变量；
+- 对投影粒子做 8--16 个确定性 medoid cluster，medoid 计算期望收益，cluster 内
+  earliest reentry/max growth 形成保守可行性 envelope，概率质量不再丢入不透明
+  OTHER；
+- observed 与 predictive worker 隔离，observed seed 立即发布；
+- 在 belief compose 前执行 action-specific eligibility 与 bucket/hysteresis 去重；
+- 物理化 A0/HOST/PREFETCH/RECLAIM+PREFETCH/PARTIAL_PREFETCH；
+- 在 scenario simulation 前执行确定性物理 preflight；
+- 在候选相关时间线上解析 JOIN/reentry；
+- 维护 future KV growth HBM ledger 和 chance constraint；
+- 将通用 future feasibility 与 future-HBM chance constraint 分开归因，避免同一
+  overflow 被重复否决；
+- 将 PREPARE_HOST 建模为两阶段 recourse：空闲期建立 CPU shadow，未来 pressure
+  到来时节省关键路径 D2H，同时计入当前 PCIe 干扰和 Host residency；
+- 使用按 GPU/model/direction/command/page-count/size/native contention 条件化的
+  持久化 transfer service curve warm-start，在线样本只滚动修正；
+- 对 PREPARE_HOST 单独投影完整 GPU descendant closure：D2H 成本包含 cross-context
+  descendant，收益只计目标 context 的 exclusive copy；除 `descendant_closure` 外的
+  lock、owner、in-flight 和 pin blocker 仍为硬约束；
+- 生成 action-specific certificate 作为 stale characterization；
+- 发布不含 physical handle 的 semantic intent，并在 safe point 重新物理化；
+- 默认只读；显式 overlay 仅授权 PREPARE_HOST 和受限 PREFETCH_GPU canary。
 
-退出条件：BeliefKV disabled 行为不变；active/shared KV 不会被错误迁移。
+受控 CPU case 已覆盖 deterministic reject、future-HBM reject/accept、
+reclaim+prefetch shadow、calibrated action-specific backoff、PREPARE 的 HBM 解耦、
+两阶段 recourse、action-projected reduction、safe-point rematerialization 和 5%
+prefetch canary。正收益候选会额外触发一次去重后的异步 PolicyInput 持久化，使
+候选所在精确 epoch 可离线 replay，而不是依赖 10 秒固定采样恰好命中。
 
-### Phase 3：可控 HiCache 迁移
+### P6.3-P6.5：形态感知联合控制（已完成的止损分支）
 
-- 实现 context intent -> leaf/page action；
-- 实现 urgent D2H/H2D；
-- 实现 admission 等待 transfer ACK；
-- 验证 CPU/GPU state consistency。
+该分支按以下最短闭环执行完毕。修正 transfer service contract 后，同一冻结 trace 中
+byte-only 与 extent-count-aware 策略没有产生 eligibility 或 selected-action flip，因此不再
+作为当前核心主线，也不通过扩大 GPU 矩阵继续寻找正例：
 
-退出条件：压力测试无 stale page handle、无 OOM、无 location divergence。
+1. **M1 自然形态审计**：复用现有 P6 trace，同时报告 candidate epoch、physical generation、
+   `context + context_epoch + stable morphology tuple` parked episode 和 context-weighted 统计。
+   physical generation 只反映 Radix 演化，不能作为独立 workload 样本。
+2. **M2 extent-count-aware 首版服务模型**：将 2026-08-10 GPU0 受控矩阵作为 development
+   warm-start，以 `bytes + extent_count` 输出保守分位数；extent-size distribution 和 closure depth
+   暂不作为模型输入。禁止跨 extent-count 的 bytes-only 回退，并显式报告 unsupported。
+3. **M3 精确 closure plumbing**：candidate physicalization 将实际
+   `PhysicalTransferShape` 传给 timeline/risk planner；safe point 重新物化后验证 shape
+   envelope。复用现有 snapshot、certificate 和 transaction，不引入第二套状态机。
+4. **M4 JointPlan 决策**：在现有 recourse 中用
+   `causal slack - morphology debt` 替代 bytes-only D2H 成本；动作集合仍只有 A0、
+   PREPARE_HOST 和受限 PREFETCH_GPU，不改 predictor、RCCG、fairness 或 restore 协议。
+5. **M5 固定 trace 反事实**：在同一批保存的 PolicyInput 上比较 bytes-only 与
+   extent-count-aware 的候选排序、timing change、feasibility-reason change、eligibility flip、
+   selected-action flip 和 unsupported rate。eligibility flip 必须按同一个配对候选分为
+   promotion（byte-only 不执行、shape-aware 执行）和 veto（byte-only 执行、shape-aware 阻止）；
+   纯 timing/reason sensitivity 不进入在线验证。
+6. **M6 单动作 canary**：原计划只运行一个自然选中的 PREPARE_HOST 或受限 PREFETCH_GPU，验证
+   intent -> live-shape rematerialization -> dispatch -> ACK -> terminal，并与 A0 比较实际
+   stall/收益。promotion 只开放 shape-aware PREPARE canary；veto 只开放 byte-only treatment，
+   并以 shape-aware/P5 不执行为 control。selected-action change 单独报告，不自动开放动作。
+   通过后才扩大到端到端 workflow。
 
-### Phase 4：Prepare-Commit Shadowing
+M1--M4 的服务成本、物理化与 fail-closed 机制继续保留；M5--M6 没有通过策略相关性门槛。
+GPU1 crossover、small-size 完整矩阵、progressive slicing、KV compaction、自定义 DMA 和
+预测性 retraction 均停止投入。P6 后续回到 FrontierBelief 的因果预测价值验证。
 
-- 实现 DUAL_CLEAN 状态；
-- 实现 urgent/shadow 双队列和小 chunk；
-- 建立 interference feedback controller；
-- 先使用无预测 heuristic shadow ordering。
+### P7：可移植性与正式实验
 
-退出条件：false shadow 不制造 H2D stall；urgent transfer 的额外等待受 chunk 上界控制。
-
-### Phase 5：Remaining-Time Predictor
-
-- 训练 hierarchical tool survival baseline；
-- 训练 semi-Markov context tree；
-- 接入 online cost model 和 calibration；
-- 只用于 shadow/prefetch/order，保留 OOD fallback。
-
-退出条件：跨 workload calibration 合格，并在 end-to-end 决策 regret 上超过 per-tool median/EWMA。
-
-### Phase 6：完整实验
-
-- 对比 SGLang LRU/HiCache 三种 write policy；
-- 对比 reactive baseline、next-action predictor、完整 BeliefKV；
-- 对比 KVFlow/TokenCake/Agentix 风格策略；
-- 计算 offline full-future oracle；
-- 在相同 SGLang 版本和模型上做 apples-to-apples 实验；
-- 再在较新 SGLang 分支验证可移植性。
+完成固定版本实验后再适配新版 HiCache/SGLang，并在同一模型、同一版本和固定
+trace 上比较 SGLang/HiCache、P5 observed、P6 shadow/action 与 offline oracle。
 
 ## 19. 实验设计
 
@@ -945,28 +1101,49 @@ predictor calibration/coverage/OOD rate
 planner 和 adapter CPU overhead
 ```
 
-### 19.4 关键离线 Oracle
+### 19.4 在线动作归因
 
-首先回答三个必要问题：
+独立 useful-action oracle 不再作为开放在线预测动作的前置 gate。为缩短关键路径，系统在单动作
+canary 和端到端 A/B 中同步回答以下问题：
 
-1. Reactive Causal Frontier 与完整未来 oracle 的差距是否显著？
-2. parked window 内最多能提前复制多少最终被驱逐的 useful bytes？
-3. 完整 subtree/remaining-time prediction 是否显著优于事件驱动和简单 median/EWMA？
+1. predictive PREPARE 是否在后续 pressure 时被实际消费并避免 reactive D2H；
+2. predictive retraction 是否让 replacement 真实进入 batch 并获得 service；
+3. 节省的 admission/transfer stall 是否覆盖预测规划、迁移干扰和 victim restore 成本。
 
-如果 reactive 已接近 oracle，复杂预测器不应成为核心。如果 useful-shadow oracle 收益很低，Prepare-Commit 只保留为工程选项。
+每笔动作进入 `useful/wasted/too-late/censored` 之一。归因仍要求 submit-time ownership、
+generation-aware physical extent、下一次真实 reentry、pressure/transfer 和 service 结果；缺少标签的
+记录只能 censored，不能用于收益声明。旧 trace 不能恢复这些标签，但这不再阻塞新 canary。
+
+如果在线动作长期不被消费，或 stall 降低但 workflow throughput 不变，预测动作停止扩展；不能通过
+筛选 trace、恢复 morphology 分支或降低为负收益阈值制造正例。
 
 ## 20. 当前创新主张
 
-目前最可辩护的系统主张是：
+当前核心假设，而不是已经完成的论文结论，是：
 
-1. 使用运行时因果关系而不是用户 DAG，统一处理 subagent continuation 和 cyclic peer collaboration；
-2. 将 causal context value 与 token-prefix physical sharing 分离，通过 ownership bridge 做实际 marginal HBM 管理；
-3. 使用 reactive causal frontier 提供无预测、跨 workload 的安全下界；
-4. 将预测从 destructive offload 降级为 non-destructive PREPARE，实际 GPU release 由事件驱动 COMMIT；
-5. 使用 remaining-time distribution 和 OOD calibration，而不是单点工具/agent duration；
-6. 联合管理 workflow fairness、child admission、KV residency 和 PCIe transfer。
+> 动态 agent workflow 的 SPAWN/JOIN、工具等待和 reentry 会形成不断扩张或闭合的 causal
+> frontier。FrontierBelief 若能识别哪些 GPU service 将快速解锁 TOOL/SPAWN/RETURN/JOIN，
+> JointPlan 就可以联合调整 admission、KV residency 和 selective retraction，将有限 GPU service
+> 分配给能更快产生下一次有效 action 的请求。
 
-单独的状态机、shadow copy、survival predictor 或 Radix ownership 都不足以支撑高水平系统论文。贡献必须体现在完整闭环及真实 workload 中现有策略的可重复 failure。
+围绕该假设，贡献层次收敛为：
+
+1. **核心算法假设**：学习局部 demand/reentry 分布，由 RCCG 组合联合 scenario，并在有限
+   horizon 内将 invocation 分类为 EXPAND、CLOSE、HOLD 或 UNKNOWN；
+2. **统一控制**：预测只发布 semantic intent，safe point 将其与 observed JointPlan、实时
+   allocator、ownership、admission、retraction 和 restore obligation 一起物理化，避免第二个策略源；
+3. **安全下界**：预测不确定、因果 read-set 失效或服务模型 OOD 时回退 observed P5；
+   non-destructive PREPARE 与事务化 restore 保证错误预测不破坏活性；
+4. **Agent workload**：受控 2--3 child fan-out 暴露多 child 工具并行、JOIN long tail 和 HBM
+   competition；旧单 child trace 继续训练局部需求，新 fan-out 数据按 repository 与 A/B 隔离；
+5. **支撑模型**：`bytes + extent_count + contention` transfer curve 只负责物理成本和 OOD 安全，
+   不再作为核心创新或独立动作来源。
+
+单独的预测器、shadow copy、状态机、fragmentation 测量或 Radix ownership 都不足以支撑论文。
+开发阶段直接比较 P5 observed JointPlan 与完整 predictive JointPlan。核心主张成立的硬门槛仍是：
+在相同 workload profile 上，FrontierBelief 产生可归因的 PREPARE/retraction action change，降低
+实际 admission/restore stall，并最终提高 successful workflows/hour；否则 P6 只是一项安全的
+工程 overlay。外部 baseline 和正式自然 workload 统计在系统闭环后补充。
 
 ## 21. 主要风险
 
@@ -984,7 +1161,9 @@ planner 和 adapter CPU overhead
 
 ### 21.4 PCIe/HBM 干扰
 
-PCIe idle 不代表 D2H 免费。Shadow controller 必须使用实测的 inference slowdown budget，而不是标称带宽。
+PCIe idle 不代表 D2H 免费，bytes 也不能唯一决定 D2H 成本。当前 4.12 倍差异只来自
+GPU0、单一字节量和两个极端布局；服务模型必须保留 shape support/OOD，并用实测
+inference slowdown 而不是标称带宽。GPU1 crossover 是后续泛化证据，不是当前实现阻塞项。
 
 ### 21.5 预测泛化
 
@@ -992,34 +1171,82 @@ TraceLab 等数据存在 workload、tool name 和平台偏差。必须使用 tax
 
 ### 21.6 创新性
 
-HiCache 已有 write-through，KVFlow/TokenCake 已有 workflow-aware eviction/prefetch，Agentix 已有 program-level scheduling。BeliefKV 必须通过 runtime causal graph、ownership bridge、reactive oracle gap 和 safe speculation 的组合证明不可被现有策略简单覆盖。
+HiCache 已有 write-through，KVFlow/TokenCake/ScaleSim/AugServe 已有 workflow-aware
+eviction/prefetch 或 future-use 估计，TokenCake/PBKV/Continuum 也覆盖了等待时间或未来复用预测。
+BeliefKV 必须证明 RCCG 上的联合不确定性、action-specific scenario reduction 和 observed/Predictive
+统一提交能产生这些 per-context 方法无法给出的有效动作。形态信息只用于避免错误估算迁移成本，
+不能再被用来弥补因果预测本身缺少决策收益。
 
 ## 22. 当前待决问题
 
-1. 哪些 agent runtime 作为首批 adapter 和真实 workload？
-2. SGLang page ownership hook 的最低修改集合是什么？
-3. HiRadix 现有 node-level write operation 如何切成可抢占小 chunk？
-4. Shared page 在跨 workflow 公平中采用比例 charge 还是其他规则？
-5. Reactive baseline 与 offline oracle 的真实 gap 有多大？
-6. Tool/subagent parked window 中 useful shadow opportunity 是否足够大？
-7. Predictor 是否应先只预测 tool residual time，再逐步加入 agent semi-Markov composition？
-8. 对等 multi-agent 的 message arrival 是否具有足够稳定的在线局部性？
+1. observed P5 与完整未来 oracle 之间是否存在足够大的 useful-action gap？
+2. FrontierBelief 的 reentry、future pressure 和 prompt/output demand 分布能否跨 repository 与
+   workload family 保持校准，并在 OOD 时可靠回退？
+3. 联合 RCCG scenario 是否比 median/EWMA 或独立 child quantile 产生更低的 planner regret？
+4. 自然 workload 中 PREPARE/PREFETCH 的 useful-action rate 是否足以覆盖控制面和 PCIe 干扰？
+5. transfer artifact 在不同 GPU/SGLang/HiCache 版本上的校准成本与 unsupported 比例是多少？
+6. blocking subagent、工具等待和 cyclic peer 三类场景中，哪类因果窗口真正贡献净收益？
 
 ## 23. 当前实现状态
 
 截至本文档日期：
 
 - 已实现原子 RCCG reducer、nested call/spawn/join/message 状态转换和事件幂等；
-- 已实现 context/page ownership bridge、allocation generation、共享页物理计费、engine/semantic lock 分离和 Radix closure 仲裁；
-- 已实现 root-workflow admission/fairness、causal frontier、reactive D2H/H2D 和 ACK 后状态提交；
-- 已实现 Prepare-Commit shadow、urgent/shadow 队列、干扰反馈和非抢占 DMA chunk cancel 语义；
-- 已实现 hierarchical Kaplan-Meier、semi-Markov context tree、LLM service cost、artifact 训练/加载、OOD fallback 和在线 calibration；
-- 已实现 ClawTrace normalizer、页级确定性模拟器、原子实验产物、ablation matrix、CSV 和 bootstrap CI；
-- 已实现并保存 SGLang `0.5.2rc1`（commit `18f91eb639084825717c0e3c3c7273492812ab71`）窄补丁，包括 metadata、admission/abort、scheduler safe point、workflow queue ordering 和增量 Radix/HiCache observer；
-- 已实现默认关闭的 run-scoped JSONL runtime audit，可审计 causal identity、admission、request lifecycle 和 transfer ACK，且不记录 prompt/observation 内容；
-- 控制面单元测试、fake HiCache 故障路径、干净源码 `git apply --check`、AST 契约和修改文件 Python 编译均已执行；
-- 已在单卡上启动 Qwen2.5-0.5B-Instruct，并验证未标注旁路、tagged root 和 spawn child 的 `deferred -> admitted -> started -> finished` 路径及 parent-child RCCG 因果边；
-- 尚未完成高 HBM pressure、长时间混合 workload、GPU/PCIe 干扰测量和论文 baseline 实验；
-- 尚未实现第二个真实 agent framework adapter 和 offline full-future oracle。
+- 已实现 context/page ownership bridge、共享页物理计费、lock/reader/pin 分离和 Radix closure 仲裁；
+- 已实现 observed-state JointPlan、workflow fairness/admission、running retraction、restore obligation、debt-owned funding reservation 和 service grace；
+- 已实现 SafePointPhysicalSnapshot、ActionGroup/read-set 局部校验、迁移 transaction/ACK 守恒及显式 shutdown；
+- 已实现 Host KV 生命周期、terminal private-KV cleanup、HiCache D2H/H2D 与有界审计；
+- 已实现 transfer service warm-start 契约：artifact 与 runtime 使用独立 sample gate，启动时
+  验证校准证据仍能支持真实 query，并将契约摘要写入初始化审计；
+- 已实现 native HiCache submit-time ownership snapshot，在 DMA 完成前冻结 owner context、epoch、
+  extent size 和 page-index revision；历史 completion-time lookup 仅作为旧记录兼容路径；
+- 已实现 P6 decision-point 数据集、结构化 FrontierBelief artifact、GPU service curve、scenario composer、candidate timeline 和 risk shadow；
+- 已拆分 observed/predictive worker，并实现 action gate、联合候选、确定性 preflight、cooperative cancellation、事件桶去重和候选级 read-set validation；
+- 已实现不携带 Radix handle 的 PredictiveIntent、action-specific support、发布/safe
+  point 双重 causal certificate 校验、收益包络约束、safe-point rematerialization、
+  PREPARE_HOST overlay 和 5% PREFETCH_GPU canary；
+- 旧 `joint_predictive_enabled` 在线启发式已降为兼容元数据开关，不再改变排序、victim 或迁移动作；
+- restore funding preview 已改为从 revision-cached migratable roots 做有界局部 bundle 物化，等待下一次高压 GPU 验证；
+- P6 批量采集会查询 `/get_server_info`，实际 KV pool 低于实验要求时在发起 workflow 前失败；
+- 当前完整 CPU serving 回归为 598 passed、8 skipped、3 subtests passed；P6
+  Deep Agents/collection 侧回归为 90 passed；
+- 已完成一次固定 16-workflow development trace，证明 worker 隔离和 observed
+  fallback 稳定，但旧 scenario reduction 使 selected action 为 0；修复后对 126 个
+  稀疏快照离线 replay，OTHER 拒绝已归零，现有快照中的 102 个正收益候选均被
+  future-HBM gate 拒绝；
+- 已完成一次 4-workflow short trace。运行时发现 PREPARE 错误复用 destructive
+  closure gate；修复后重放 45 个 snapshot 生成 57 个 closure-complete PREPARE
+  候选。41/57 候选预测到 capacity pressure，最大 overflow 约 5.78 GB；修复
+  transfer size-neighbor 回退后，456 个 scenario 中有 2 个满足完整 recourse 条件，
+  但概率质量不足以覆盖保守 D2H interference cost，候选层仍无正收益在线 intent；
+- 已在 GPU0 完成相同 2,659,221,504 bytes、7/106 extents 的受控 D2H 对照，三次
+  重复均显示高碎片更慢，均值分别为 185.69/765.17 ms；该结果只作为形态感知路线的
+  development evidence，双 GPU formal gate 仍未完成；
+- 已完成 M1 自然形态审计：57 个候选 epoch 对应 51 个物理 generation，但只形成 13 个稳定
+  parked episode；其中 5 个高 extent-count WAIT_JOIN/WAIT_TOOL episode 分布在 3/5 个 context。
+  该结果证明问题存在，不能将 33/51 解释为 prevalence；
+- M2 单 GPU development artifact 是 extent-count-aware 首版；M3 closure-level shape plumbing 和
+  M4 JointPlan 机制已完成。PredictiveIntent 现在携带 shape/count/transfer/stall
+  envelope，safe point 重建实时形态并在 OOD、成本超界或 slack 过期时回退 observed P5；
+- 初始 M5 trace 只改变 timing/reason，未改变动作。后续冻结 Xarray w8 characterization 中，
+  `PREPARE_HOST` 的 future-HBM gate 被确认是动作语义 bug；修正后的 938 个 paired snapshot 含
+  842 个 PREPARE candidate，byte-only/extent-count-aware 分别有 25/11 个 eligible，产生 3 次
+  promotion、17 次 veto 和 20 次 selected-action change。该修正发生在首次观察后，因此属于
+  post-hoc development evidence；
+- M6 单动作 canary 基础设施和显式 transfer-model arm 已实现。一次 morphology-aware autonomous
+  w8 canary 8/8 正常结束、750 次 LLM call、9 个动态 subagent，shutdown 时无未决事务，但
+  `natural_prepare_count=0`。随后一次冻结的 veto-only treatment 运行 7,216.16 秒，7/8 workflow
+  完成；旧在线阈值使 16 个 paired veto 全部错误回退为 `shape_unsupported`，11 个在发布前
+  stale，5 个在 safe point 被拒绝，0 commit/0 predictive D2H。修复 warm-start 资格后，14 个
+  可用源 snapshot 上的 16 个候选产生 14 次 timing change、6 次 reason change，但 0 action flip。
+  严格门禁现已要求 counterfactual shape support。尚未证明 P6 在线净收益，也尚未完成论文
+  baseline/oracle 实验。
 
-因此，当前代码已越过真实 runtime 集成的最小门槛，但不能把单次 smoke 或页级模拟结果当作论文端到端性能结论，也不能声称已经完成生产级 GPU 验证。
+下一阶段按 2026-08-11 P6 执行计划推进：一次性删除 morphology 策略分支并补齐 transfer attribution
+正确性；加入 `parallel_analysis_2to3` workload；直接运行单笔 PREPARE_HOST canary；随后用
+EXPAND/CLOSE/HOLD 注解现有 selective retraction，并进行 P5 对完整 predictive JointPlan 的短期
+端到端 A/B。独立 oracle 不再是前置 gate，PREFETCH_GPU、peer-agent、外部 baseline 和更复杂模型
+均不进入当前关键路径。
+
+因此，当前可以主张 P5 物理控制面和 P6 shadow 链路已实现，不能把 2026-08-07
+低支持度 heuristic A/B、请求值形式的 KV pool 或单次 agent rollout 当作预测收益证据。

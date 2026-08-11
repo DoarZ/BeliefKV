@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-QWEN_CODE_ROOT="${QWEN_CODE_ROOT:-/home/longhao/.local/qwen-code}"
+QWEN_CODE_ROOT="${QWEN_CODE_ROOT:-${HOME}/.local/qwen-code}"
 NODE_ROOT="${NODE_ROOT:-/opt/node-v22.20.0-linux-x64}"
 QWEN_BIN="${QWEN_BIN:-${QWEN_CODE_ROOT}/bin/qwen}"
 QWEN_HOME="${QWEN_HOME:-${ROOT_DIR}/experiments/raw/qwen-code/home}"

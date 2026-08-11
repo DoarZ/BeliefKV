@@ -9,9 +9,12 @@ on development-labelled corpora; outputs are marked ``development_only``.
 from __future__ import annotations
 
 import argparse
-import json, sys, os, glob
-from pathlib import Path
 from collections import Counter
+import glob
+import json
+import os
+from pathlib import Path
+import sys
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
@@ -70,10 +73,7 @@ def main():
     parser.add_argument("--model-version", default="p6-mvp-v1")
     parser.add_argument(
         "--output",
-        default=(
-            "/home/longhao/experiment/BeliefKV/experiments/models/"
-            "frontier_belief_mvp_v1.json"
-        ),
+        default=str(REPO / "experiments/models/frontier_belief_mvp_v1.json"),
     )
     parser.add_argument("--minimum-projects", type=int, default=3)
     parser.add_argument("--minimum-tasks", type=int, default=30)

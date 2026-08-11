@@ -65,7 +65,7 @@ def test_runnable_invocation_prediction_fields_round_trip() -> None:
     assert restored.prediction_support_level == "backoff"
 
 
-def test_planner_uses_predicted_remaining_decode_for_ordering() -> None:
+def test_observed_planner_ignores_predicted_remaining_decode_for_ordering() -> None:
     normal = _predictive_request(
         "request-normal",
         "workflow",
@@ -96,11 +96,12 @@ def test_planner_uses_predicted_remaining_decode_for_ordering() -> None:
         JointPlannerConfig(max_planning_budget_ms=100.0)
     ).plan(policy_input)
 
-    assert plan.prediction_used
-    assert plan.execution.ordered_request_ids[0] == "request-child"
-    assert dict(plan.prediction_influence).get("ordering_changed", 0) >= 1
-    assert dict(plan.prediction_influence).get("prediction_available", 0) == 2
-    assert dict(plan.prediction_influence).get("support_backoff", 0) == 2
+    assert not plan.prediction_used
+    assert plan.execution.ordered_request_ids[:2] == (
+        "request-normal",
+        "request-child",
+    )
+    assert not plan.prediction_influence
 
 
 def test_planner_falls_back_to_observed_order_without_predictions() -> None:
@@ -137,7 +138,7 @@ def test_planner_falls_back_to_observed_order_without_predictions() -> None:
     assert plan.execution.ordered_request_ids[0] == "request-normal"
 
 
-def test_victim_selection_uses_predicted_idle_time_when_present() -> None:
+def test_observed_victim_selection_ignores_predictive_metadata() -> None:
     policy_input = _input(capacity=600, reserved=0, include_cpu_target=False)
     policy_input = _with_runtime_state(
         policy_input,
@@ -195,10 +196,9 @@ def test_victim_selection_uses_predicted_idle_time_when_present() -> None:
     ).plan(policy_input)
 
     assert plan.semantic_residency
-    assert plan.semantic_residency[0].context_id == "ctx-recent"
-    assert dict(plan.prediction_influence).get(
-        "victim_prediction_selected", 0
-    ) >= 1
+    assert plan.semantic_residency[0].context_id == "ctx-old"
+    assert not plan.prediction_used
+    assert not plan.prediction_influence
 
 
 def test_victim_selection_uses_lru_without_predictions() -> None:

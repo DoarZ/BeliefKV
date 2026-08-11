@@ -1,0 +1,115 @@
+{
+  "arms": {
+    "byte_only_veto_treatment": {
+      "predictive_joint_overlay_enabled": true,
+      "predictive_prepare_authority_gate": "byte-only-veto",
+      "predictive_prepare_host_canary_limit": 1,
+      "predictive_transfer_model_mode": "byte-only"
+    },
+    "p5_observed_control": {
+      "predictive_joint_overlay_enabled": false,
+      "predictive_prepare_authority_gate": "natural",
+      "predictive_prepare_host_canary_limit": 0,
+      "predictive_transfer_model_mode": "morphology-aware"
+    }
+  },
+  "artifacts": {
+    "gpu_service": {
+      "model_version": null,
+      "path": "/home/longhao/experiment/BeliefKV/experiments/models/gpu_service_curve_cluster_cal_qwen3coder30b_rtx6000ada_20260804T060824Z.json",
+      "schema_version": 3,
+      "sha256": "fe9aae3706de3df3d634824a3268ea97689cdb3662b10265caa28ce7ee338af7"
+    },
+    "predictor": {
+      "model_version": "p6-mvp-v6",
+      "path": "/home/longhao/experiment/BeliefKV/experiments/models/frontier_belief_mvp_v6_calibrated_dev.json",
+      "schema_version": 2,
+      "sha256": "51a50b896ab63668551eeefd876c5ea866470b3c34a0f8a53860d3a91d43e456"
+    },
+    "transfer_service": {
+      "model_version": null,
+      "path": "/home/longhao/experiment/BeliefKV/experiments/models/transfer_service_morphology_gpu0_dev_v2.json",
+      "schema_version": 2,
+      "sha256": "0d908fa9774f78b620816ca4a45394bb23d47b73297e87cd6c9bd224efa7db17"
+    }
+  },
+  "collection": {
+    "arrival_policy": "single_frozen_batch_concurrency_8",
+    "batch_id": "p6-confirm-xarray-v2-r0",
+    "concurrency": 8,
+    "harness_profiles": {
+      "path": "/home/longhao/experiment/BeliefKV/configs/p6/harness_profiles_v1.json",
+      "sha256": "b545f39f719d15560e5bb9faf49d563b5bc10816c4ead9d97bfd62d05d056100"
+    },
+    "instance_ids": [
+      "pydata__xarray-7233",
+      "pydata__xarray-6992",
+      "pydata__xarray-4966",
+      "pydata__xarray-4629",
+      "pydata__xarray-4356",
+      "pydata__xarray-4695",
+      "pydata__xarray-3305",
+      "pydata__xarray-4687"
+    ],
+    "plan": {
+      "path": "/home/longhao/experiment/BeliefKV/configs/p6/decision_relevance_v2/collection_plan.json",
+      "sha256": "3d0a87b4848339a52516234a33063e49748ac269df65048db5a11b4126587325"
+    },
+    "workflow_count": 8,
+    "workload_manifest": {
+      "path": "/home/longhao/experiment/BeliefKV/configs/p6/decision_relevance_v2/workload_manifest.json",
+      "sha256": "da056e46e85f0e122bc3d5850152f29a0fd2cb9fe7839923f92739fc11b7fd78"
+    }
+  },
+  "evidence": {
+    "characterization_manifest": {
+      "path": "/home/longhao/experiment/BeliefKV/configs/p6/decision_relevance_v2/manifest.json",
+      "sha256": "862437237015c896f1188ed7693c2e19acab209cb85173ed12c6e345968bc4ba"
+    },
+    "paired_replay_comparison": {
+      "path": "/home/longhao/experiment/BeliefKV/experiments/characterization/p6_decision_relevance_xarray_v2/run1/replay/comparison.json",
+      "sha256": "ed26baef4e78fd7d3183a02bac6167a488b0e5daaf58dab0da7b3b0276d8f148"
+    },
+    "recommended_validation_arm": "byte_only_veto_treatment",
+    "selected_action_gate": true,
+    "shape_action_gate": false,
+    "shape_veto_gate": true
+  },
+  "frozen": true,
+  "manifest_payload_sha256": "d8e052214e5d12031ebec4029571a54fcdb75962e04e76dae0ffed84760d22bf",
+  "risk_policy": {
+    "commit_guard_ms": 25.0,
+    "max_candidates": 8,
+    "min_calibration_coverage": 0.9,
+    "particle_count": 128,
+    "prefetch_desired_lead_ms": 100.0,
+    "prefetch_min_hbm_feasibility": 0.95,
+    "prepare_host_enabled": true,
+    "top_k": 8
+  },
+  "runtime_policy": {
+    "context_length": 262144,
+    "gpu_index": 0,
+    "host_cache_gib": 96,
+    "joint_workflow_active_window": 8,
+    "max_running_requests": 16,
+    "mode": "paired_veto_canary",
+    "pool_tokens": 163840,
+    "port": 18000
+  },
+  "runtime_source_fingerprint": {
+    "algorithm": "sha256(path\\0sha256(content))",
+    "digest": "4049f86cde9eeb4848d72eb47f670ec887cf3a987d7e49b9ad9d00c853c5f8b3",
+    "file_count": 174
+  },
+  "schema_version": 1,
+  "selection_contract": {
+    "adaptive_trace_selection": false,
+    "maximum_predictive_prepare_actions": 1,
+    "no_forced_or_injected_intent": true,
+    "no_predictive_prefetch_or_retraction": true,
+    "no_threshold_changes_after_freeze": true,
+    "same_workload_and_arrival_for_both_arms": true
+  },
+  "study_id": "p6-morphology-veto-canary-v1"
+}

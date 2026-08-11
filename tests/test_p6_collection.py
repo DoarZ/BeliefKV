@@ -1,13 +1,34 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from pathlib import Path
 
 import pytest
 
 from beliefkv.experiments.p6_collection import load_collection_batch
-from scripts.run_p6_collection_batch import _materialize_runtime_workload_manifest
+from scripts.run_p6_collection_batch import (
+    _actual_kv_pool_tokens,
+    _materialize_runtime_workload_manifest,
+)
+
+
+def test_actual_kv_pool_tokens_uses_server_report(monkeypatch: pytest.MonkeyPatch) -> None:
+    requested_urls: list[str] = []
+
+    def fake_urlopen(url: str, *, timeout: float) -> io.BytesIO:
+        requested_urls.append(url)
+        assert timeout == 3.0
+        return io.BytesIO(b'{"max_total_num_tokens": 167816}')
+
+    monkeypatch.setattr(
+        "scripts.run_p6_collection_batch.urllib.request.urlopen",
+        fake_urlopen,
+    )
+
+    assert _actual_kv_pool_tokens("http://127.0.0.1:18000/v1", timeout_s=3.0) == 167816
+    assert requested_urls == ["http://127.0.0.1:18000/get_server_info"]
 
 
 def _write_fixture(tmp_path: Path, *, split: str = "train") -> Path:

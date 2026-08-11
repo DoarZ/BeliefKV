@@ -148,6 +148,36 @@ def test_join_is_resolved_after_candidate_batch_schedule() -> None:
     assert serial_timeline.join_reentry_offsets_ms["join"] != max(100, 100)
 
 
+def test_service_estimates_are_reused_across_candidate_timelines() -> None:
+    evaluator = CandidateTimelineEvaluator(_service_model(), service_quantile=0.9)
+    plan = CandidatePhysicalPlan(
+        package_id="batched",
+        physical_snapshot_id="snapshot",
+        physical_snapshot_revision=1,
+        invocation_demands=_physical_demands(),
+        batches=(
+            ScheduledBatchQuantum(
+                "batched",
+                DemandPhase.DECODE,
+                (
+                    ScheduledRequestQuantum("child-a", 100, 4096),
+                    ScheduledRequestQuantum("child-b", 100, 4096),
+                ),
+                chunk_position="first",
+            ),
+        ),
+    )
+
+    evaluator.evaluate(_scenario(), plan)
+    first_hits, first_misses, entries = evaluator.service_cache_stats()
+    evaluator.evaluate(_scenario(), plan)
+    second_hits, second_misses, _ = evaluator.service_cache_stats()
+
+    assert (first_hits, first_misses, entries) == (0, 1, 1)
+    assert second_hits == 1
+    assert second_misses == 1
+
+
 def test_timed_scenario_is_the_only_input_to_risk_cost() -> None:
     evaluator = CandidateTimelineEvaluator(_service_model())
     plan = CandidatePhysicalPlan(
@@ -228,3 +258,49 @@ def test_join_release_and_parent_completion_are_distinct() -> None:
     )
     assert parent.completion_offset_ms > timeline.join_reentry_offsets_ms["join"]
     assert timeline.service_quanta[-1].start_offset_ms == 25.0
+
+
+def test_reactive_restore_starts_only_after_join_release() -> None:
+    evaluator = CandidateTimelineEvaluator(_service_model())
+    plan = CandidatePhysicalPlan(
+        package_id="reactive-parent",
+        physical_snapshot_id="snapshot",
+        physical_snapshot_revision=1,
+        invocation_demands=(
+            *_physical_demands(),
+            PhysicalizedInvocationDemand("parent", 0, 16, 8192),
+        ),
+        batches=(
+            ScheduledBatchQuantum(
+                "children",
+                DemandPhase.DECODE,
+                (
+                    ScheduledRequestQuantum("child-a", 100, 4096),
+                    ScheduledRequestQuantum("child-b", 100, 4096),
+                ),
+            ),
+            ScheduledBatchQuantum(
+                "parent",
+                DemandPhase.DECODE,
+                (ScheduledRequestQuantum("parent", 16, 8192),),
+                ready_after_transfer_ids=("restore-parent",),
+            ),
+        ),
+        transfers=(
+            ScheduledTransfer(
+                "restore-parent",
+                0.0,
+                25.0,
+                25.0,
+                ready_after_dependency_release_ids=("parent",),
+            ),
+        ),
+    )
+
+    timeline = evaluator.evaluate(_scenario(), plan)
+    join_release = timeline.join_reentry_offsets_ms["join"]
+
+    assert timeline.transfer_completion_offsets_ms["restore-parent"] == (
+        join_release + 25.0
+    )
+    assert timeline.service_quanta[-1].start_offset_ms == join_release + 25.0

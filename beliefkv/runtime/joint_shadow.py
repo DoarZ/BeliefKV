@@ -4,6 +4,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping, Protocol
 
@@ -15,6 +16,11 @@ from beliefkv.policy.admission import AdmissionController
 from beliefkv.policy.causal_frontier import CausalFrontierScheduler
 from beliefkv.policy.joint_scheduler import JointPlan, ObservedJointPlanner
 from beliefkv.policy.leases import CausalLeaseProjector
+from beliefkv.policy.risk_shadow import (
+    PredictiveEligibility,
+    PredictiveRiskShadowObserver,
+    PredictiveRiskShadowResult,
+)
 from beliefkv.policy.reference import (
     CapabilityReport,
     MetadataSource,
@@ -38,6 +44,7 @@ from beliefkv.runtime.page_index import (
     PhysicalPageStateReplica,
 )
 from beliefkv.runtime.protocol import PageHandle, TransferTelemetry
+from beliefkv.predictor.frontier_belief import PredictiveEvidenceReadSet
 
 
 class JointPlanProducer(Protocol):
@@ -70,6 +77,7 @@ class JointShadowStateStamp:
     lease_revision: int = 0
     grace_revision: int = 0
     parser_frontier_revision: int = 0
+    admission_revision: int = 0
 
 
 @dataclass(frozen=True)
@@ -93,6 +101,7 @@ class JointShadowDelta:
     frontier_predictions: Mapping[str, Mapping[str, object]] = field(
         default_factory=dict
     )
+    frontier_model_version: str | None = None
 
     def __post_init__(self) -> None:
         if self.event_to_sequence < self.event_from_sequence:
@@ -113,6 +122,8 @@ class JointShadowDelta:
                 }
             ),
         )
+        if self.frontier_model_version is not None and not self.frontier_model_version:
+            raise ValueError("frontier model version must be non-empty")
 
 
 def coalesce_joint_shadow_deltas(
@@ -208,6 +219,7 @@ def coalesce_joint_shadow_deltas(
         trigger=last.trigger,
         captured_monotonic_ms=last.captured_monotonic_ms,
         frontier_predictions=last.frontier_predictions,
+        frontier_model_version=last.frontier_model_version,
     )
 
 
@@ -237,6 +249,9 @@ class JointShadowResult:
     trigger: str = "legacy_policy_input"
     trigger_interval_ms: float | None = None
     planning_budget_ms: float | None = None
+    predictive_shadow: PredictiveRiskShadowResult | None = None
+    predictive_shadow_error: str | None = None
+    predictive_shadow_compute_ms: float = 0.0
 
     @property
     def queue_wait_ms(self) -> float:
@@ -268,11 +283,59 @@ class JointShadowWorkerStats:
 
 
 @dataclass(frozen=True)
+class PredictiveRiskSubmission:
+    sequence: int
+    source_joint_sequence: int
+    source_snapshot_id: str
+    submitted_monotonic_ms: float
+    eligibility: PredictiveEligibility
+    enqueue_ms: float
+    enqueued: bool
+    replaced_sequence: int | None
+    suppression_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class PredictiveRiskWorkerResult:
+    sequence: int
+    source_joint_sequence: int
+    source_snapshot_id: str
+    submitted_monotonic_ms: float
+    started_monotonic_ms: float
+    completed_monotonic_ms: float
+    policy_input: PolicyInput
+    shadow: PredictiveRiskShadowResult | None
+    error: str | None
+    eligibility_ms: float
+    counterfactual_shadow: PredictiveRiskShadowResult | None = None
+    counterfactual_error: str | None = None
+
+    @property
+    def queue_wait_ms(self) -> float:
+        return max(0.0, self.started_monotonic_ms - self.submitted_monotonic_ms)
+
+    @property
+    def compute_ms(self) -> float:
+        return max(0.0, self.completed_monotonic_ms - self.started_monotonic_ms)
+
+
+@dataclass(frozen=True)
 class _WorkItem:
     sequence: int
     submitted_monotonic_ms: float
     policy_input: PolicyInput | None = None
     deltas: tuple[JointShadowDelta, ...] = ()
+
+
+@dataclass(frozen=True)
+class _PredictiveWorkItem:
+    sequence: int
+    source_joint_sequence: int
+    submitted_monotonic_ms: float
+    policy_input: PolicyInput
+    source_plan: JointPlan
+    state_stamp: JointShadowStateStamp
+    eligibility: PredictiveEligibility
 
 
 class IncrementalPolicyInputAssembler:
@@ -300,6 +363,13 @@ class IncrementalPolicyInputAssembler:
             window=config.service_curve_window,
             min_samples=config.service_curve_min_samples,
         )
+        if config.transfer_service_model_path:
+            self.service_curve.warm_start(
+                Path(config.transfer_service_model_path),
+                expected_hardware_key=config.transfer_service_hardware_key,
+            )
+            self.service_curve.validate_warm_start_contract()
+        self.transfer_service_contract = self.service_curve.warm_start_contract()
         self.builder = PolicyInputSnapshotBuilder(
             self.graph,
             self.data_consumers,
@@ -386,6 +456,14 @@ class IncrementalPolicyInputAssembler:
                 policy_input,
                 optional_metadata=metadata,
             )
+        if delta.frontier_model_version:
+            metadata = dict(policy_input.optional_metadata)
+            metadata["frontier_prediction_model_version"] = MetadataValue(
+                source=MetadataSource.PREDICTED,
+                value=delta.frontier_model_version,
+                producer="frontier_belief_model",
+            )
+            policy_input = replace(policy_input, optional_metadata=metadata)
         return policy_input
 
 
@@ -638,6 +716,220 @@ class LatestWinsJointPlanWorker:
 
     def __exit__(self, *_args: object) -> None:
         self.close()
+
+
+class LatestWinsPredictiveRiskWorker:
+    """Independent, capacity-one predictive worker with cooperative cancel."""
+
+    def __init__(
+        self,
+        observer: PredictiveRiskShadowObserver,
+        *,
+        thread_name: str = "beliefkv-predictive-risk",
+    ) -> None:
+        self.observer = observer
+        self._condition = threading.Condition()
+        self._pending: _PredictiveWorkItem | None = None
+        self._latest: PredictiveRiskWorkerResult | None = None
+        self._closed = False
+        self._busy = False
+        self._next_sequence = 0
+        self._submitted_count = 0
+        self._started_count = 0
+        self._completed_count = 0
+        self._failed_count = 0
+        self._dropped_pending_count = 0
+        self._superseded_result_count = 0
+        self._last_trigger_signature: tuple[object, ...] | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name=thread_name,
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(
+        self,
+        result: JointShadowResult,
+    ) -> PredictiveRiskSubmission:
+        started_ns = time.perf_counter_ns()
+        if (
+            result.plan is None
+            or result.policy_input is None
+            or result.state_stamp is None
+        ):
+            raise ValueError("predictive risk submission requires a complete observed plan")
+        eligibility = self.observer.eligibility_index.probe(result.policy_input)
+        submitted_ms = _monotonic_ms()
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("predictive risk worker is closed")
+            trigger_signature = (
+                eligibility.trigger_signature
+                if eligibility.has_candidate
+                else ("no_candidate",)
+            )
+            changed = trigger_signature != self._last_trigger_signature
+            replaced = None
+            enqueued = False
+            suppression_reason = None
+            if changed:
+                self._last_trigger_signature = trigger_signature
+                self._next_sequence += 1
+                replaced = (
+                    self._pending.sequence if self._pending is not None else None
+                )
+                if self._pending is not None:
+                    self._pending = None
+                    self._dropped_pending_count += 1
+                if eligibility.has_candidate:
+                    self._pending = _PredictiveWorkItem(
+                        sequence=self._next_sequence,
+                        source_joint_sequence=result.sequence,
+                        submitted_monotonic_ms=submitted_ms,
+                        policy_input=result.policy_input,
+                        source_plan=result.plan,
+                        state_stamp=result.state_stamp,
+                        eligibility=eligibility,
+                    )
+                    enqueued = True
+                else:
+                    suppression_reason = "no_action_specific_candidate"
+            else:
+                suppression_reason = "unchanged_action_bucket"
+            sequence = self._next_sequence
+            self._submitted_count += 1
+            if changed:
+                self._condition.notify_all()
+        return PredictiveRiskSubmission(
+            sequence=sequence,
+            source_joint_sequence=result.sequence,
+            source_snapshot_id=result.policy_input.snapshot_id,
+            submitted_monotonic_ms=submitted_ms,
+            eligibility=eligibility,
+            enqueue_ms=(time.perf_counter_ns() - started_ns) / 1_000_000.0,
+            enqueued=enqueued,
+            replaced_sequence=replaced,
+            suppression_reason=suppression_reason,
+        )
+
+    def latest(self, *, after_sequence: int = 0) -> PredictiveRiskWorkerResult | None:
+        with self._condition:
+            if self._latest is None or self._latest.sequence <= after_sequence:
+                return None
+            return self._latest
+
+    def stats(self) -> JointShadowWorkerStats:
+        with self._condition:
+            return JointShadowWorkerStats(
+                submitted_count=self._submitted_count,
+                started_count=self._started_count,
+                completed_count=self._completed_count,
+                failed_count=self._failed_count,
+                dropped_pending_count=self._dropped_pending_count,
+                coalesced_pending_count=0,
+                superseded_result_count=self._superseded_result_count,
+                pending_count=int(self._pending is not None),
+                busy=self._busy,
+                latest_published_sequence=(
+                    self._latest.sequence if self._latest is not None else 0
+                ),
+            )
+
+    def close(self, *, timeout_s: float = 5.0) -> bool:
+        if timeout_s < 0:
+            raise ValueError("worker close timeout must be non-negative")
+        with self._condition:
+            self._closed = True
+            if self._pending is not None:
+                self._pending = None
+                self._dropped_pending_count += 1
+            self._condition.notify_all()
+        self._thread.join(timeout=timeout_s)
+        return not self._thread.is_alive()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while self._pending is None and not self._closed:
+                    self._condition.wait()
+                if self._closed:
+                    return
+                item = self._pending
+                self._pending = None
+                self._busy = True
+                self._started_count += 1
+            assert item is not None
+            started_ms = _monotonic_ms()
+            shadow = None
+            error = None
+            try:
+                graph = RuntimeCausalContextGraph.from_snapshot(
+                    item.policy_input.runtime_graph.state
+                )
+                model_metadata = item.policy_input.optional_metadata.get(
+                    "frontier_prediction_model_version"
+                )
+                model_version = (
+                    str(model_metadata.value)
+                    if model_metadata is not None
+                    else "unavailable"
+                )
+                evidence_read_set = PredictiveEvidenceReadSet(
+                    graph_version=item.state_stamp.graph_version,
+                    page_revision=item.state_stamp.page_revision,
+                    topology_revision=item.state_stamp.topology_revision,
+                    fairness_revision=item.state_stamp.fairness_revision,
+                    admission_revision=item.state_stamp.admission_revision,
+                    transfer_epoch=item.state_stamp.transfer_epoch,
+                    obligation_revision=item.state_stamp.obligation_revision,
+                    lease_revision=item.state_stamp.lease_revision,
+                    grace_revision=item.state_stamp.grace_revision,
+                    parser_frontier_revision=(
+                        item.state_stamp.parser_frontier_revision
+                    ),
+                    model_version=model_version,
+                )
+                shadow = self.observer.evaluate(
+                    item.policy_input,
+                    graph=graph,
+                    source_plan=item.source_plan,
+                    eligibility=item.eligibility,
+                    evidence_read_set=evidence_read_set,
+                    cancel_check=lambda: self._is_superseded(item.sequence),
+                )
+            except Exception as caught:
+                error = f"{type(caught).__name__}: {caught}"
+            completed_ms = _monotonic_ms()
+            worker_result = PredictiveRiskWorkerResult(
+                sequence=item.sequence,
+                source_joint_sequence=item.source_joint_sequence,
+                source_snapshot_id=item.policy_input.snapshot_id,
+                submitted_monotonic_ms=item.submitted_monotonic_ms,
+                started_monotonic_ms=started_ms,
+                completed_monotonic_ms=completed_ms,
+                policy_input=item.policy_input,
+                shadow=shadow,
+                error=error,
+                eligibility_ms=item.eligibility.probe_ms,
+                counterfactual_shadow=None,
+                counterfactual_error=None,
+            )
+            with self._condition:
+                self._busy = False
+                self._completed_count += 1
+                if error is not None:
+                    self._failed_count += 1
+                superseded = self._next_sequence > item.sequence
+                if superseded:
+                    self._superseded_result_count += 1
+                elif self._latest is None or item.sequence > self._latest.sequence:
+                    self._latest = worker_result
+                self._condition.notify_all()
+
+    def _is_superseded(self, sequence: int) -> bool:
+        with self._condition:
+            return self._closed or self._next_sequence > sequence
 
 
 def _monotonic_ms() -> float:

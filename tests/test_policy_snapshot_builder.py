@@ -240,6 +240,25 @@ def test_snapshot_versions_change_only_with_corresponding_physical_state() -> No
     assert fourth.physical_kv.allocator_version > third.physical_kv.allocator_version
 
 
+def test_snapshot_exposes_conditioned_transfer_estimates_per_context() -> None:
+    controller = _controller()
+    _bind_two_level_tree(controller)
+
+    snapshot = controller.build_policy_input(
+        _observation(ts_ms=10, hbm_used=300)
+    )
+
+    metadata = snapshot.optional_metadata[
+        "beliefkv_transfer_service_estimates"
+    ].value
+    estimate = metadata["contexts"]["ctx-root"]["d2h"]
+    assert estimate["size_bytes"] == 300
+    assert estimate["page_count"] == 2
+    assert estimate["command_kind"] == "offload_context"
+    assert estimate["effective_bytes_per_ms_p10"] > 0
+    assert estimate["source"]
+
+
 def test_residency_delta_rebuilds_only_touched_radix_ancestors() -> None:
     controller = _controller()
     _bind_two_level_tree(controller)

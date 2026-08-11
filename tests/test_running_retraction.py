@@ -36,6 +36,10 @@ def candidate(
     private_bytes: int = 100,
     service_status: str = "stale",
     causal_rank: int = 3,
+    frontier_class: str = "unknown",
+    prediction_support: str = "unavailable",
+    service_to_boundary_tokens: float | None = None,
+    join_criticality: float = 0.0,
 ) -> RunningRetractionCandidate:
     return RunningRetractionCandidate(
         request_id=request_id,
@@ -48,6 +52,10 @@ def candidate(
         causal_rank=causal_rank,
         unblock_depth=0,
         workflow_fair_rank=1,
+        frontier_class=frontier_class,
+        prediction_support=prediction_support,
+        service_to_boundary_tokens=service_to_boundary_tokens,
+        join_criticality=join_criticality,
     )
 
 
@@ -108,6 +116,114 @@ class ObservedRetractionPlannerTest(unittest.TestCase):
         self.assertEqual(plan.expected_reclaim_capacity_bytes, 800)
         self.assertEqual(plan.replacement_request_ids, ("replacement",))
 
+    def test_disabled_frontier_annotations_preserve_observed_result(self):
+        baseline = self.planner.plan(
+            snapshot(
+                candidates=(candidate("a", private_bytes=600), candidate("b", private_bytes=600)),
+                active_footprint=1400,
+            )
+        )
+        annotated = self.planner.plan(
+            snapshot(
+                candidates=(
+                    candidate(
+                        "a",
+                        private_bytes=600,
+                        frontier_class="expand",
+                        prediction_support="exact",
+                        service_to_boundary_tokens=8,
+                    ),
+                    candidate(
+                        "b",
+                        private_bytes=600,
+                        frontier_class="hold",
+                        prediction_support="exact",
+                        service_to_boundary_tokens=512,
+                    ),
+                ),
+                active_footprint=1400,
+            )
+        )
+
+        self.assertEqual(annotated, baseline)
+
+    def test_frontier_aware_planner_protects_expand_and_prefers_hold(self):
+        planner = ObservedRetractionPlanner(
+            ObservedRetractionConfig(
+                minimum_admission_stall_ms=100.0,
+                minimum_reclaim_bytes=1,
+                frontier_aware_enabled=True,
+            )
+        )
+        plan = planner.plan(
+            snapshot(
+                candidates=(
+                    candidate(
+                        "expand",
+                        private_bytes=600,
+                        frontier_class="expand",
+                        prediction_support="exact",
+                        service_to_boundary_tokens=8,
+                    ),
+                    candidate(
+                        "hold",
+                        private_bytes=600,
+                        frontier_class="hold",
+                        prediction_support="exact",
+                        service_to_boundary_tokens=512,
+                    ),
+                ),
+                active_footprint=1400,
+            )
+        )
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.request_ids, ("hold",))
+        self.assertEqual(plan.reason, "frontier_aware_lock_closure_reclaim")
+
+    def test_frontier_aware_planner_prioritizes_expand_replacement(self):
+        planner = ObservedRetractionPlanner(
+            ObservedRetractionConfig(
+                minimum_admission_stall_ms=100.0,
+                minimum_reclaim_bytes=1,
+                frontier_aware_enabled=True,
+            )
+        )
+        source = snapshot(
+            candidates=(
+                candidate(
+                    "hold",
+                    private_bytes=1000,
+                    frontier_class="hold",
+                    prediction_support="exact",
+                ),
+            ),
+            active_footprint=1400,
+            running_count=2,
+        )
+        source = source.__class__(
+            **{
+                **source.__dict__,
+                "replacements": (
+                    RetractionReplacement("observed-first", 100),
+                    RetractionReplacement(
+                        "expand-first",
+                        100,
+                        frontier_class="expand",
+                        prediction_support="exact",
+                        service_to_boundary_tokens=16,
+                    ),
+                ),
+            }
+        )
+
+        plan = planner.plan(source)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(
+            plan.replacement_request_ids,
+            ("expand-first", "observed-first"),
+        )
     def test_does_not_count_partially_attributed_extent(self):
         decision = self.planner.decide(
             snapshot(
@@ -174,6 +290,30 @@ class ObservedRetractionPlannerTest(unittest.TestCase):
     def test_config_requires_observed_admission(self):
         with self.assertRaisesRegex(ValueError, "observed admission"):
             BeliefKVConfig(running_batch_retraction_enabled=True)
+
+
+def test_runtime_projects_frontier_prediction_into_retraction_annotation():
+    runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+    runtime.controller = SimpleNamespace(graph=SimpleNamespace(joins={}))
+    runtime._last_frontier_predictions = {
+        "inv": {
+            "boundary_distribution": {"tool": 0.8, "final": 0.2},
+            "remaining_decode_tokens": {
+                "values": [16, 64],
+                "probability_mass": [0.6, 0.4],
+            },
+            "support_level": "exact",
+        }
+    }
+
+    annotation = runtime._frontier_retraction_annotation("inv")
+
+    assert annotation == {
+        "frontier_class": "expand",
+        "prediction_support": "exact",
+        "service_to_boundary_tokens": 16.0,
+        "join_criticality": 0.0,
+    }
 
 
 class _Audit:

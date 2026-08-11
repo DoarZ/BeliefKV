@@ -348,6 +348,14 @@ class DemandPhase(str, Enum):
     EXTERNAL = "external"
 
 
+class ScenarioProjection(str, Enum):
+    """Action-specific particle coordinates used for finite risk planning."""
+
+    FULL = "full"
+    PREFETCH = "prefetch"
+    PREPARE_HOST = "prepare_host"
+
+
 @dataclass(frozen=True)
 class ExternalDemandSegment:
     segment_kind: str
@@ -419,15 +427,33 @@ class DemandScenario:
     scenario_id: str
     outcomes: tuple[FrontierDemandOutcome, ...]
     probability_mass: float
+    conservative_outcomes: tuple[FrontierDemandOutcome, ...] = ()
+    projection: ScenarioProjection = ScenarioProjection.FULL
 
     def __post_init__(self) -> None:
         if not self.scenario_id or not self.outcomes:
             raise ValueError("belief scenario identity and outcomes are required")
         if not 0 < self.probability_mass <= 1:
             raise ValueError("belief scenario probability must be in (0, 1]")
+        object.__setattr__(self, "projection", ScenarioProjection(self.projection))
         invocation_ids = [item.invocation_id for item in self.outcomes]
         if len(invocation_ids) != len(set(invocation_ids)):
             raise ValueError("a scenario must assign each invocation once")
+        conservative_ids = [
+            item.invocation_id for item in self.conservative_outcomes
+        ]
+        if conservative_ids and set(conservative_ids) != set(invocation_ids):
+            raise ValueError(
+                "a conservative scenario must assign the same invocation closure"
+            )
+        if len(conservative_ids) != len(set(conservative_ids)):
+            raise ValueError(
+                "a conservative scenario must assign each invocation once"
+            )
+
+    @property
+    def feasibility_outcomes(self) -> tuple[FrontierDemandOutcome, ...]:
+        return self.conservative_outcomes or self.outcomes
 
 
 @dataclass(frozen=True)

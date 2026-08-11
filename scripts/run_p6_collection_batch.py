@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import urllib.request
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +29,28 @@ from beliefkv.runtime.langchain_tool_safety import ToolObservationBudgetPolicy
 
 DEFAULT_PAUSE_FILE = Path("/tmp/beliefkv-experiments.paused")
 DEFAULT_HARNESS_PROFILES = REPOSITORY_ROOT / "configs/p6/harness_profiles_v1.json"
+
+
+def _actual_kv_pool_tokens(base_url: str, *, timeout_s: float = 10.0) -> int:
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3]
+    with urllib.request.urlopen(
+        f"{root}/get_server_info",
+        timeout=timeout_s,
+    ) as response:
+        payload = json.load(response)
+    if not isinstance(payload, dict):
+        raise RuntimeError("SGLang /get_server_info did not return a JSON object")
+    try:
+        actual = int(payload["max_total_num_tokens"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "SGLang /get_server_info omitted a valid max_total_num_tokens"
+        ) from error
+    if actual <= 0:
+        raise RuntimeError("SGLang reported a non-positive KV pool capacity")
+    return actual
 
 
 def _materialize_runtime_workload_manifest(
@@ -163,13 +186,45 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--predictive-risk-shadow-enabled",
+        action="store_true",
+        help=(
+            "Record that the serving-side P6 scenario-risk observer evaluated "
+            "read-only would-actions; no predictive command is dispatched."
+        ),
+    )
+    parser.add_argument(
         "--predictive-joint-enabled",
         action="store_true",
         help=(
-            "Record that the serving-side JointPlan consumed FrontierBelief "
-            "predictions (prediction_used=true). Implies predictor shadow "
-            "flag; the dataset exporter marks this run formal ineligible."
+            "Deprecated provenance flag for historical runs. The current "
+            "serving path never grants this flag predictive action authority."
         ),
+    )
+    parser.add_argument(
+        "--predictive-joint-overlay-enabled",
+        action="store_true",
+        help=(
+            "Record that the serving-side semantic predictive overlay may "
+            "dispatch PREPARE_HOST through JointPlan."
+        ),
+    )
+    parser.add_argument(
+        "--predictive-prefetch-canary-enabled",
+        action="store_true",
+        help=(
+            "Record that the bounded serving-side PREFETCH_GPU canary is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--frontier-retraction-shadow-enabled",
+        action="store_true",
+        help="Record observed/frontier selective-retraction comparisons.",
+    )
+    parser.add_argument(
+        "--frontier-retraction-canary-limit",
+        type=int,
+        default=0,
     )
     parser.add_argument("--base-url", default="http://127.0.0.1:18000/v1")
     parser.add_argument("--model", default="Qwen3-Coder-30B-A3B-Instruct-FP8")
@@ -178,7 +233,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--server-events", type=Path, required=True)
     parser.add_argument("--server-log", type=Path, required=True)
     parser.add_argument("--gpu", type=int, default=0)
-    parser.add_argument("--pool-tokens", type=int, default=163_840)
+    parser.add_argument(
+        "--pool-tokens",
+        type=int,
+        default=163_840,
+        help=(
+            "minimum actual SGLang max_total_num_tokens required by this run; "
+            "the server-reported value is used for pressure accounting"
+        ),
+    )
     parser.add_argument("--max-completion-tokens", type=int, default=4096)
     parser.add_argument("--context-window-tokens", type=int, default=32_768)
     parser.add_argument("--context-keep-tokens", type=int, default=8_192)
@@ -186,6 +249,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tool-observation-turn-chars", type=int, default=65_536)
     parser.add_argument("--tool-observation-result-chars", type=int, default=16_384)
     parser.add_argument("--recursion-limit", type=int, default=512)
+    parser.add_argument(
+        "--subagent-fanout-profile",
+        choices=("natural", "parallel_analysis_2to3"),
+        default="natural",
+    )
+    parser.add_argument("--workflow-arrival-interval-ms", type=float, default=0.0)
     parser.add_argument("--request-timeout", type=float, default=7200.0)
     parser.add_argument("--sandbox-command-timeout", type=int, default=600)
     parser.add_argument("--runtime-event-ack-timeout", type=float, default=10.0)
@@ -207,12 +276,29 @@ def main() -> int:
     if pause_file.exists():
         print(f"BeliefKV experiments are paused: {pause_file}", file=sys.stderr)
         return 75
+    if (
+        args.predictive_prefetch_canary_enabled
+        and not args.predictive_joint_overlay_enabled
+    ):
+        raise ValueError(
+            "predictive prefetch canary provenance requires predictive overlay"
+        )
+    if args.frontier_retraction_canary_limit < 0:
+        raise ValueError("frontier retraction canary limit must be non-negative")
     batch = load_collection_batch(
         args.collection_plan,
         args.batch_id,
         allow_calibration=args.allow_calibration,
         allow_test=args.allow_test,
     )
+    if args.pool_tokens <= 0:
+        raise ValueError("--pool-tokens must be positive")
+    actual_pool_tokens = _actual_kv_pool_tokens(args.base_url)
+    if actual_pool_tokens < args.pool_tokens:
+        raise RuntimeError(
+            "SGLang actual KV pool is below the collection requirement: "
+            f"actual={actual_pool_tokens}, required={args.pool_tokens}"
+        )
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output = args.output or (
         REPOSITORY_ROOT
@@ -250,12 +336,38 @@ def main() -> int:
         "selected_instance_ids": selected_instance_ids,
         "workflow_count": workflow_count,
         "concurrency": concurrency,
+        "workflow_arrival_interval_ms": args.workflow_arrival_interval_ms,
+        "required_minimum_pool_tokens": args.pool_tokens,
+        "actual_pool_tokens": actual_pool_tokens,
         "predictor_enabled": (
-            args.predictor_shadow_enabled or args.predictive_joint_enabled
+            args.predictor_shadow_enabled
+            or args.predictive_risk_shadow_enabled
+            or args.predictive_joint_enabled
+            or args.predictive_joint_overlay_enabled
         ),
-        "predictive_actions_enabled": args.predictive_joint_enabled,
+        "predictive_actions_enabled": args.predictive_joint_overlay_enabled,
+        "predictive_risk_shadow_enabled": args.predictive_risk_shadow_enabled,
+        "predictive_joint_overlay_enabled": (
+            args.predictive_joint_overlay_enabled
+        ),
+        "predictive_prefetch_canary_enabled": (
+            args.predictive_prefetch_canary_enabled
+        ),
+        "frontier_retraction_shadow_enabled": (
+            args.frontier_retraction_shadow_enabled
+        ),
+        "frontier_retraction_canary_limit": (
+            args.frontier_retraction_canary_limit
+        ),
+        "predictive_transfer_model": "extent_count_aware",
         "joint_predictive_enabled": args.predictive_joint_enabled,
-        "runtime_policy": "frozen_p5_observed",
+        "legacy_predictive_flag_requested": args.predictive_joint_enabled,
+        "runtime_policy": (
+            "p5_observed_plus_p6_predictive_overlay"
+            if args.predictive_joint_overlay_enabled
+            else "frozen_p5_observed"
+        ),
+        "subagent_fanout_profile": args.subagent_fanout_profile,
         "request_timeout_s": args.request_timeout,
         "completion_semantics": "model_terminal_no_harness_llm_repair",
         "completion_gate_enabled": False,
@@ -300,9 +412,11 @@ def main() -> int:
         server_log_path=args.server_log,
         max_workflows=workflow_count,
         concurrency=concurrency,
+        workflow_arrival_interval_ms=args.workflow_arrival_interval_ms,
         gpu_index=args.gpu,
-        pool_tokens=args.pool_tokens,
+        pool_tokens=actual_pool_tokens,
         max_completion_tokens=args.max_completion_tokens,
+        subagent_fanout_profile=args.subagent_fanout_profile,
         recursion_limit=args.recursion_limit,
         request_timeout_s=args.request_timeout,
         sandbox_command_timeout_s=args.sandbox_command_timeout,

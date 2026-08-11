@@ -271,6 +271,12 @@ class TransferTelemetry:
     allocator_submit_ms: float | None = None
     callback_overhead_ms: float | None = None
     start_timestamp_semantics: str = "unavailable"
+    extent_count: int = 0
+    extent_bytes_min: int = 0
+    extent_bytes_p50: int = 0
+    extent_bytes_max: int = 0
+    small_extent_ratio: float = 0.0
+    small_extent_threshold_bytes: int = 64 * 1024 * 1024
 
     def __post_init__(self) -> None:
         if not self.command_id:
@@ -301,8 +307,28 @@ class TransferTelemetry:
             raise ValueError("transfer byte counts must be non-negative")
         if self.actual_bytes > self.closure_bytes:
             raise ValueError("actual_bytes cannot exceed selected closure_bytes")
-        if self.merged_operation_count < 0 or self.page_count < 0:
+        if (
+            self.merged_operation_count < 0
+            or self.page_count < 0
+            or self.extent_count < 0
+        ):
             raise ValueError("operation and page counts must be non-negative")
+        extent_sizes = (
+            self.extent_bytes_min,
+            self.extent_bytes_p50,
+            self.extent_bytes_max,
+            self.small_extent_threshold_bytes,
+        )
+        if any(value < 0 for value in extent_sizes):
+            raise ValueError("extent byte statistics must be non-negative")
+        if not (
+            self.extent_bytes_min
+            <= self.extent_bytes_p50
+            <= self.extent_bytes_max
+        ):
+            raise ValueError("extent byte statistics must be ordered")
+        if not 0.0 <= self.small_extent_ratio <= 1.0:
+            raise ValueError("small_extent_ratio must be within [0, 1]")
         if self.native_concurrent_bytes < 0:
             raise ValueError("native concurrent bytes must be non-negative")
         if not self.source_tier or not self.target_tier:

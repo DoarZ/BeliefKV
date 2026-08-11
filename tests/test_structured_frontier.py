@@ -10,6 +10,7 @@ from beliefkv.core.events import RuntimeEvent, RuntimeEventKind
 from beliefkv.predictor.frontier_belief import (
     BeliefScopeBuilder,
     PredictiveEvidenceReadSet,
+    ScenarioProjection,
 )
 from beliefkv.predictor.structured_frontier import (
     EmpiricalDistribution,
@@ -655,6 +656,93 @@ def test_composer_applies_known_join_all_instead_of_learning_it() -> None:
     assert belief.other_probability_mass + sum(
         item.probability_mass for item in belief.scenarios
     ) == 1.0
+
+
+def test_action_projected_reduction_preserves_mass_and_conservative_envelope() -> None:
+    graph = RuntimeCausalContextGraph()
+    graph.apply(
+        RuntimeEvent(
+            event_id="projected-1",
+            ts_ms=1.0,
+            kind=RuntimeEventKind.WORKFLOW_START,
+            workflow_id="workflow",
+        )
+    )
+    graph.apply(
+        RuntimeEvent(
+            event_id="projected-2",
+            ts_ms=2.0,
+            kind=RuntimeEventKind.INVOCATION_CREATE,
+            workflow_id="workflow",
+            invocation_id="parent",
+            context_id="parent-context",
+        )
+    )
+    graph.apply(
+        RuntimeEvent(
+            event_id="projected-3",
+            ts_ms=3.0,
+            kind=RuntimeEventKind.TOOL_START,
+            workflow_id="workflow",
+            invocation_id="parent",
+            attributes={"tool_family": "shell"},
+        )
+    )
+    scope = BeliefScopeBuilder().build(graph, ("parent",))
+    prediction = LocalFrontierPrediction(
+        invocation_id="parent",
+        boundary_distribution={"unknown": 1.0},
+        current_sequence_tokens=4096,
+        remaining_decode_tokens=EmpiricalDistribution((0.0,), (1.0,), 8.0),
+        remaining_external_wait=EmpiricalDistribution(
+            (10.0, 100.0, 1000.0), (0.4, 0.4, 0.2), 8.0
+        ),
+        tool_terminal_distribution={"success": 1.0},
+        prompt_growth_tokens=EmpiricalDistribution(
+            (16.0, 128.0, 512.0), (0.4, 0.4, 0.2), 8.0
+        ),
+        next_output_tokens=EmpiricalDistribution((16.0,), (1.0,), 8.0),
+        support_level="backoff",
+        calibration_coverage=0.95,
+        ood_reasons=("boundary_unavailable",),
+    )
+    readset = PredictiveEvidenceReadSet(
+        graph_version=graph.graph_version,
+        page_revision=0,
+        topology_revision=0,
+        fairness_revision=0,
+        admission_revision=0,
+        transfer_epoch=0,
+        obligation_revision=0,
+        lease_revision=0,
+        grace_revision=0,
+        parser_frontier_revision=0,
+        model_version="projected-v1",
+    )
+
+    belief = FrontierScenarioComposer(particle_count=32, top_k=4).compose(
+        graph=graph,
+        scope=scope,
+        local_predictions={"parent": prediction},
+        generated_ts_ms=10.0,
+        evidence_read_set=readset,
+        projection=ScenarioProjection.PREFETCH,
+        target_invocation_id="parent",
+    )
+
+    assert belief.other_probability_mass == 0.0
+    assert belief.other_policy.finite_risk_bound
+    assert sum(item.probability_mass for item in belief.scenarios) == 1.0
+    assert 1 <= len(belief.scenarios) <= 4
+    for scenario in belief.scenarios:
+        medoid = scenario.outcomes[0]
+        conservative = scenario.feasibility_outcomes[0]
+        assert scenario.projection == ScenarioProjection.PREFETCH
+        assert conservative.prompt_growth_tokens >= medoid.prompt_growth_tokens
+        assert (
+            conservative.external_segments[0].residual_delay_ms
+            <= medoid.external_segments[0].residual_delay_ms
+        )
 
 
 def test_composer_applies_blocking_child_and_message_dependencies() -> None:

@@ -119,6 +119,53 @@ def test_locked_large_extent_does_not_hide_independent_reclaimable_bundle() -> N
     assert by_handles[(free,)].bundle.marginal_reclaimable_bytes == 500
 
 
+def test_indexed_root_preview_matches_context_enumeration() -> None:
+    graph, index = _runtime(("parked", "ctx", "wf"))
+    graph.apply(_event(2, RuntimeEventKind.TOOL_START, invocation_id="parked"))
+    parent = PageHandle(1, 0)
+    child = PageHandle(2, 0)
+    index.register_page(parent, size_bytes=300, radix_depth=1)
+    index.register_page(child, size_bytes=500, radix_depth=2, parent=parent)
+    index.bind_pages("ctx", 0, (parent, child))
+    builder = PhysicalBundleBuilder(graph, index)
+
+    enumerated = builder.previews_for_context(
+        CommandKind.OFFLOAD_CONTEXT,
+        "ctx",
+        0,
+        now_ms=3,
+    )
+    direct = builder.preview_offload_root(
+        CommandKind.OFFLOAD_CONTEXT,
+        "ctx",
+        0,
+        child,
+        now_ms=3,
+    )
+
+    expected = next(item for item in enumerated if item.bundle.handles == (child,))
+    assert direct == expected
+
+
+def test_indexed_root_preview_rejects_foreign_context() -> None:
+    graph, index = _runtime(
+        ("parked", "ctx", "wf"),
+        ("other", "other-ctx", "wf"),
+    )
+    graph.apply(_event(3, RuntimeEventKind.TOOL_START, invocation_id="parked"))
+    handle = PageHandle(1, 0)
+    index.register_page(handle, size_bytes=300)
+    index.bind_pages("other-ctx", 0, (handle,))
+
+    assert PhysicalBundleBuilder(graph, index).preview_offload_root(
+        CommandKind.OFFLOAD_CONTEXT,
+        "ctx",
+        0,
+        handle,
+        now_ms=4,
+    ) is None
+
+
 def test_bundle_preview_audit_is_bounded_and_summarizes_omitted_extents() -> None:
     controller = BeliefKVController(
         BeliefKVConfig(

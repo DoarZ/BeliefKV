@@ -204,6 +204,15 @@ class BeliefKVController:
             window=self.config.service_curve_window,
             min_samples=self.config.service_curve_min_samples,
         )
+        if self.config.transfer_service_model_path:
+            self.service_curve.warm_start(
+                Path(self.config.transfer_service_model_path),
+                expected_hardware_key=(
+                    self.config.transfer_service_hardware_key
+                ),
+            )
+            self.service_curve.validate_warm_start_contract()
+        self.transfer_service_contract = self.service_curve.warm_start_contract()
         self.policy_snapshot_builder = PolicyInputSnapshotBuilder(
             self.graph,
             self.data_consumers,

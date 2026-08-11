@@ -25,9 +25,13 @@ from beliefkv.policy.joint_scheduler import JointPlannerConfig, ObservedJointPla
 from beliefkv.policy.online_joint import (
     OnlineJointPlanDecision,
     OnlineJointPlanView,
+    compile_bounded_seed_epoch,
 )
+from beliefkv.policy.predictive_joint import PredictiveActionKind
+from beliefkv.policy.risk_shadow import PredictiveIntent
 from beliefkv.policy.reference import ResidencyAction, RunnableInvocation
 from beliefkv.policy.resource_snapshot import RuntimeResourceObservation
+from beliefkv.policy.service_curve import TransferServiceCurve
 from beliefkv.runtime.audit import PolicySnapshotLog
 from beliefkv.runtime.joint_shadow import (
     IncrementalPolicyInputAssembler,
@@ -65,6 +69,7 @@ from beliefkv.runtime.sglang_v052rc1 import (
     SGLangNodeRegistry,
     close_runtime_with_signal_shield,
     install_scheduler_shutdown_handler,
+    _predictive_bundle_envelope_reasons,
 )
 from beliefkv.runtime.restore_obligation import (
     RestoreAuthorityMode,
@@ -369,6 +374,41 @@ class _AuditRecorder:
         self.events.append((event, ts_ms, fields))
 
 
+def _predictive_causal_certificate(controller, model_version):
+    snapshot = controller.graph.snapshot()
+    return {
+        "context_epochs": [
+            [context_id, context["epoch"]]
+            for context_id, context in sorted(snapshot["contexts"].items())
+        ],
+        "invocation_evidence": [
+            [
+                invocation_id,
+                invocation["state"],
+                invocation["updated_ts_ms"],
+                invocation["join_id"],
+            ]
+            for invocation_id, invocation in sorted(
+                snapshot["invocations"].items()
+            )
+        ],
+        "join_evidence": [
+            [join_id, join["mode"], join["satisfied"], join["completed"]]
+            for join_id, join in sorted(snapshot["joins"].items())
+        ],
+        "communication_evidence": [
+            [
+                edge["source_invocation_id"],
+                edge["target_invocation_id"],
+                edge["count"],
+                edge["last_ts_ms"],
+            ]
+            for edge in snapshot["communication_edges"]
+        ],
+        "model_version": model_version,
+    }
+
+
 class _EventBatchRecorder:
     def __init__(self):
         self.events = []
@@ -504,6 +544,216 @@ def resolved_bundle(kind, actions, *, closure_handles=None):
 
 
 class SGLangBackendTest(unittest.TestCase):
+
+    def test_predictive_bundle_envelope_rejects_each_value_bound(self):
+        base_intent = PredictiveIntent(
+            intent_id="intent-envelope",
+            source_joint_plan_id="source-plan",
+            source_snapshot_id="snapshot",
+            package_id="package-envelope",
+            model_version="frontier-v1",
+            action=PredictiveActionKind.PREPARE_HOST,
+            invocation_id="inv",
+            expected_invocation_state="wait_tool",
+            context_id="ctx",
+            context_epoch=0,
+            generated_ts_ms=1.0,
+            remaining_window_low_ms=1_000.0,
+            transfer_p95_ms=10.0,
+            target_bytes_hint=300,
+            min_reclaimable_bytes=300,
+            max_cross_context_bytes=0,
+            max_copy_bytes=300,
+            causal_certificate={"model_version": "frontier-v1"},
+            required_prediction_heads=("remaining_window",),
+            prediction_head_support=(("remaining_window", "exact"),),
+            calibration_coverage=0.95,
+            future_hbm_feasibility_probability=1.0,
+            expected_benefit_ms=5.0,
+            shape_fingerprint="shape-v1",
+            predicted_extent_count=1,
+            maximum_transfer_ms=12.0,
+            maximum_stall_ms=10.0,
+            morphology_slack_ms=100.0,
+        )
+        valid_preview = SimpleNamespace(
+            copy_bytes=300,
+            bundle=SimpleNamespace(
+                cross_context_action_bytes=0,
+                exclusive_action_bytes=300,
+            ),
+        )
+        cases = (
+            (
+                replace(base_intent, target_bytes_hint=299, max_copy_bytes=299),
+                valid_preview,
+                "copy_bytes_exceed_envelope",
+            ),
+            (
+                base_intent,
+                SimpleNamespace(
+                    copy_bytes=300,
+                    bundle=SimpleNamespace(
+                        cross_context_action_bytes=1,
+                        exclusive_action_bytes=300,
+                    ),
+                ),
+                "cross_context_bytes_exceed_envelope",
+            ),
+            (
+                replace(base_intent, min_reclaimable_bytes=301),
+                valid_preview,
+                "exclusive_reclaim_below_envelope",
+            ),
+        )
+        for intent, preview, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    _predictive_bundle_envelope_reasons(intent, preview),
+                    (expected,),
+                )
+
+    def test_empty_or_rejected_predictive_result_preserves_observed_plan(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = BeliefKVConfig(
+            hbm_capacity_bytes=1_000,
+            host_capacity_bytes=1_000,
+            reserve_hbm_bytes=0,
+            predictor_model_path="/tmp/frontier.json",
+            gpu_service_model_path="/tmp/service.json",
+            joint_policy_enabled=True,
+            predictive_risk_shadow_enabled=True,
+            predictive_joint_overlay_enabled=True,
+        )
+        runtime.audit = _AuditRecorder()
+        runtime._last_predictive_risk_result_sequence = 0
+        runtime._joint_shadow_timing_samples = {}
+        runtime._joint_predictive_counts = Counter()
+        runtime._last_joint_decision_plan_id = "observed-plan"
+        observed_decision = object()
+        runtime._current_online_joint_decision = observed_decision
+        runtime._latest_predictive_intent = None
+        runtime._maybe_persist_predictive_candidate_snapshot = (
+            lambda *_args, **_kwargs: None
+        )
+        observation = RuntimeResourceObservation(
+            ts_ms=10.0,
+            hbm_capacity_bytes=1_000,
+            hbm_used_bytes=0,
+            host_capacity_bytes=1_000,
+            host_used_bytes=0,
+            host_free_bytes=1_000,
+        )
+
+        candidate = PredictiveIntent(
+            intent_id="intent-rejected",
+            source_joint_plan_id="source-plan",
+            source_snapshot_id="snapshot",
+            package_id="package-rejected",
+            model_version="frontier-v1",
+            action=PredictiveActionKind.PREPARE_HOST,
+            invocation_id="inv",
+            expected_invocation_state="wait_tool",
+            context_id="ctx",
+            context_epoch=0,
+            generated_ts_ms=1.0,
+            remaining_window_low_ms=1_000.0,
+            transfer_p95_ms=10.0,
+            target_bytes_hint=100,
+            min_reclaimable_bytes=100,
+            max_cross_context_bytes=0,
+            max_copy_bytes=100,
+            causal_certificate={"model_version": "frontier-v1"},
+            required_prediction_heads=("remaining_window",),
+            prediction_head_support=(("remaining_window", "exact"),),
+            calibration_coverage=0.95,
+            future_hbm_feasibility_probability=1.0,
+            expected_benefit_ms=5.0,
+            shape_fingerprint="shape-v1",
+            predicted_extent_count=1,
+            maximum_transfer_ms=12.0,
+            maximum_stall_ms=10.0,
+            morphology_slack_ms=100.0,
+        )
+        for sequence, predictive_intent in enumerate((None, candidate), start=1):
+            shadow = SimpleNamespace(
+                predictive_intent=predictive_intent,
+                to_dict=lambda: {
+                    "selected_action": "observed_baseline",
+                    "candidate_summaries": [],
+                    "belief_compose_ms": 0.0,
+                    "candidate_generation_ms": 0.0,
+                    "deterministic_preflight_ms": 0.0,
+                    "scenario_risk_ms": 0.0,
+                },
+            )
+            result = SimpleNamespace(
+                sequence=sequence,
+                queue_wait_ms=0.0,
+                compute_ms=1.0,
+                shadow=shadow,
+                submitted_monotonic_ms=0.0,
+                source_joint_sequence=sequence,
+                eligibility_ms=0.1,
+                error=None,
+            )
+            runtime.predictive_risk_worker = SimpleNamespace(
+                latest=lambda **_kwargs: result
+            )
+
+            runtime._drain_predictive_risk_result(
+                observation,
+                current_policy_input=None,
+                current_transfer_epoch=0,
+            )
+
+            self.assertIs(runtime._current_online_joint_decision, observed_decision)
+            self.assertEqual(runtime._last_joint_decision_plan_id, "observed-plan")
+
+        runtime._latest_predictive_intent = candidate
+        shadow = SimpleNamespace(
+            predictive_intent=candidate,
+            to_dict=lambda: {
+                "selected_action": "prepare_host",
+                "candidate_summaries": [],
+                "belief_compose_ms": 0.0,
+                "candidate_generation_ms": 0.0,
+                "deterministic_preflight_ms": 0.0,
+                "scenario_risk_ms": 0.0,
+            },
+        )
+        result = SimpleNamespace(
+            sequence=3,
+            queue_wait_ms=0.0,
+            compute_ms=1.0,
+            shadow=shadow,
+            submitted_monotonic_ms=0.0,
+            source_joint_sequence=3,
+            eligibility_ms=0.1,
+            error=None,
+        )
+        runtime.predictive_risk_worker = SimpleNamespace(
+            latest=lambda **_kwargs: result
+        )
+        with mock.patch(
+            "beliefkv.runtime.sglang_v052rc1.validate_predictive_causal_certificate",
+            return_value=(),
+        ):
+            runtime._drain_predictive_risk_result(
+                observation,
+                current_policy_input=SimpleNamespace(
+                    runtime_graph=SimpleNamespace(state={})
+                ),
+                current_transfer_epoch=0,
+            )
+
+        self.assertIs(runtime._current_online_joint_decision, observed_decision)
+        self.assertEqual(runtime._last_joint_decision_plan_id, "observed-plan")
+        self.assertEqual(
+            runtime._joint_predictive_counts["semantic_intent_refresh_unchanged"],
+            1,
+        )
+
     def test_config_uses_authoritative_host_allocator_capacity(self):
         scheduler = SimpleNamespace(
             max_total_num_tokens=100,
@@ -586,12 +836,79 @@ class SGLangBackendTest(unittest.TestCase):
         self.assertEqual(fields["host_copy_state"], "present")
         self.assertIs(fields["pinned_host"], True)
         self.assertEqual(fields["native_concurrent_bytes"], 80)
+        self.assertEqual(fields["extent_count"], 1)
+        self.assertEqual(fields["extent_bytes_min"], 40)
+        self.assertEqual(fields["extent_bytes_p50"], 40)
+        self.assertEqual(fields["extent_bytes_max"], 40)
+        self.assertEqual(fields["small_extent_ratio"], 1.0)
         self.assertEqual(fields["allocator_submit_ms"], 0.25)
         self.assertEqual(fields["callback_overhead_ms"], 10.0)
         self.assertEqual(
             fields["native_inflight_operation_count_at_submit"], 2
         )
         self.assertFalse(fields["start_timestamp_observed"])
+
+    def test_native_hicache_telemetry_preserves_submit_time_ownership(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = BeliefKVConfig(kv_bytes_per_token=10)
+        runtime.controller = BeliefKVController(runtime.config)
+        runtime.controller.process_runtime_events(
+            (
+                RuntimeEvent("start", 1.0, RuntimeEventKind.WORKFLOW_START, "wf"),
+                RuntimeEvent(
+                    "create",
+                    2.0,
+                    RuntimeEventKind.INVOCATION_CREATE,
+                    "wf",
+                    invocation_id="child",
+                    context_id="ctx-child",
+                    context_epoch=0,
+                ),
+            )
+        )
+        runtime.registry = SGLangNodeRegistry()
+        node = _Node(7)
+        handle = runtime.registry.register(node)
+        runtime.controller.page_index.register_page(handle, size_bytes=40)
+        runtime.controller.page_index.bind_pages("ctx-child", 0, (handle,))
+        runtime.audit = _AuditRecorder()
+        runtime.transfer_telemetry_log = None
+        runtime._now_ms = lambda: 30.0
+        record = {
+            "operation_id": "d2h-7-1",
+            "backend_operation_id": 7,
+            "direction": "d2h",
+            "source": "native_write_back",
+            "submit_ts_ms": 10.0,
+            "complete_ts_ms": 20.0,
+            "token_count": 4,
+            "node_ids": (7,),
+        }
+
+        attribution = runtime.on_hicache_transfer_submitted(record)
+        self.assertEqual(
+            attribution["page_handles"],
+            ((handle.page_id, handle.allocation_generation),),
+        )
+        replacement_handle = runtime.registry.register(_Node(7))
+        self.assertNotEqual(replacement_handle, handle)
+        runtime.controller.page_index.unbind_context("ctx-child")
+        runtime.on_hicache_transfer_completed({**record, **attribution})
+
+        _, _, fields = runtime.audit.events[0]
+        self.assertEqual(fields["owner_context_ids"], ("ctx-child",))
+        self.assertEqual(fields["owner_context_epochs"], (("ctx-child", 0),))
+        self.assertEqual(fields["context_epoch"], 0)
+        self.assertEqual(fields["extent_count"], 1)
+        self.assertEqual(fields["extent_bytes_min"], 40)
+        self.assertEqual(fields["ownership_attribution_semantics"], "submit_snapshot")
+        self.assertEqual(
+            fields["radix_page_handles"],
+            ((handle.page_id, handle.allocation_generation),),
+        )
+        self.assertEqual(
+            fields["ownership_revision"], attribution["ownership_revision"]
+        )
 
     def test_online_joint_plan_requires_shadow_observed_worker(self):
         scheduler = SimpleNamespace(
@@ -782,6 +1099,8 @@ class SGLangBackendTest(unittest.TestCase):
         request = SimpleNamespace(
             rid="runtime-request",
             fill_ids=list(range(4096)),
+            origin_input_ids=list(range(4096)),
+            output_ids=[1, 2],
             beliefkv_metadata=BeliefKVRequestMetadata(
                 "workflow",
                 "invocation",
@@ -803,6 +1122,12 @@ class SGLangBackendTest(unittest.TestCase):
         self.assertEqual(fields["phase"], "decode")
         self.assertEqual(fields["sequence_tokens_before"], [4096])
         self.assertEqual(fields["max_sequence_tokens_before"], 4096)
+        self.assertEqual(fields["effective_sequence_tokens_before"], [4098])
+        self.assertEqual(fields["max_effective_sequence_tokens_before"], 4098)
+        self.assertEqual(
+            fields["request_samples"][0]["effective_sequence_tokens_before"],
+            4098,
+        )
         self.assertEqual(fields["workflow_ids"], ["workflow"])
 
     def test_request_physical_checkpoint_separates_allocator_and_radix_growth(self):
@@ -1147,6 +1472,91 @@ class SGLangBackendTest(unittest.TestCase):
                 if item[0] == "policy_snapshot_recorded"
             ]
             self.assertEqual(len(recorded), 2)
+
+    def test_positive_predictive_candidate_persists_exact_snapshot_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+            runtime.controller = BeliefKVController(
+                BeliefKVConfig(
+                    hbm_capacity_bytes=1_000,
+                    host_capacity_bytes=1_000,
+                    reserve_hbm_bytes=0,
+                    predictor_enabled=False,
+                )
+            )
+            runtime.audit = _AuditRecorder()
+            runtime._joint_predictive_counts = Counter()
+            runtime._predictive_candidate_snapshot_signatures = {}
+            path = Path(temporary) / "predictive-candidate.jsonl.gz"
+            runtime.policy_snapshot_log = PolicySnapshotLog(
+                path,
+                trace_id="predictive-candidate",
+                trace_sensitivity="timing_sensitive",
+            )
+            policy_input = runtime.controller.build_policy_input(
+                RuntimeResourceObservation(
+                    ts_ms=10,
+                    hbm_capacity_bytes=1_000,
+                    hbm_used_bytes=0,
+                    host_capacity_bytes=1_000,
+                    host_used_bytes=0,
+                    host_free_bytes=1_000,
+                )
+            )
+            result = SimpleNamespace(
+                sequence=7,
+                policy_input=policy_input,
+            )
+            payload = {
+                "candidate_summaries": [
+                    {
+                        "action": "prefetch_gpu",
+                        "expected_benefit_ms": 12.0,
+                        "eligible": False,
+                        "reasons": ["future_hbm_chance_constraint"],
+                        "action_certificate": {
+                            "target_context_id": "ctx-parent",
+                            "required_hbm_free_bytes": 310 << 20,
+                            "required_host_free_bytes": 0,
+                        },
+                    }
+                ]
+            }
+            observation = RuntimeResourceObservation(
+                ts_ms=11,
+                hbm_capacity_bytes=1_000,
+                hbm_used_bytes=0,
+                host_capacity_bytes=1_000,
+                host_used_bytes=0,
+                host_free_bytes=1_000,
+            )
+
+            runtime._maybe_persist_predictive_candidate_snapshot(
+                result, payload, observation=observation
+            )
+            runtime._maybe_persist_predictive_candidate_snapshot(
+                result, payload, observation=replace(observation, ts_ms=12)
+            )
+            runtime.policy_snapshot_log.close()
+
+            snapshots = load_replay_trace(path)
+            self.assertEqual(len(snapshots), 1)
+            self.assertEqual(
+                snapshots[0].policy_input.snapshot_id,
+                policy_input.snapshot_id,
+            )
+            self.assertEqual(
+                runtime._joint_predictive_counts[
+                    "candidate_snapshot_persisted"
+                ],
+                1,
+            )
+            self.assertEqual(
+                runtime._joint_predictive_counts[
+                    "candidate_snapshot_deduplicated"
+                ],
+                1,
+            )
 
     def test_joint_shadow_safe_point_validates_without_applying_plan(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2241,6 +2651,82 @@ class SGLangBackendTest(unittest.TestCase):
             runtime._restore_authority_mode, RestoreAuthorityMode.NORMAL_JOINT
         )
 
+    def test_restore_authority_prioritizes_visible_owner(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime._restore_authority_request_id = "owner"
+        runtime._active_restore_lease = lambda: SimpleNamespace(
+            request_id="owner"
+        )
+        entries = {
+            "owner": SimpleNamespace(state=AdmissionSideState.VISIBLE_PENDING),
+            "dependency": SimpleNamespace(
+                state=AdmissionSideState.VISIBLE_PENDING
+            ),
+        }
+
+        target, reason = runtime._restore_authority_admission_target(
+            entries, ("dependency",)
+        )
+
+        self.assertEqual(target, "owner")
+        self.assertEqual(reason, "restore_owner")
+
+    def test_restore_authority_lease_dependency_precedes_visible_owner(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime._restore_authority_request_id = "owner"
+        runtime._active_restore_lease = lambda: SimpleNamespace(
+            request_id="dependency"
+        )
+        entries = {
+            "owner": SimpleNamespace(state=AdmissionSideState.VISIBLE_PENDING),
+            "dependency": SimpleNamespace(
+                state=AdmissionSideState.VISIBLE_PENDING
+            ),
+        }
+
+        target, reason = runtime._restore_authority_admission_target(
+            entries, ("dependency",)
+        )
+
+        self.assertEqual(target, "dependency")
+        self.assertEqual(reason, "restore_lease_dependency")
+
+    def test_restore_authority_inherits_ready_lease_dependency(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime._restore_authority_request_id = "owner"
+        runtime._active_restore_lease = lambda: SimpleNamespace(
+            request_id="dependency"
+        )
+        entries = {
+            "owner": SimpleNamespace(state=AdmissionSideState.WAIT_RESTORE),
+            "dependency": SimpleNamespace(
+                state=AdmissionSideState.VISIBLE_PENDING
+            ),
+        }
+
+        target, reason = runtime._restore_authority_admission_target(
+            entries, ("dependency",)
+        )
+
+        self.assertEqual(target, "dependency")
+        self.assertEqual(reason, "restore_lease_dependency")
+
+    def test_restore_authority_does_not_bypass_to_unrelated_ready_debt(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime._restore_authority_request_id = "owner"
+        runtime._active_restore_lease = lambda: None
+        entries = {
+            "owner": SimpleNamespace(state=AdmissionSideState.WAIT_RESTORE),
+            "other": SimpleNamespace(state=AdmissionSideState.VISIBLE_PENDING),
+        }
+
+        target, reason = runtime._restore_authority_admission_target(
+            entries, ("other",)
+        )
+
+        self.assertIsNone(target)
+        self.assertEqual(reason, "restore_owner_not_ready")
+
     def test_late_runtime_event_is_committed_at_workflow_watermark(self):
         runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
         runtime.config = BeliefKVConfig(runtime_event_max_lateness_ms=100.0)
@@ -2842,6 +3328,11 @@ class SGLangBackendTest(unittest.TestCase):
         self.assertTrue(child.evicted)
         self.assertEqual(telemetry.actual_bytes, 800)
         self.assertEqual(telemetry.status, CommandStatus.COMPLETED)
+        self.assertEqual(telemetry.extent_count, 2)
+        self.assertEqual(telemetry.extent_bytes_min, 400)
+        self.assertEqual(telemetry.extent_bytes_p50, 400)
+        self.assertEqual(telemetry.extent_bytes_max, 400)
+        self.assertEqual(telemetry.small_extent_ratio, 1.0)
 
     def test_atomic_drop_bundle_commits_deep_first_and_keeps_host_copies(self):
         tree = _TreeCache()
@@ -3811,6 +4302,475 @@ class SGLangBackendTest(unittest.TestCase):
             set(runtime.controller.fairness.accounts), {"wf-a", "wf-b"}
         )
 
+    def test_empty_predictive_overlay_skips_safe_point_budget_accounting(self):
+        config = BeliefKVConfig(
+            hbm_capacity_bytes=1_000,
+            reserve_hbm_bytes=0,
+            joint_policy_enabled=True,
+            predictor_model_path="/tmp/frontier.json",
+            gpu_service_model_path="/tmp/service.json",
+            predictive_risk_shadow_enabled=True,
+            predictive_joint_overlay_enabled=True,
+        )
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.controller = BeliefKVController(
+            BeliefKVConfig(
+                hbm_capacity_bytes=1_000,
+                reserve_hbm_bytes=0,
+                predictor_enabled=False,
+            )
+        )
+        runtime._policy_runtime_runnable = lambda _now_ms: ()
+        runtime._current_online_joint_decision = None
+        runtime._current_joint_plan_epoch = None
+        runtime._online_joint_epoch_sequence = 0
+        runtime._online_joint_counts = Counter()
+        runtime._joint_predictive_counts = Counter()
+        runtime._joint_shadow_timing_samples = {}
+        runtime._latest_predictive_intent = None
+
+        decision = runtime._safe_point_seed_decision(now_ms=10.0)
+
+        self.assertIsNotNone(decision.view)
+        self.assertNotIn(
+            "predictive_safe_point_commit_ms",
+            runtime._joint_shadow_timing_samples,
+        )
+        self.assertFalse(runtime._joint_predictive_counts)
+
+    def test_predictive_prepare_is_rematerialized_into_joint_epoch(self):
+        controller_config = BeliefKVConfig(
+            hbm_capacity_bytes=2_000,
+            host_capacity_bytes=4_000,
+            reserve_hbm_bytes=0,
+            predictor_enabled=False,
+        )
+        controller = BeliefKVController(controller_config)
+        controller.process_runtime_events(
+            (
+                RuntimeEvent(
+                    "wf-start-predictive",
+                    1.0,
+                    RuntimeEventKind.WORKFLOW_START,
+                    "wf-predictive",
+                ),
+                RuntimeEvent(
+                    "inv-create-predictive",
+                    2.0,
+                    RuntimeEventKind.INVOCATION_CREATE,
+                    "wf-predictive",
+                    invocation_id="inv-predictive",
+                    context_id="ctx-predictive",
+                    context_epoch=0,
+                ),
+                RuntimeEvent(
+                    "tool-start-predictive",
+                    3.0,
+                    RuntimeEventKind.TOOL_START,
+                    "wf-predictive",
+                    invocation_id="inv-predictive",
+                    context_id="ctx-predictive",
+                    context_epoch=0,
+                    attributes={"tool_family": "shell"},
+                ),
+            )
+        )
+        small_handle = PageHandle(901, 0)
+        matching_handle = PageHandle(903, 0)
+        controller.page_index.register_page(small_handle, size_bytes=100)
+        controller.page_index.register_page(matching_handle, size_bytes=300)
+        controller.page_index.bind_pages(
+            "ctx-predictive",
+            0,
+            (small_handle, matching_handle),
+        )
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = BeliefKVConfig(
+            hbm_capacity_bytes=2_000,
+            host_capacity_bytes=4_000,
+            reserve_hbm_bytes=0,
+            predictor_model_path="/tmp/frontier.json",
+            gpu_service_model_path="/tmp/service.json",
+            joint_policy_enabled=True,
+            predictive_risk_shadow_enabled=True,
+            predictive_joint_overlay_enabled=True,
+            predictive_prepare_host_canary_limit=1,
+        )
+        runtime.controller = controller
+        controller.service_curve = SimpleNamespace(
+            estimate=lambda *_args, **_kwargs: SimpleNamespace(
+                estimated_completion_p90_ms=10.0,
+                estimated_unhidden_stall_p90_ms=1.0,
+                shape_supported=True,
+                source="unified_test_curve",
+            ),
+            snapshot=lambda: {},
+        )
+        runtime.audit = _AuditRecorder()
+        runtime._joint_predictive_counts = Counter()
+        runtime._online_joint_counts = Counter()
+        runtime._pending_online_joint_residency = None
+        runtime._online_joint_residency_sequence = 0
+        runtime._online_joint_residency_history = deque()
+        runtime._online_joint_last_residency_action = {}
+        runtime._current_semantic_residency_commit = None
+        runtime._current_predictive_residency_commit = None
+        runtime._restore_service_grace_by_request = {}
+        runtime._last_frontier_model_version = "frontier-v1"
+        runtime._latest_predictive_intent = PredictiveIntent(
+            intent_id="intent-prepare",
+            source_joint_plan_id="source-plan",
+            source_snapshot_id="snapshot",
+            package_id="package-prepare",
+            model_version="frontier-v1",
+            action=PredictiveActionKind.PREPARE_HOST,
+            invocation_id="inv-predictive",
+            expected_invocation_state="wait_tool",
+            context_id="ctx-predictive",
+            context_epoch=0,
+            generated_ts_ms=100.0,
+            remaining_window_low_ms=1_000.0,
+            transfer_p95_ms=10.0,
+            target_bytes_hint=300,
+            min_reclaimable_bytes=300,
+            max_cross_context_bytes=0,
+            max_copy_bytes=300,
+            causal_certificate=_predictive_causal_certificate(
+                controller, "frontier-v1"
+            ),
+            required_prediction_heads=("remaining_window",),
+            prediction_head_support=(("remaining_window", "exact"),),
+            calibration_coverage=0.95,
+            future_hbm_feasibility_probability=0.0,
+            expected_benefit_ms=5.0,
+            shape_fingerprint="shape-v1",
+            predicted_extent_count=1,
+            maximum_transfer_ms=12.0,
+            maximum_stall_ms=10.0,
+            morphology_slack_ms=100.0,
+        )
+        decision = compile_bounded_seed_epoch(
+            ordered_request_ids=("request",),
+            visible_request_ids=("request",),
+            epoch_sequence=1,
+        )
+        plan = SimpleNamespace(
+            plan_id=decision.view.plan_id,
+            residency=(),
+            semantic_residency=(),
+        )
+
+        committed = runtime._physical_commit_predictive_intent(
+            plan,
+            decision,
+            now_ms=110.0,
+        )
+
+        self.assertIsNotNone(runtime._current_predictive_residency_commit)
+        self.assertEqual(
+            committed.epoch.action_slices[-1].kind,
+            "predictive_residency",
+        )
+        group = committed.epoch.action_groups[-1]
+        self.assertTrue(group.committed)
+        self.assertEqual(group.resource_certificate.required_hbm_bytes, 0)
+        self.assertEqual(group.resource_certificate.required_host_bytes, 300)
+        self.assertTrue(group.resource_certificate.finite_future_risk_bound)
+        self.assertTrue(
+            runtime._queue_predictive_joint_residency(
+                plan.plan_id,
+                now_ms=111.0,
+            )
+        )
+        queued = controller.command_queue.pop()
+        self.assertIsNotNone(queued)
+        self.assertEqual(queued.kind, CommandKind.SHADOW_CONTEXT)
+        self.assertEqual(
+            queued.metadata["predictive_intent_id"], "intent-prepare"
+        )
+        self.assertEqual(
+            queued.metadata["predictive_transfer_model"],
+            "extent_count_aware",
+        )
+        predictive_queued = [
+            fields
+            for event, _, fields in runtime.audit.events
+            if event == "online_joint_residency_queued"
+            and fields.get("predictive_intent_id") == "intent-prepare"
+        ]
+        self.assertEqual(predictive_queued[-1]["predicted_extent_count"], 1)
+        self.assertEqual(predictive_queued[-1]["live_extent_count"], 1)
+        self.assertTrue(predictive_queued[-1]["live_shape_fingerprint"])
+        self.assertEqual(
+            predictive_queued[-1]["transfer_model"], "extent_count_aware"
+        )
+        self.assertEqual(
+            runtime._pending_online_joint_residency.plan_id,
+            decision.view.plan_id,
+        )
+        runtime._advance_online_joint_residency(
+            (
+                CommandAck(
+                    queued.command_id,
+                    CommandStatus.COMPLETED,
+                    112.0,
+                    actual_bytes=300,
+                ),
+            ),
+            now_ms=112.0,
+        )
+        self.assertIsNone(runtime._pending_online_joint_residency)
+        self.assertEqual(
+            runtime._online_joint_residency_history[-1].stage,
+            "completed",
+        )
+        predictive_terminal = [
+            fields
+            for event, _, fields in runtime.audit.events
+            if event == "online_joint_residency_terminal"
+        ]
+        self.assertEqual(predictive_terminal[-1]["actual_bytes"], 300)
+
+    def test_predictive_prefetch_canary_rejection_preserves_observed_epoch(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = BeliefKVConfig(
+            hbm_capacity_bytes=2_000,
+            host_capacity_bytes=4_000,
+            reserve_hbm_bytes=0,
+            predictor_model_path="/tmp/frontier.json",
+            gpu_service_model_path="/tmp/service.json",
+            joint_policy_enabled=True,
+            predictive_risk_shadow_enabled=True,
+            predictive_joint_overlay_enabled=True,
+            predictive_prefetch_canary_enabled=True,
+        )
+        controller = BeliefKVController(
+            BeliefKVConfig(
+                hbm_capacity_bytes=2_000,
+                host_capacity_bytes=4_000,
+                reserve_hbm_bytes=0,
+                predictor_enabled=False,
+            )
+        )
+        controller.process_runtime_events(
+            (
+                RuntimeEvent("wf-prefetch", 1.0, RuntimeEventKind.WORKFLOW_START, "wf"),
+                RuntimeEvent(
+                    "inv-prefetch",
+                    2.0,
+                    RuntimeEventKind.INVOCATION_CREATE,
+                    "wf",
+                    invocation_id="inv",
+                    context_id="ctx",
+                    context_epoch=0,
+                ),
+                RuntimeEvent(
+                    "tool-prefetch",
+                    3.0,
+                    RuntimeEventKind.TOOL_START,
+                    "wf",
+                    invocation_id="inv",
+                    context_id="ctx",
+                    context_epoch=0,
+                ),
+            )
+        )
+        handle = PageHandle(902, 0)
+        controller.page_index.register_page(
+            handle,
+            size_bytes=200,
+            residency=PhysicalResidency.CPU_ONLY,
+        )
+        controller.page_index.bind_pages("ctx", 0, (handle,))
+        runtime.controller = controller
+        runtime.audit = _AuditRecorder()
+        runtime._joint_predictive_counts = Counter()
+        runtime._online_joint_counts = Counter()
+        runtime._pending_online_joint_residency = None
+        runtime._current_semantic_residency_commit = None
+        runtime._current_predictive_residency_commit = None
+        runtime._restore_service_grace_by_request = {}
+        runtime._last_frontier_model_version = "frontier-v1"
+        runtime._latest_predictive_intent = PredictiveIntent(
+            intent_id="intent-prefetch",
+            source_joint_plan_id="source-plan",
+            source_snapshot_id="snapshot",
+            package_id="package-prefetch",
+            model_version="frontier-v1",
+            action=PredictiveActionKind.PREFETCH_GPU,
+            invocation_id="inv",
+            expected_invocation_state="wait_tool",
+            context_id="ctx",
+            context_epoch=0,
+            generated_ts_ms=100.0,
+            remaining_window_low_ms=100.0,
+            transfer_p95_ms=20.0,
+            target_bytes_hint=200,
+            min_reclaimable_bytes=0,
+            max_cross_context_bytes=0,
+            max_copy_bytes=200,
+            causal_certificate=_predictive_causal_certificate(
+                controller, "frontier-v1"
+            ),
+            required_prediction_heads=("future_kv_growth", "reentry_window"),
+            prediction_head_support=(
+                ("future_kv_growth", "exact"),
+                ("reentry_window", "exact"),
+            ),
+            calibration_coverage=0.95,
+            future_hbm_feasibility_probability=0.99,
+            expected_benefit_ms=5.0,
+            shape_fingerprint="prefetch-not-shape-certified",
+            predicted_extent_count=0,
+            maximum_transfer_ms=24.0,
+            maximum_stall_ms=0.0,
+            morphology_slack_ms=0.0,
+        )
+        decision = compile_bounded_seed_epoch(
+            ordered_request_ids=("request",),
+            visible_request_ids=("request",),
+            epoch_sequence=1,
+        )
+        plan = SimpleNamespace(
+            plan_id=decision.view.plan_id,
+            residency=(),
+            semantic_residency=(),
+        )
+
+        unchanged = runtime._physical_commit_predictive_intent(
+            plan,
+            decision,
+            now_ms=110.0,
+        )
+
+        self.assertEqual(unchanged, decision)
+        self.assertIsNone(runtime._current_predictive_residency_commit)
+        rejected = [
+            fields
+            for event, _, fields in runtime.audit.events
+            if event == "predictive_semantic_intent_rejected"
+        ]
+        self.assertIn("prefetch_canary_hbm_cap", rejected[-1]["reasons"])
+
+    def test_predictive_causal_change_before_safe_point_preserves_observed_epoch(self):
+        config = BeliefKVConfig(
+            hbm_capacity_bytes=2_000,
+            host_capacity_bytes=4_000,
+            reserve_hbm_bytes=0,
+            predictor_model_path="/tmp/frontier.json",
+            gpu_service_model_path="/tmp/service.json",
+            joint_policy_enabled=True,
+            predictive_risk_shadow_enabled=True,
+            predictive_joint_overlay_enabled=True,
+        )
+        controller = BeliefKVController(
+            BeliefKVConfig(
+                hbm_capacity_bytes=2_000,
+                host_capacity_bytes=4_000,
+                reserve_hbm_bytes=0,
+                predictor_enabled=False,
+            )
+        )
+        controller.process_runtime_events(
+            (
+                RuntimeEvent("wf-causal", 1.0, RuntimeEventKind.WORKFLOW_START, "wf"),
+                RuntimeEvent(
+                    "inv-causal",
+                    2.0,
+                    RuntimeEventKind.INVOCATION_CREATE,
+                    "wf",
+                    invocation_id="inv",
+                    context_id="ctx",
+                    context_epoch=0,
+                ),
+                RuntimeEvent(
+                    "tool-causal",
+                    3.0,
+                    RuntimeEventKind.TOOL_START,
+                    "wf",
+                    invocation_id="inv",
+                    context_id="ctx",
+                    context_epoch=0,
+                ),
+            )
+        )
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = config
+        runtime.controller = controller
+        runtime.audit = _AuditRecorder()
+        runtime._joint_predictive_counts = Counter()
+        runtime._pending_online_joint_residency = None
+        runtime._current_semantic_residency_commit = None
+        runtime._current_predictive_residency_commit = None
+        runtime._restore_service_grace_by_request = {}
+        runtime._last_frontier_model_version = "frontier-v1"
+        runtime._latest_predictive_intent = PredictiveIntent(
+            intent_id="intent-causal",
+            source_joint_plan_id="source-plan",
+            source_snapshot_id="snapshot",
+            package_id="package-causal",
+            model_version="frontier-v1",
+            action=PredictiveActionKind.PREPARE_HOST,
+            invocation_id="inv",
+            expected_invocation_state="wait_tool",
+            context_id="ctx",
+            context_epoch=0,
+            generated_ts_ms=100.0,
+            remaining_window_low_ms=1_000.0,
+            transfer_p95_ms=10.0,
+            target_bytes_hint=100,
+            min_reclaimable_bytes=100,
+            max_cross_context_bytes=0,
+            max_copy_bytes=100,
+            causal_certificate=_predictive_causal_certificate(
+                controller, "frontier-v1"
+            ),
+            required_prediction_heads=("remaining_window",),
+            prediction_head_support=(("remaining_window", "exact"),),
+            calibration_coverage=0.95,
+            future_hbm_feasibility_probability=1.0,
+            expected_benefit_ms=5.0,
+            shape_fingerprint="shape-v1",
+            predicted_extent_count=1,
+            maximum_transfer_ms=12.0,
+            maximum_stall_ms=10.0,
+            morphology_slack_ms=100.0,
+        )
+        # The prediction was published, then an RCCG event changed its read set
+        # before the next scheduler safe point.
+        controller.graph.invocations["inv"].updated_ts_ms += 1.0
+        decision = compile_bounded_seed_epoch(
+            ordered_request_ids=("request",),
+            visible_request_ids=("request",),
+            epoch_sequence=1,
+        )
+        plan = SimpleNamespace(
+            plan_id=decision.view.plan_id,
+            residency=(),
+            semantic_residency=(),
+        )
+
+        unchanged = runtime._physical_commit_predictive_intent(
+            plan,
+            decision,
+            now_ms=110.0,
+        )
+
+        self.assertEqual(unchanged, decision)
+        self.assertIsNone(runtime._current_predictive_residency_commit)
+        rejected = [
+            fields
+            for event, _, fields in runtime.audit.events
+            if event == "predictive_semantic_intent_rejected"
+        ]
+        self.assertTrue(
+            any(
+                reason.startswith("causal:invocation_revision:inv")
+                for reason in rejected[-1]["reasons"]
+            )
+        )
+
     def test_observed_admission_holds_new_tickets_at_active_kv_watermark(self):
         config = BeliefKVConfig(
             hbm_capacity_bytes=1000,
@@ -4314,6 +5274,48 @@ class SGLangBackendTest(unittest.TestCase):
         )
         self.assertNotIn("restored", runtime._restore_service_grace_by_request)
 
+    def test_short_completed_restore_closes_service_grace_transaction(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = BeliefKVConfig(restore_service_grace_decode_tokens=32)
+        runtime.audit = _AuditRecorder()
+        runtime._restore_obligation_counts = Counter()
+        runtime._restore_service_grace_by_request = {}
+        obligation = runtime._restore_obligation_index().create(
+            request_id="short-response",
+            workflow_id="wf",
+            invocation_id="inv",
+            context_id="ctx",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction-1",
+            source_joint_plan_id="joint-1",
+            created_ts_ms=0.0,
+            path_extent_ids=(),
+        )
+        runtime._start_restore_service_grace(obligation, now_ms=1.0)
+        obligation.finish(
+            RestoreObligationState.SATISFIED,
+            now_ms=2.0,
+            reason="gpu_service_resumed",
+        )
+
+        runtime._cancel_restore_service_grace(
+            obligation.request_id,
+            now_ms=3.0,
+            reason="request_finished",
+        )
+
+        transaction = runtime._ensure_restore_transaction(obligation)
+        self.assertEqual(transaction.stage, RestoreTransactionStage.SATISFIED)
+        self.assertNotIn(
+            obligation.request_id, runtime._restore_service_grace_by_request
+        )
+        terminal = [
+            fields
+            for event, _, fields in runtime.audit.events
+            if event == "restore_service_grace_terminal"
+        ]
+        self.assertEqual(terminal[-1]["restore_transaction_stage"], "satisfied")
+
     def test_restore_obligation_funds_h2d_then_releases_ticket(self):
         config = BeliefKVConfig(
             hbm_capacity_bytes=2000,
@@ -4680,6 +5682,96 @@ class SGLangBackendTest(unittest.TestCase):
                 for event, _, _ in runtime.audit.events
             )
         )
+
+    def test_failed_restore_lease_grant_waits_for_active_lease(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = BeliefKVConfig(
+            kv_bytes_per_token=10,
+            restore_lease_enabled=True,
+            restore_lease_max_active=1,
+        )
+        obligations = runtime._restore_obligation_index()
+        active = obligations.create(
+            request_id="active",
+            workflow_id="wf-active",
+            invocation_id="inv-active",
+            context_id="ctx-active",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction-active",
+            source_joint_plan_id="joint-active",
+            created_ts_ms=1.0,
+            path_extent_ids=(),
+        )
+        blocked = obligations.create(
+            request_id="blocked",
+            workflow_id="wf-blocked",
+            invocation_id="inv-blocked",
+            context_id="ctx-blocked",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction-blocked",
+            source_joint_plan_id="joint-blocked",
+            created_ts_ms=2.0,
+            path_extent_ids=("page:1:0",),
+        )
+        runtime._restore_lease_index().grant(
+            obligation=active,
+            granted_ts_ms=3.0,
+            reserved_tokens=1,
+            reserved_bytes=10,
+            h2d_bytes=10,
+        )
+        runtime._try_queue_restore_lease_funding = lambda *_args, **_kwargs: (
+            (_ for _ in ()).throw(AssertionError("must not reclaim for a busy lease"))
+        )
+
+        queued, blockers, wake_conditions = (
+            runtime._recover_failed_restore_lease_grant(
+                blocked,
+                now_ms=4.0,
+                attempt_stamp=(1,),
+                h2d_bytes=20,
+            )
+        )
+
+        self.assertFalse(queued)
+        self.assertEqual(blockers, ("restore_lease_busy",))
+        self.assertEqual(wake_conditions, ("restore_lease_terminal",))
+
+    def test_failed_h2d_restore_lease_grant_reclaims_debt_owned_funding(self):
+        runtime = EmbeddedSGLangRuntime.__new__(EmbeddedSGLangRuntime)
+        runtime.config = BeliefKVConfig(kv_bytes_per_token=10)
+        obligation = runtime._restore_obligation_index().create(
+            request_id="target",
+            workflow_id="wf",
+            invocation_id="inv",
+            context_id="ctx",
+            context_epoch=0,
+            source_retraction_transaction_id="retraction",
+            source_joint_plan_id="joint",
+            created_ts_ms=1.0,
+            path_extent_ids=("page:1:0",),
+        )
+        calls = []
+        runtime._try_queue_restore_lease_funding = (
+            lambda candidate, **kwargs: (
+                calls.append((candidate.request_id, kwargs["h2d_bytes"])) or True,
+                (),
+            )
+        )
+
+        queued, blockers, wake_conditions = (
+            runtime._recover_failed_restore_lease_grant(
+                obligation,
+                now_ms=2.0,
+                attempt_stamp=(1,),
+                h2d_bytes=200,
+            )
+        )
+
+        self.assertTrue(queued)
+        self.assertEqual(blockers, ())
+        self.assertEqual(calls, [("target", 200)])
+        self.assertIn("restore_funding_terminal", wake_conditions)
 
     def test_restore_prefix_pin_waits_for_host_only_h2d(self):
         config = BeliefKVConfig(kv_bytes_per_token=10)

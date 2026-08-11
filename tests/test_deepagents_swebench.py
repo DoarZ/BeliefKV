@@ -38,6 +38,7 @@ from beliefkv.experiments.deepagents_swebench import (
     DockerWorkspaceBackend,
     DelegationPlan,
     JsonlAudit,
+    ParallelAnalysisPlan,
     PartialAgentRunError,
     SANDBOX_PATH_CONTRACT,
     SYMPY_SANDBOX_PREFLIGHT,
@@ -58,6 +59,7 @@ from beliefkv.experiments.deepagents_swebench import (
     _autonomous_subagents,
     _runtime_verify_changed_tests,
     _planned_child_loop_guard_policy,
+    _parallel_analysis_tasks,
     _workspace_patch_tool,
 )
 from beliefkv.runtime.langchain_tool_safety import (
@@ -487,6 +489,57 @@ def test_docker_backend_preflights_test_environment_before_use(
     assert preflight["expected_python"] == "/opt/miniconda3/envs/testbed/bin/python"
 
 
+def test_workload_cli_does_not_apply_sympy_preflight_globally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts.run_deepagents_swebench import parse_args
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["run_deepagents_swebench.py", "--mode", "autonomous"],
+    )
+
+    args = parse_args()
+
+    assert args.sandbox_preflight_command is None
+
+
+def test_docker_backend_recovers_when_timed_out_run_is_already_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    audit = JsonlAudit(tmp_path / "audit.jsonl")
+    backend = DockerWorkspaceBackend(tmp_path, image="fixture:latest", audit=audit)
+    invocations: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        del kwargs
+        invocations.append(argv)
+        if argv[:2] == ["docker", "run"]:
+            raise subprocess.TimeoutExpired(argv, 120.0)
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="true\n", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    backend.start()
+    backend.close()
+    audit.close()
+
+    assert [item[:2] for item in invocations] == [
+        ["docker", "run"],
+        ["docker", "inspect"],
+        ["docker", "exec"],
+        ["docker", "rm"],
+    ]
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    start = next(item for item in records if item["event"] == "sandbox_start")
+    assert start["status"] == "timeout_recovered_running"
+    assert start["attempt"] == 1
+
+
 def test_docker_backend_uses_workspace_paths_for_file_and_shell_tools(
     tmp_path: Path,
 ) -> None:
@@ -753,6 +806,7 @@ def test_experiment_config_uses_hard_fuse_as_langgraph_limit(tmp_path: Path) -> 
     )
     assert config.recursion_limit == 512
     assert config.sampling_seed is None
+    assert config.workflow_arrival_interval_ms == 0.0
     assert config.loop_guard.enabled
     assert config.completion_gate_enabled is True
     assert config.completion_repair_attempts == 2
@@ -776,6 +830,135 @@ def test_experiment_config_rejects_negative_sampling_seed(tmp_path: Path) -> Non
             docker_image="fixture:latest",
             sampling_seed=-1,
         )
+
+
+def test_experiment_config_rejects_negative_arrival_interval(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="arrival interval"):
+        DeepAgentsExperimentConfig(
+            mode="planned",
+            base_url="http://localhost:18000/v1",
+            model="model",
+            output_dir=tmp_path,
+            workload_manifest=tmp_path / "workloads.json",
+            docker_image="fixture:latest",
+            workflow_arrival_interval_ms=-1,
+        )
+
+
+def test_parallel_analysis_profile_builds_three_read_only_orthogonal_roles(
+    tmp_path: Path,
+) -> None:
+    config = DeepAgentsExperimentConfig(
+        mode="autonomous",
+        base_url="http://localhost:18000/v1",
+        model="model",
+        output_dir=tmp_path / "output",
+        workload_manifest=tmp_path / "workloads.json",
+        docker_image="fixture:latest",
+        subagent_fanout_profile="parallel_analysis_2to3",
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    audit = JsonlAudit(tmp_path / "audit.jsonl")
+    backend = DockerWorkspaceBackend(
+        workspace,
+        image="fixture:latest",
+        audit=audit,
+        support_dir=None,
+    )
+    model = FakeMessagesListChatModel(responses=[AIMessage(content="done")])
+    try:
+        specs = _autonomous_subagents(
+            config,
+            SweBenchWorkload(
+                instance_id="pydata__xarray-1",
+                repo="pydata/xarray",
+                base_commit="deadbeef",
+                problem_statement="Fix an invariant.",
+                difficulty="unknown",
+            ),
+            backend,
+            SimpleNamespace(record_call_censor=lambda _record: None),
+            model,
+            model,
+        )
+    finally:
+        audit.close()
+    assert [item["name"] for item in specs] == [
+        "repository-explorer",
+        "test-analyst",
+        "compatibility-analyst",
+    ]
+    assert all(item["tools"] == [] for item in specs)
+    assert all(
+        "do not modify files" in item["system_prompt"].lower()
+        for item in specs
+    )
+
+
+def test_parallel_analysis_plan_always_materializes_two_orthogonal_children() -> None:
+    tasks = _parallel_analysis_tasks(
+        ParallelAnalysisPlan(
+            rationale="The code path and failure evidence are independent.",
+            repository_analysis="Trace index construction and its invariants.",
+            test_analysis="Reproduce the repr failure and identify regression tests.",
+        )
+    )
+
+    assert [item.role for item in tasks] == [
+        "repository-explorer",
+        "test-analyst",
+    ]
+
+
+def test_parallel_analysis_plan_materializes_optional_compatibility_child() -> None:
+    tasks = _parallel_analysis_tasks(
+        ParallelAnalysisPlan(
+            rationale="Serialization behavior is independent.",
+            repository_analysis="Trace the implementation.",
+            test_analysis="Reproduce the failure.",
+            compatibility_analysis="Check the serialization compatibility contract.",
+        )
+    )
+
+    assert [item.role for item in tasks] == [
+        "repository-explorer",
+        "test-analyst",
+        "compatibility-analyst",
+    ]
+
+
+def test_parallel_analysis_plan_rejects_empty_mandatory_task() -> None:
+    with pytest.raises(ValueError, match="two non-empty"):
+        _parallel_analysis_tasks(
+            ParallelAnalysisPlan(
+                rationale="invalid",
+                repository_analysis=" ",
+                test_analysis="Reproduce the failure.",
+            )
+        )
+
+
+def test_trace_summary_reports_parallel_fanout_shape(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    records = [
+        {"kind": "workflow_start", "ts_ms": 0},
+        {"kind": "invocation_create", "invocation_id": "a", "parent_invocation_id": "p", "ts_ms": 10},
+        {"kind": "spawn", "target_invocation_id": "a", "ts_ms": 10},
+        {"kind": "invocation_create", "invocation_id": "b", "parent_invocation_id": "p", "ts_ms": 10},
+        {"kind": "spawn", "target_invocation_id": "b", "ts_ms": 10},
+        {"kind": "join_create", "ts_ms": 10, "attributes": {"mode": "all"}},
+        {"kind": "return", "invocation_id": "a", "ts_ms": 30},
+        {"kind": "return", "invocation_id": "b", "ts_ms": 50},
+        {"kind": "join_satisfied", "ts_ms": 50},
+        {"kind": "workflow_end", "ts_ms": 60},
+    ]
+    path.write_text("".join(json.dumps(item) + "\n" for item in records))
+    summary = _trace_summary(path)
+    assert summary["fanout_by_parent"] == {"p": 2}
+    assert summary["peak_concurrent_children"] == 2
+    assert summary["join_type_counts"] == {"all": 1}
+    assert summary["child_return_span_ms"] == 20
 
 
 def test_repository_contract_does_not_duplicate_django_checkout_root() -> None:
@@ -1554,6 +1737,70 @@ def test_loop_guard_observes_semantic_patterns_without_intervening() -> None:
     assert update["guard_observed_patterns"] == ("repeated_tool_call",)
     assert "guard_phase" not in update
     assert "guard_forcing_completion" not in update
+
+
+def test_loop_guard_enforces_repeated_suppressed_failure_circuit() -> None:
+    args = {"pattern": 401, "path": "/workspace"}
+    messages: list[BaseMessage] = [
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "grep", "args": args, "id": "grep-physical"}],
+        ),
+        ToolMessage(
+            content="Input should be a valid string",
+            tool_call_id="grep-physical",
+            name="grep",
+            status="error",
+            additional_kwargs={
+                "beliefkv_error_class": "validation_error",
+                "beliefkv_physical_execution": True,
+                "beliefkv_suppressed_repeat_intent": False,
+                "beliefkv_failure_episode_id": "failure-1",
+            },
+        ),
+    ]
+    for index in range(3):
+        call_id = f"grep-suppressed-{index}"
+        messages.extend(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[{"name": "grep", "args": args, "id": call_id}],
+                ),
+                ToolMessage(
+                    content="duplicate_suppressed",
+                    tool_call_id=call_id,
+                    name="grep",
+                    status="error",
+                    additional_kwargs={
+                        "beliefkv_error_class": "duplicate_suppressed",
+                        "beliefkv_physical_execution": False,
+                        "beliefkv_suppressed_repeat_intent": True,
+                        "beliefkv_failure_episode_id": "failure-1",
+                    },
+                ),
+            ]
+        )
+    guard = AgentLoopGuardMiddleware(
+        policy=LoopGuardPolicy(),
+        completion_schema=ChildCompletion,
+        completion_instruction="Return ChildCompletion.",
+        audit=None,
+        scope="suppressed-failure-circuit-test",
+    )
+
+    suspect = guard.before_model({"messages": messages}, runtime=None)
+
+    assert suspect is not None
+    assert suspect["guard_phase"] == "SUSPECT"
+    assert suspect["guard_reason"] == "repeated_suppressed_tool_intent"
+    assert suspect["guard_forcing_completion"] is False
+    recovery = guard.before_model(
+        {"messages": messages, **suspect}, runtime=None
+    )
+    assert recovery is not None
+    assert recovery["guard_phase"] == "RECOVERY"
+    assert recovery["guard_forcing_completion"] is True
 
 
 def test_loop_guard_clears_legacy_semantic_finalization_state() -> None:

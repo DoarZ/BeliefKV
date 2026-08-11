@@ -212,108 +212,149 @@ class PhysicalBundleBuilder:
         previews: list[PhysicalBundlePreview] = []
         seen_closures: set[tuple[PageHandle, ...]] = set()
         for root in sorted(roots, key=lambda page: (-page.radix_depth, page.handle)):
-            closure, closure_blockers = self._gpu_descendant_closure(root)
-            handles = tuple(sorted(closure))
-            if not handles or handles in seen_closures:
+            preview = self.preview_offload_root(
+                command_kind,
+                context_id,
+                context_epoch,
+                root.handle,
+                now_ms=now_ms,
+                allow_ready_owners=allow_ready_owners,
+                protected_context_id=protected_context_id,
+                bypass_owner_context_ids=bypass_owner_context_ids,
+                host_available_bytes=host_available_bytes,
+            )
+            if preview is None:
+                continue
+            handles = preview.bundle.handles
+            if handles in seen_closures:
                 continue
             seen_closures.add(handles)
-            blockers = list(closure_blockers)
-            actions: list[ResolvedPageAction] = []
-            blocked_handles: set[PageHandle] = {
-                item.page_handle
-                for item in blockers
-                if item.page_handle is not None
-            }
-            for page in sorted(
-                closure.values(),
-                key=lambda item: (-item.radix_depth, item.handle),
-            ):
-                if page.residency == PhysicalResidency.DUAL_CLEAN:
-                    if command_kind == CommandKind.OFFLOAD_CONTEXT:
-                        actions.append(
-                            ResolvedPageAction(
-                                page.handle,
-                                PhysicalPageAction.COMMIT_CPU,
-                                page.size_bytes,
-                            )
-                        )
-                elif page.residency == PhysicalResidency.GPU_ONLY:
+            previews.append(preview)
+        return previews
+
+    def preview_offload_root(
+        self,
+        command_kind: CommandKind,
+        context_id: str,
+        context_epoch: int,
+        root_handle: PageHandle,
+        *,
+        now_ms: float,
+        allow_ready_owners: bool = False,
+        protected_context_id: str | None = None,
+        bypass_owner_context_ids: frozenset[str] = frozenset(),
+        host_available_bytes: int | None = None,
+    ) -> PhysicalBundlePreview | None:
+        """Build one closure-complete D2H preview from an indexed root."""
+
+        if command_kind not in {
+            CommandKind.OFFLOAD_CONTEXT,
+            CommandKind.SHADOW_CONTEXT,
+        }:
+            return None
+        context = self.graph.contexts.get(context_id)
+        root = self.page_index.pages.get(root_handle)
+        if (
+            context is None
+            or context.epoch != context_epoch
+            or root is None
+            or not root.gpu_resident
+            or context_id not in root.owner_contexts
+        ):
+            return None
+        closure, closure_blockers = self._gpu_descendant_closure(root)
+        if not closure:
+            return None
+        blockers = list(closure_blockers)
+        actions: list[ResolvedPageAction] = []
+        blocked_handles: set[PageHandle] = {
+            item.page_handle
+            for item in blockers
+            if item.page_handle is not None
+        }
+        for page in sorted(
+            closure.values(),
+            key=lambda item: (-item.radix_depth, item.handle),
+        ):
+            if page.residency == PhysicalResidency.DUAL_CLEAN:
+                if command_kind == CommandKind.OFFLOAD_CONTEXT:
                     actions.append(
                         ResolvedPageAction(
                             page.handle,
-                            PhysicalPageAction.START_D2H,
+                            PhysicalPageAction.COMMIT_CPU,
                             page.size_bytes,
                         )
                     )
-                page_blockers = self._page_blockers(page)
-                page_blockers += self._owner_blockers(
-                    page,
-                    now_ms=now_ms,
-                    allow_ready_owners=allow_ready_owners,
-                    protected_context_id=protected_context_id,
-                    bypass_owner_context_ids=bypass_owner_context_ids,
+            elif page.residency == PhysicalResidency.GPU_ONLY:
+                actions.append(
+                    ResolvedPageAction(
+                        page.handle,
+                        PhysicalPageAction.START_D2H,
+                        page.size_bytes,
+                    )
                 )
-                blockers.extend(page_blockers)
-                if page_blockers:
-                    blocked_handles.add(page.handle)
-                    continue
-                ancestor = page.parent
-                while ancestor is not None:
-                    parent = self.page_index.pages.get(ancestor)
-                    if parent is None or parent.residency == PhysicalResidency.DEAD:
-                        blocker = TransferBlocker(
+            page_blockers = self._page_blockers(page)
+            page_blockers += self._owner_blockers(
+                page,
+                now_ms=now_ms,
+                allow_ready_owners=allow_ready_owners,
+                protected_context_id=protected_context_id,
+                bypass_owner_context_ids=bypass_owner_context_ids,
+            )
+            blockers.extend(page_blockers)
+            if page_blockers:
+                blocked_handles.add(page.handle)
+                continue
+            ancestor = page.parent
+            while ancestor is not None:
+                parent = self.page_index.pages.get(ancestor)
+                if parent is None or parent.residency == PhysicalResidency.DEAD:
+                    blockers.append(
+                        TransferBlocker(
                             TransferBlockerCode.ANCESTOR_CLOSURE,
                             page.handle,
                             page.size_bytes,
                             "D2H closure has a missing ancestor",
                         )
-                        blockers.append(blocker)
-                        blocked_handles.add(page.handle)
-                        break
-                    if not parent.gpu_resident:
-                        blocker = TransferBlocker(
+                    )
+                    blocked_handles.add(page.handle)
+                    break
+                if not parent.gpu_resident:
+                    blockers.append(
+                        TransferBlocker(
                             TransferBlockerCode.ANCESTOR_CLOSURE,
                             page.handle,
                             page.size_bytes,
                             "D2H target has a non-resident ancestor",
                         )
-                        blockers.append(blocker)
-                        blocked_handles.add(page.handle)
-                        break
-                    ancestor = parent.parent
-                if page.handle in blocked_handles:
-                    continue
-            copy_bytes = sum(
-                item.size_bytes
-                for item in actions
-                if item.action == PhysicalPageAction.START_D2H
-            )
-            if (
-                host_available_bytes is not None
-                and copy_bytes > host_available_bytes
-            ):
-                blockers.append(
-                    TransferBlocker(
-                        TransferBlockerCode.HOST_CAPACITY,
-                        root.handle,
-                        copy_bytes,
-                        "D2H bundle exceeds current host availability",
                     )
-                )
-            blockers_tuple = self._deduplicate_blockers(blockers)
-            previews.append(
-                self._preview(
-                    command_kind,
-                    context_id,
-                    context_epoch,
-                    closure,
-                    tuple(actions),
-                    blockers_tuple,
-                    blocked_handles,
-                    now_ms=now_ms,
+                    blocked_handles.add(page.handle)
+                    break
+                ancestor = parent.parent
+        copy_bytes = sum(
+            item.size_bytes
+            for item in actions
+            if item.action == PhysicalPageAction.START_D2H
+        )
+        if host_available_bytes is not None and copy_bytes > host_available_bytes:
+            blockers.append(
+                TransferBlocker(
+                    TransferBlockerCode.HOST_CAPACITY,
+                    root.handle,
+                    copy_bytes,
+                    "D2H bundle exceeds current host availability",
                 )
             )
-        return previews
+        return self._preview(
+            command_kind,
+            context_id,
+            context_epoch,
+            closure,
+            tuple(actions),
+            self._deduplicate_blockers(blockers),
+            blocked_handles,
+            now_ms=now_ms,
+        )
 
     def _drop_previews(
         self,

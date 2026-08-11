@@ -72,6 +72,53 @@ class ControllerHarness:
 
 
 class ControllerTest(unittest.TestCase):
+    def test_predictive_overlay_requires_explicit_online_dependencies(self):
+        with self.assertRaisesRegex(
+            ValueError, "requires online observed JointPlan"
+        ):
+            BeliefKVConfig(predictive_joint_overlay_enabled=True)
+        with self.assertRaisesRegex(ValueError, "requires predictive JointPlan"):
+            BeliefKVConfig(predictive_prefetch_canary_enabled=True)
+
+        config = BeliefKVConfig(
+            joint_policy_enabled=True,
+            predictor_model_path="frontier.json",
+            gpu_service_model_path="service.json",
+            predictive_risk_shadow_enabled=True,
+            predictive_joint_overlay_enabled=True,
+            predictive_prefetch_canary_enabled=True,
+        )
+        self.assertTrue(config.predictive_prepare_host_enabled)
+        self.assertEqual(config.predictive_prefetch_canary_max_inflight, 1)
+        self.assertEqual(config.predictive_prefetch_canary_max_hbm_ratio, 0.05)
+
+        unified = BeliefKVConfig(
+            joint_policy_enabled=True,
+            predictor_model_path="frontier.json",
+            gpu_service_model_path="service.json",
+            predictive_risk_shadow_enabled=True,
+            predictive_joint_overlay_enabled=True,
+            predictive_prepare_host_canary_limit=1,
+        )
+        self.assertEqual(unified.predictive_prepare_host_canary_limit, 1)
+
+    def test_frontier_retraction_requires_predictor_and_p5_retraction(self):
+        with self.assertRaisesRegex(ValueError, "frontier-aware retraction"):
+            BeliefKVConfig(frontier_aware_retraction_shadow_enabled=True)
+
+        config = BeliefKVConfig(
+            joint_policy_enabled=True,
+            observed_admission_scheduling_enabled=True,
+            running_batch_retraction_enabled=True,
+            predictor_model_path="frontier.json",
+            gpu_service_model_path="service.json",
+            predictive_risk_shadow_enabled=True,
+            frontier_aware_retraction_shadow_enabled=True,
+            frontier_aware_retraction_canary_limit=1,
+        )
+        self.assertTrue(config.frontier_aware_retraction_shadow_enabled)
+        self.assertEqual(config.frontier_aware_retraction_canary_limit, 1)
+
     def test_typed_enqueue_adopts_only_equivalent_canonical_command(self):
         h = ControllerHarness()
         first = ControlCommand(

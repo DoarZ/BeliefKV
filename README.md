@@ -10,12 +10,15 @@ The current runtime target is **SGLang 0.5.2rc1** at commit
 **Qwen3-Coder-30B-A3B-Instruct-FP8**, tensor parallelism 1, LangGraph/Deep
 Agents orchestration, isolated SWE-bench tool containers, and a single GPU.
 
-> Current status (2026-07-28): the P5D control-plane repair is implemented
-> behind explicit flags. The online path uses an asynchronous semantic planner
-> and a scheduler-safe physical committer, with one JointPlan authority for
-> admission, residency, and retraction. The CPU suite passes, but the repaired
-> 4/8/12/24-workflow GPU gate has not run. No P5 performance claim should be
-> made from the current repository.
+> Current status (2026-08-11): P5 observed JointPlan, transactional restore,
+> and selective retraction have passed their focused correctness gates. P6
+> R0--R4 integrate frontier belief, action-specific risk, predictive
+> `PREPARE_HOST`, and retraction annotations under the same JointPlan authority.
+> R5 v7 is invalid for performance comparison because its B arm exposed a
+> duplicate allocator/Radix ownership defect. The defect is fixed and a 2.659
+> GB deterministic D2H/H2D restore gate passed 14/14 checks; the v9 A/B inputs
+> are frozen, but the six formal paired runs remain pending. No P6 online
+> performance claim is made yet.
 
 ## Implemented System
 
@@ -56,8 +59,10 @@ Agents orchestration, isolated SWE-bench tool containers, and a single GPU.
 
 P6 now includes the load-independent demand schema, structured local model,
 closure-complete scenario composer, candidate-specific service timeline, formal
-dataset gates, and offline risk-planning path. A cross-project formal model has
-not been trained, and predictive physical actions remain disabled online.
+dataset gates, and asynchronous risk-planning path. Predictive online authority
+is disabled by default. The explicit semantic overlay can authorize only
+non-destructive `PREPARE_HOST`; `PREFETCH_GPU` additionally requires a bounded
+canary. Predictive retraction, drop, and reclaim-and-prefetch remain disabled.
 All fixed P5 w4 traces are development-only correctness evidence. Formal fitting
 rejects them by provenance and also requires at least 5 train projects, 40
 distinct tasks, and 40 workflow rollouts. As of 2026-08-04, the local-label corpus
@@ -82,7 +87,9 @@ The maintained local workflow uses three Conda environments:
 Create or update the first two environments from the repository root:
 
 ```bash
-cd /home/longhao/experiment/BeliefKV
+git clone git@github.com:SJTU-DDST/BeliefKV.git
+cd BeliefKV
+export BELIEFKV_ROOT="$PWD"
 
 # First installation.
 conda env create -f environment.yml
@@ -107,9 +114,14 @@ Run the CPU regression suite before changing the runtime patch or policy:
 conda run --no-capture-output -n beliefkv pytest -q
 ```
 
-The current split CPU regression is `531 passed, 3 skipped` in
-`beliefkv-agents`, plus `122 passed` (and 3 unittest subtests) for the
-SGLang/FastAPI backend files in `beliefkv`.
+At the 2026-08-11 checkpoint, the split CPU regression is `668 passed, 9
+skipped` (plus 6 unittest subtests) in `beliefkv` and `157 passed` across the
+Deep Agents, LangGraph, collection, dataset, and characterization paths in
+`beliefkv-agents`. Keep the environments split: the control environment
+intentionally does not install Deep Agents.
+
+For moving the project, model weights, datasets, and ignored experiment
+artifacts to another host, follow [the migration guide](docs/migration_guide_zh.md).
 
 ## End-to-End GPU Experiment
 
@@ -121,7 +133,7 @@ start an experiment while another process owns the GPU.
 ### 1. Preflight
 
 ```bash
-cd /home/longhao/experiment/BeliefKV
+cd "$BELIEFKV_ROOT"
 
 nvidia-smi
 test -f /opt/downloaded_models/Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8/config.json
@@ -142,7 +154,7 @@ calibration.
 Run this in the server terminal:
 
 ```bash
-cd /home/longhao/experiment/BeliefKV
+cd "$BELIEFKV_ROOT"
 
 RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
 RUN_DIR="$PWD/experiments/raw/p5_observed_24/$RUN_ID"
@@ -215,9 +227,9 @@ need independent headroom.
 In a separate terminal, use the exact `RUN_DIR` from step 2:
 
 ```bash
-cd /home/longhao/experiment/BeliefKV
+cd "$BELIEFKV_ROOT"
 
-RUN_DIR=/home/longhao/experiment/BeliefKV/experiments/raw/p5_observed_24/REPLACE_WITH_RUN_ID
+RUN_DIR="$BELIEFKV_ROOT/experiments/raw/p5_observed_24/REPLACE_WITH_RUN_ID"
 CONTROL_SOCKET=$(jq -r '.runtime_event_socket_path' \
   "$RUN_DIR/server/beliefkv_config.json")
 
@@ -250,9 +262,9 @@ In a separate workload terminal, set `RUN_DIR` to the exact value printed by
 step 2:
 
 ```bash
-cd /home/longhao/experiment/BeliefKV
+cd "$BELIEFKV_ROOT"
 
-RUN_DIR=/home/longhao/experiment/BeliefKV/experiments/raw/p5_observed_24/REPLACE_WITH_RUN_ID
+RUN_DIR="$BELIEFKV_ROOT/experiments/raw/p5_observed_24/REPLACE_WITH_RUN_ID"
 CONTROL_SOCKET=$(jq -r '.runtime_event_socket_path' \
   "$RUN_DIR/server/beliefkv_config.json")
 
@@ -525,6 +537,73 @@ mix server logs from different policies.
 | P2 reactive | `--disable-policy-shadow` | Online reactive residency/admission path without JointPlan shadow |
 | P4 shadow | no P5 flags | Read-only observed JointPlan; decisions do not alter admission or residency |
 | P5 observed | `--queue-service-observer --enable-online-joint --enable-observed-admission --enable-running-retraction` | Semantic JointPlan controls execution/admission/residency/retraction; reactive transfer cannot become a second online policy source |
+| P6 risk shadow | P5 flags plus `--enable-predictive-risk-shadow --predictor-model experiments/models/frontier_belief_mvp_v6_calibrated_dev.json --gpu-service-model experiments/models/gpu_service_curve_cluster_cal_qwen3coder30b_rtx6000ada_20260804T060824Z.json --transfer-service-model experiments/models/transfer_service_morphology_gpu0_dev_v2.json` | Read-only A0/PREPARE_HOST/PREFETCH_GPU risk evaluation; the current transfer artifact conditions on bytes and extent count and is single-GPU development evidence |
+| P6 semantic overlay | P6 risk-shadow flags plus `--enable-predictive-joint-overlay` | A selected `PREPARE_HOST` becomes a semantic intent in the current JointPlan; the safe point rebuilds and validates the live Radix bundle before dispatch |
+| P6 prefetch canary | P6 semantic-overlay flags plus `--enable-predictive-prefetch-canary` | Also allows one in-flight `PREFETCH_GPU`, capped at 5% of the configured KV pool and guarded by reentry, KV-growth, HBM, and timing checks |
+| P6 single PREPARE canary | P6 semantic-overlay flags plus `--predictive-prepare-canary-limit 1` | Allows at most one naturally selected PREPARE_HOST in the server run; it does not force or relax selection |
+
+`--enable-joint-predictive` is retained only for historical config compatibility and
+does not change ordering, victim selection, or migration. P6 risk planning runs
+on the latest-wins worker. Only `--enable-predictive-joint-overlay` gives a
+selected semantic intent online authority; the asynchronous physical certificate
+is diagnostic and is never executed. Safe-point rematerialization failure falls
+back to the unchanged observed JointPlan.
+
+P6 KV actions use action-projected scenario reduction. Continuous particles are
+clustered on the variables required by the candidate action, so unrelated action
+boundary OOD state cannot create an opaque OTHER rejection. Transfer timing must
+be warm-started from a hardware/model-specific artifact; online telemetry updates
+that prior instead of resetting every server process to nominal PCIe bandwidth.
+
+Before enabling any single-action validation, replay both transfer models on
+the same frozen snapshots and classify decision relevance by direction:
+
+- `shape_action_gate`: byte-only rejects while extent-count-aware accepts the
+  same paired candidate. This opens one shape-aware PREPARE canary.
+- `shape_veto_gate`: byte-only accepts while extent-count-aware rejects the
+  same paired candidate. This opens a byte-only treatment with shape-aware/P5
+  no-action control, not a shape-aware canary.
+- `selected_action_gate`: the snapshot-level selected actions differ. This is
+  reported separately and does not by itself authorize a PREPARE canary.
+
+```bash
+SNAPSHOTS=experiments/shadow/p6_predictive_overlay_fixed/20260809T105733Z/server/policy_snapshots.jsonl.gz
+GPU_MODEL=experiments/models/gpu_service_curve_cluster_cal_qwen3coder30b_rtx6000ada_20260804T060824Z.json
+TRANSFER_MODEL=experiments/models/transfer_service_morphology_gpu0_dev_v2.json
+
+conda run -n beliefkv python scripts/replay_predictive_risk.py \
+  --snapshots "$SNAPSHOTS" --gpu-service-model "$GPU_MODEL" \
+  --transfer-service-model "$TRANSFER_MODEL" --transfer-model byte-only \
+  --output experiments/analysis/p6_m5_byte_only_replay.jsonl
+
+conda run -n beliefkv python scripts/replay_predictive_risk.py \
+  --snapshots "$SNAPSHOTS" --gpu-service-model "$GPU_MODEL" \
+  --transfer-service-model "$TRANSFER_MODEL" --transfer-model morphology-aware \
+  --output experiments/analysis/p6_m5_morphology_aware_replay.jsonl
+
+conda run -n beliefkv python scripts/compare_predictive_replays.py \
+  --byte-only experiments/analysis/p6_m5_byte_only_replay.jsonl \
+  --morphology-aware experiments/analysis/p6_m5_morphology_aware_replay.jsonl \
+  --output experiments/analysis/p6_m5_replay_comparison.json
+
+conda run -n beliefkv python scripts/analyze_predictive_prepare_canary.py \
+  --comparison-summary experiments/analysis/p6_m5_replay_comparison.json \
+  --output experiments/analysis/p6_m6_canary_gate.json
+```
+
+Do not force an intent or relax risk constraints. Add
+`--predictive-prepare-canary-limit 1` to that trace's semantic-overlay server
+configuration only when `shape_action_gate=true`; the compatibility field
+`online_canary_gate` now has exactly that promotion-only meaning. When
+`shape_veto_gate=true`, run the byte-only action arm and use shape-aware/P5
+no-action as the control. Pass the resulting `runtime_audit.jsonl` to the
+canary analyzer.
+
+Decision-relevance characterization must use a predeclared task batch. Freeze
+the predictor, transfer-service artifact, risk thresholds, workload manifest,
+and arrival policy before collecting the batch; report promotion, veto,
+selected-action changes, and shape support for every paired candidate. Do not
+keep selecting new traces until a positive case appears.
 
 For a matched comparison, hold constant the workload manifest, stable
 `--run-namespace`, model, SGLang commit, KV/Host capacity, arrival schedule,
@@ -628,6 +707,13 @@ conda run --no-capture-output -n beliefkv-agents \
   --server-log "$RUN_DIR/server/server.log" \
   --output "$RUN_DIR/workloads"
 ```
+
+`--pool-tokens` is the minimum server-reported `max_total_num_tokens` required by
+the run (default 163,840). The runner queries `/get_server_info` before creating
+workload output, rejects silently clipped pools, and uses the actual value for all
+resident-pressure metrics. Add `--predictive-risk-shadow-enabled` only when the
+server was started in P6 risk-shadow mode; this marks the collection as
+development-only without claiming predictive actions were applied.
 
 For a targeted harness recovery run, repeat `--instance-id` while still naming the
 original frozen batch. The runner validates the original plan and manifest digest,
@@ -784,7 +870,7 @@ conda run -n beliefkv-agents python scripts/train_gpu_service_curve.py \
 The exact patched runtime is expected at `third_party/sglang`:
 
 ```bash
-cd /home/longhao/experiment/BeliefKV
+cd "$BELIEFKV_ROOT"
 git clone --branch v0.5.2rc1 https://github.com/sgl-project/sglang.git \
   third_party/sglang
 git -C third_party/sglang rev-parse HEAD
@@ -825,8 +911,13 @@ tests/           correctness and regression tests
 ```
 
 The implementation contract and phase status are documented in
-[docs/architecture_status_zh.md](docs/architecture_status_zh.md). The active
-improvement plan is
+[docs/architecture_status_zh.md](docs/architecture_status_zh.md). The authoritative
+current design is
+[docs/beliefkv_design_2026-07-14_zh.md](docs/beliefkv_design_2026-07-14_zh.md).
+The transfer-service sample-gate fix, corrected morphology conclusion, and
+native HiCache ownership boundary are recorded in
+[docs/experiments/beliefkv_p6_service_contract_and_native_ownership_2026-08-11_zh.md](docs/experiments/beliefkv_p6_service_contract_and_native_ownership_2026-08-11_zh.md).
+The earlier P0-P8 implementation plan is retained as historical context in
 [docs/beliefkv_hicache_joint_control_improvement_plan_2026-07-18_zh.md](docs/beliefkv_hicache_joint_control_improvement_plan_2026-07-18_zh.md).
 The current dynamic agent workload and its validity gates are described in
 [docs/experiments/beliefkv_p3_agentic_workload_2026-07-22_zh.md](docs/experiments/beliefkv_p3_agentic_workload_2026-07-22_zh.md).

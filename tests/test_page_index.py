@@ -132,6 +132,23 @@ class PageIndexTest(unittest.TestCase):
         self.assertEqual(reader_locked.engine_locked_bytes, 200)
         self.assertEqual(index.engine_locked_gpu_pages(), ())
 
+    def test_migratable_gpu_pages_reuses_closure_aware_cache(self):
+        index = PageOwnershipIndex()
+        parent = PageHandle(1, 0)
+        child = PageHandle(2, 0)
+        index.register_page(parent, size_bytes=100, radix_depth=1)
+        index.register_page(child, size_bytes=200, radix_depth=2, parent=parent)
+
+        cached = index.migratable_gpu_pages()
+        self.assertEqual(
+            tuple(page.handle for page in cached),
+            (child, parent),
+        )
+        self.assertIs(index.migratable_gpu_pages(), cached)
+
+        index.set_engine_lock(child, 1)
+        self.assertEqual(index.migratable_gpu_pages(), ())
+
     def test_tentative_unlock_preview_is_read_only_and_closure_aware(self):
         index = PageOwnershipIndex()
         parent = PageHandle(1, 0)

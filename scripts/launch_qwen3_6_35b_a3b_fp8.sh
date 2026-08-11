@@ -4,7 +4,7 @@ set -euo pipefail
 MODEL_PATH="${MODEL_PATH:-/opt/downloaded_models/Qwen/Qwen3.6-35B-A3B-FP8}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.6-35B-A3B-FP8}"
 CONDA_ENV="${CONDA_ENV:-beliefkv}"
-CONDA_BIN="${CONDA_BIN:-/home/longhao/miniconda3/bin/conda}"
+CONDA_BIN="${CONDA_BIN:-$(command -v conda || true)}"
 EXPECTED_SGLANG_VERSION="${EXPECTED_SGLANG_VERSION:-0.5.10.post1}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-18000}"

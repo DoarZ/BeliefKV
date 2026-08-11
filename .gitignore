@@ -23,6 +23,11 @@ experiments/calibration/*
 experiments/analysis/*
 experiments/models/*
 experiments/shadow/*
+experiments/ab/*
+experiments/canary/*
+experiments/characterization/*
+experiments/micro/*
+experiments/smoke/*
 !experiments/archive/README.md
 
 third_party/*

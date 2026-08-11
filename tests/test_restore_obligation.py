@@ -155,6 +155,17 @@ def test_restore_retry_depends_only_on_external_progress_token():
         )
     )
 
+    lease_token = ExternalProgressToken(
+        engine_owner_epoch=token.engine_owner_epoch,
+        closure_fingerprint=token.closure_fingerprint,
+        effective_capacity_threshold_epoch=token.effective_capacity_threshold_epoch,
+        command_ownership_epoch=token.command_ownership_epoch,
+        guard_generation=token.guard_generation,
+        native_load_generation=token.native_load_generation,
+        restore_lease_epoch=(("restore-lease-1", "request", "granted", 8, 16),),
+    )
+    assert obligation.external_progressed(lease_token)
+
 
 def test_restore_transaction_deduplicates_stage_attempt_certificate():
     obligation = _create(RestoreObligationIndex(max_active=1))

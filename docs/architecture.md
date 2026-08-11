@@ -8,6 +8,40 @@ For rendered diagrams that distinguish implemented, partial, and missing
 components, see
 [`architecture_status_zh.md`](architecture_status_zh.md).
 
+## Current P6 Control Line
+
+The current P6 design joins an agent-side opportunity window with the physical
+cost of the live Radix closure:
+
+```text
+RCCG + FrontierBeliefModel        PhysicalSnapshot + Radix closure
+  -> causal slack                  -> transfer shape
+                                  -> morphology debt
+                 \                    /
+                  ScenarioRiskPlanner
+                  -> A0 / PREPARE_HOST / bounded PREFETCH_GPU
+                  -> semantic intent
+                  -> safe-point live-shape rematerialization
+                  -> existing P5 transaction and ACK path
+```
+
+The decision margin is conceptually
+`min(pressure_deadline, reentry_deadline) - Q90(shape-conditioned transfer
+time) - guard`. A bytes-only estimate may not be substituted across extent-count
+buckets. Unsupported shapes and stale live closures fail closed to the P5
+observed plan.
+
+As of 2026-08-10, the first implementation conditions transfer cost on bytes
+and extent count; extent-size distribution and closure depth are observed but
+not model inputs. M1--M5 connect that cost to predictive intent generation and
+scheduler-safe live-shape rematerialization. Replay changes timing estimates
+and feasibility reasons, but changes neither candidate eligibility nor the
+selected action. M6 implements a run-level one-action canary and strict
+five-stage attribution, but its decision-relevance and natural-action gates are
+closed, so no GPU canary was forced. A controlled GPU0 result at equal 2.659 GB measured
+185.69 ms for 7 extents and 765.17 ms for 106 extents; this remains development
+evidence, not a cross-GPU or end-to-end benefit result.
+
 ## Control And Data Planes
 
 ```text
@@ -19,12 +53,14 @@ Agent runtime / tool dispatcher / message bus
                   |
           +-------+--------+
           |                |
-  Remaining-time      Causal frontier
-    predictor          and fairness
+  Frontier belief     Causal frontier
+  and causal slack     and fairness
           |                |
           +-------+--------+
                   |
-      Admission + transfer planner
+      Physical closure shape
+                  |
+  Morphology-aware admission + transfer planner
                   |
           ControlCommand queue
                   |

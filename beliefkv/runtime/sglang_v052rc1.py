@@ -3,12 +3,14 @@ from __future__ import annotations
 import atexit
 import copy
 import gc
+import hashlib
 import inspect
 import json
 import os
 import signal
 import threading
 import time
+from statistics import median
 from collections import Counter, deque
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
@@ -48,12 +50,20 @@ from beliefkv.policy.joint_scheduler import (
     validate_joint_plan_components,
 )
 from beliefkv.policy.online_joint import (
+    ActionGroup,
+    ActionGroupAtomicity,
+    ActionGroupResourceCertificate,
     ActionSlice,
     OnlineJointPlanDecision,
     OnlineJointPlanView,
     append_committed_action_slice,
     compile_bounded_seed_epoch,
     compile_online_joint_view,
+)
+from beliefkv.policy.predictive_joint import PredictiveActionKind
+from beliefkv.policy.predictive_attribution import (
+    PredictiveActionAttributionLedger,
+    PredictiveActionOutcome,
 )
 from beliefkv.policy.reference import (
     AdmissionAction,
@@ -74,6 +84,15 @@ from beliefkv.policy.retraction import (
     RunningRetractionPlan,
 )
 from beliefkv.policy.resource_snapshot import RuntimeResourceObservation
+from beliefkv.policy.service_curve import TransferServiceCurve
+from beliefkv.policy.risk_shadow import (
+    PredictiveIntent,
+    PredictiveRiskShadowConfig,
+    PredictiveRiskShadowObserver,
+    validate_predictive_causal_certificate,
+    validate_predictive_certificate,
+)
+from beliefkv.predictor.hardware_service import GPUServiceCurveModel
 from beliefkv.predictor.online_shadow import (
     build_invocation_frontier_predictions,
 )
@@ -93,6 +112,7 @@ from beliefkv.runtime.joint_shadow import (
     JointShadowResult,
     JointShadowStateStamp,
     LatestWinsJointPlanWorker,
+    LatestWinsPredictiveRiskWorker,
     WorkflowFairnessReplica,
 )
 from beliefkv.runtime.lock_service import (
@@ -134,6 +154,52 @@ def install_scheduler_shutdown_handler() -> Any:
         raise SystemExit(0)
 
     return signal.signal(signal.SIGTERM, handle_sigterm)
+
+
+def _predictive_bundle_envelope_reasons(
+    intent: PredictiveIntent,
+    preview: PhysicalBundlePreview,
+) -> tuple[str, ...]:
+    """Validate that a rematerialized bundle preserves predicted value bounds."""
+
+    reasons: list[str] = []
+    if preview.copy_bytes > intent.max_copy_bytes:
+        reasons.append("copy_bytes_exceed_envelope")
+    if preview.bundle.cross_context_action_bytes > intent.max_cross_context_bytes:
+        reasons.append("cross_context_bytes_exceed_envelope")
+    if preview.bundle.exclusive_action_bytes < intent.min_reclaimable_bytes:
+        reasons.append("exclusive_reclaim_below_envelope")
+    return tuple(reasons)
+
+
+def _predictive_live_shape_fingerprint(
+    snapshot_builder: Any,
+    preview: PhysicalBundlePreview,
+    *,
+    now_ms: float,
+) -> str:
+    """Recreate the snapshot-side transfer-shape digest for live page actions."""
+
+    evidence: list[tuple[str, str, int, int]] = []
+    for action in preview.page_actions:
+        bundle = snapshot_builder.page_bundle_at_safe_point(
+            action.handle,
+            now_ms=now_ms,
+        )
+        extent_id = bundle.extent_ids[0] if bundle.extent_ids else bundle.bundle_id
+        evidence.append(
+            (
+                extent_id,
+                bundle.generation_fingerprint,
+                bundle.gpu_bytes,
+                bundle.cpu_bytes,
+            )
+        )
+    return hashlib.blake2b(
+        repr(tuple(sorted(evidence))).encode("utf-8"),
+        digest_size=12,
+        person=b"bkv-shape",
+    ).hexdigest()
 
 
 def _linux_process_start_time_ticks(pid: int) -> int | None:
@@ -360,12 +426,31 @@ class _OnlineJointResidencyTransaction:
     command_id: str
     command_kind: CommandKind
     context_id: str
+    context_epoch: int
     physical_bundle_id: str
     created_ts_ms: float
     stage: str = "queued"
     completed_ts_ms: float | None = None
     actual_bytes: int = 0
     failure_reason: str | None = None
+    predictive_intent_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _PredictiveResidencyCommit:
+    plan_id: str
+    intent: PredictiveIntent
+    target: SemanticResidencyTarget
+    preview: PhysicalBundlePreview
+    live_shape_fingerprint: str
+    live_extent_count: int
+
+
+@dataclass(frozen=True)
+class _PredictiveOverlaySeedPlan:
+    plan_id: str
+    residency: tuple[Any, ...] = ()
+    semantic_residency: tuple[Any, ...] = ()
 
 
 @dataclass
@@ -1662,6 +1747,8 @@ class HiCacheNodeCommandBackend:
             completed = selected & completed_handles
             closure_bytes = sum(actions[handle].size_bytes for handle in selected)
             actual_bytes = sum(actions[handle].size_bytes for handle in completed)
+            extent_sizes = sorted(actions[handle].size_bytes for handle in completed)
+            small_extent_threshold_bytes = 64 * 1024 * 1024
             source_tier, target_tier = (
                 ("gpu", "host")
                 if direction == TransferDirection.D2H
@@ -1710,6 +1797,22 @@ class HiCacheNodeCommandBackend:
                         if pending.start_ts_ms is not None
                         else "unavailable"
                     ),
+                    extent_count=len(extent_sizes),
+                    extent_bytes_min=extent_sizes[0] if extent_sizes else 0,
+                    extent_bytes_p50=(
+                        int(median(extent_sizes)) if extent_sizes else 0
+                    ),
+                    extent_bytes_max=extent_sizes[-1] if extent_sizes else 0,
+                    small_extent_ratio=(
+                        sum(
+                            size < small_extent_threshold_bytes
+                            for size in extent_sizes
+                        )
+                        / len(extent_sizes)
+                        if extent_sizes
+                        else 0.0
+                    ),
+                    small_extent_threshold_bytes=small_extent_threshold_bytes,
                 )
             )
 
@@ -1931,6 +2034,9 @@ class EmbeddedSGLangRuntime:
             ),
             flush_interval_s=self.config.runtime_audit_flush_interval_s,
         )
+        self._predictive_action_attribution = PredictiveActionAttributionLedger(
+            self._emit_predictive_action_outcome
+        )
         runtime_summary_path = self.config.runtime_summary_path
         if runtime_summary_path is None and self.config.runtime_audit_path is not None:
             runtime_summary_path = str(
@@ -2010,10 +2116,17 @@ class EmbeddedSGLangRuntime:
         self._shadow_page_revision = 0
         self._shadow_telemetry_sequence = 0
         self.joint_shadow_worker: LatestWinsJointPlanWorker | None = None
+        self.predictive_risk_worker: LatestWinsPredictiveRiskWorker | None = None
         self._last_joint_shadow_result_sequence = 0
+        self._last_predictive_risk_result_sequence = 0
+        self._predictive_candidate_snapshot_signatures: dict[
+            tuple[object, ...], float
+        ] = {}
         self._joint_shadow_counts: Counter[str] = Counter()
         self._joint_predictive_counts: Counter[str] = Counter()
         self._last_frontier_predictions: dict[str, dict[str, object]] = {}
+        self._last_frontier_model_version: str | None = None
+        self._restore_funding_preview_cursor: dict[str, int] = {}
         self._joint_shadow_strict_stale_reasons: Counter[str] = Counter()
         self._joint_shadow_readset_stale_reasons: Counter[str] = Counter()
         self._online_joint_result: JointShadowResult | None = None
@@ -2034,6 +2147,10 @@ class EmbeddedSGLangRuntime:
         self._current_online_joint_decision: OnlineJointPlanDecision | None = None
         self._current_semantic_residency_commit: (
             tuple[str, int, SemanticResidencyTarget, PhysicalBundlePreview] | None
+        ) = None
+        self._latest_predictive_intent: PredictiveIntent | None = None
+        self._current_predictive_residency_commit: (
+            _PredictiveResidencyCommit | None
         ) = None
         self._online_joint_residency_sequence = 0
         self._pending_online_joint_residency: (
@@ -2063,6 +2180,7 @@ class EmbeddedSGLangRuntime:
                 "validation_ms",
                 "physical_commit_ms",
                 "plan_age_ms",
+                "predictive_risk_shadow_ms",
             )
         }
         joint_shadow_requested = (
@@ -2132,6 +2250,40 @@ class EmbeddedSGLangRuntime:
                     residency_hysteresis_ms=self.config.residency_hysteresis_ms,
                 )
             )
+            if self.config.predictive_risk_shadow_enabled:
+                assert self.config.gpu_service_model_path is not None
+                predictive_service_model = GPUServiceCurveModel.load(
+                    Path(self.config.gpu_service_model_path)
+                )
+                predictive_shadow_config = PredictiveRiskShadowConfig(
+                    particle_count=(
+                        self.config.predictive_risk_particle_count
+                    ),
+                    top_k=self.config.predictive_risk_top_k,
+                    max_candidates=(
+                        self.config.predictive_risk_max_candidates
+                    ),
+                    minimum_calibration_coverage=(
+                        self.config.predictive_risk_min_calibration_coverage
+                    ),
+                    kv_bytes_per_token=self.config.kv_bytes_per_token,
+                    max_full_prefetch_hbm_ratio=(
+                        self.config.predictive_prefetch_canary_max_hbm_ratio
+                    ),
+                    online_overlay_enabled=(
+                        self.config.predictive_joint_overlay_enabled
+                    ),
+                    transfer_commit_guard_ms=(
+                        self.config.predictive_commit_guard_ms
+                    ),
+                )
+                predictive_risk_observer = PredictiveRiskShadowObserver(
+                    predictive_service_model,
+                    predictive_shadow_config,
+                )
+                self.predictive_risk_worker = LatestWinsPredictiveRiskWorker(
+                    predictive_risk_observer,
+                )
             self.joint_shadow_worker = LatestWinsJointPlanWorker(
                 planner,
                 assembler=IncrementalPolicyInputAssembler(self.config),
@@ -2142,6 +2294,7 @@ class EmbeddedSGLangRuntime:
             hbm_capacity_bytes=self.config.hbm_capacity_bytes,
             host_capacity_bytes=self.config.host_capacity_bytes,
             kv_bytes_per_token=self.config.kv_bytes_per_token,
+            transfer_service_contract=self.controller.transfer_service_contract,
             runtime_event_channel_enabled=self.event_server is not None,
             hicache_capabilities=asdict(self.backend.capabilities),
             transfer_time_semantics={
@@ -2184,11 +2337,7 @@ class EmbeddedSGLangRuntime:
                 "requested": joint_shadow_requested,
                 "enabled": self.joint_shadow_worker is not None,
                 "disabled_reason": self._joint_shadow_disabled_reason,
-                "planner": (
-                    "belief_joint_semantic_predictive"
-                    if self.config.joint_predictive_enabled
-                    else "belief_joint_observed"
-                ),
+                "planner": "belief_joint_observed",
                 "worker_queue": "latest_wins_capacity_1_lossless_delta_merge",
                 "snapshot_builder": "worker_owned_incremental_mirror",
                 "validation": "dependency_scoped_optimistic",
@@ -2196,6 +2345,28 @@ class EmbeddedSGLangRuntime:
                 "application_connected": self.config.joint_policy_enabled,
                 "joint_policy_enabled_requested": self.config.joint_policy_enabled,
                 "joint_predictive_enabled": self.config.joint_predictive_enabled,
+                "joint_predictive_compatibility_mode": (
+                    "metadata_only_no_decision_authority"
+                ),
+                "predictive_risk_shadow_enabled": (
+                    self.config.predictive_risk_shadow_enabled
+                ),
+                "predictive_joint_overlay_enabled": (
+                    self.config.predictive_joint_overlay_enabled
+                ),
+                "predictive_prepare_host_enabled": (
+                    self.config.predictive_prepare_host_enabled
+                ),
+                "predictive_transfer_model": "extent_count_aware",
+                "predictive_prefetch_canary_enabled": (
+                    self.config.predictive_prefetch_canary_enabled
+                ),
+                "predictive_prefetch_canary_max_inflight": (
+                    self.config.predictive_prefetch_canary_max_inflight
+                ),
+                "predictive_prefetch_canary_max_hbm_ratio": (
+                    self.config.predictive_prefetch_canary_max_hbm_ratio
+                ),
                 "max_plan_age_ms": self.config.max_joint_plan_age_ms,
             },
             observed_admission_scheduling={
@@ -2715,6 +2886,39 @@ class EmbeddedSGLangRuntime:
         temporary.replace(path)
         self._last_runtime_summary_ms = now_ms
 
+    def _emit_predictive_action_outcome(
+        self,
+        event: str,
+        now_ms: float,
+        outcome: PredictiveActionOutcome,
+    ) -> None:
+        self._joint_predictive_counts[f"action_outcome_{event}"] += 1
+        self.audit.emit(
+            "predictive_action_outcome",
+            now_ms,
+            outcome_event=event,
+            intent_id=outcome.intent_id,
+            action=outcome.action,
+            context_id=outcome.context_id,
+            context_epoch=outcome.context_epoch,
+            command_id=outcome.command_id,
+            state=outcome.state,
+            created_ts_ms=outcome.created_ts_ms,
+            transfer_completed_ts_ms=outcome.transfer_completed_ts_ms,
+            terminal_ts_ms=outcome.terminal_ts_ms,
+            actual_bytes=outcome.actual_bytes,
+            reason=outcome.reason,
+        )
+
+    def _predictive_action_ledger(self) -> PredictiveActionAttributionLedger:
+        ledger = getattr(self, "_predictive_action_attribution", None)
+        if ledger is None:
+            ledger = PredictiveActionAttributionLedger(
+                self._emit_predictive_action_outcome
+            )
+            self._predictive_action_attribution = ledger
+        return ledger
+
     def prepare_shutdown(self) -> None:
         """Stop admitting new control plans at a scheduler-safe boundary."""
 
@@ -2891,6 +3095,7 @@ class EmbeddedSGLangRuntime:
                 command_id=residency.command_id,
                 command_kind=residency.command_kind.value,
                 source_bundle_id=residency.source_bundle_id,
+                predictive_intent_id=residency.predictive_intent_id,
                 physical_bundle_id=residency.physical_bundle_id,
                 context_id=residency.context_id,
                 status="aborted",
@@ -2925,6 +3130,10 @@ class EmbeddedSGLangRuntime:
         if self._closed:
             return
         self.prepare_shutdown()
+        self._predictive_action_ledger().censor_all(
+            now_ms=float(self._now_ms()),
+            reason="runtime_shutdown",
+        )
         self._closed = True
         event_server = self.event_server
         self.event_server = None
@@ -3217,10 +3426,7 @@ class EmbeddedSGLangRuntime:
             predictive_counts = dict(
                 sorted(getattr(self, "_joint_predictive_counts", {}).items())
             )
-            prediction_used = bool(
-                predictive_counts
-                or getattr(config, "joint_predictive_enabled", False)
-            )
+            prediction_used = False
             terminal_stages = {"completed", "failed", "aborted"}
             pending_residency = getattr(
                 self, "_pending_online_joint_residency", None
@@ -3263,7 +3469,22 @@ class EmbeddedSGLangRuntime:
                 joint_predictive_enabled=getattr(
                     config, "joint_predictive_enabled", False
                 ),
+                predictive_risk_shadow_enabled=getattr(
+                    config, "predictive_risk_shadow_enabled", False
+                ),
                 predictive_decision_counts=predictive_counts,
+            )
+        predictive_risk_worker = getattr(self, "predictive_risk_worker", None)
+        if predictive_risk_worker is not None:
+            predictive_worker_closed = predictive_risk_worker.close()
+            self.predictive_risk_worker = None
+            self.audit.emit(
+                "predictive_risk_worker_summary",
+                self._now_ms(),
+                worker_closed=predictive_worker_closed,
+                worker=predictive_risk_worker.stats().to_dict(),
+                counts=dict(sorted(self._joint_predictive_counts.items())),
+                observed_worker_independent=True,
             )
         joint_shadow_worker = getattr(self, "joint_shadow_worker", None)
         if joint_shadow_worker is not None:
@@ -5091,6 +5312,7 @@ class EmbeddedSGLangRuntime:
             RestoreAuthorityMode.RESTORE_DRAIN_REQUESTED
         )
         self._restore_authority_request_id = obligation.request_id
+        self._restore_authority_dependency_request_id = None
         self.audit.emit(
             "restore_authority_transition",
             now_ms,
@@ -5128,6 +5350,7 @@ class EmbeddedSGLangRuntime:
         if mode != RestoreAuthorityMode.NORMAL_JOINT and owner_finished:
             self._restore_authority_mode = RestoreAuthorityMode.NORMAL_JOINT
             self._restore_authority_request_id = None
+            self._restore_authority_dependency_request_id = None
             self._current_online_joint_view = None
             self._current_online_joint_decision = None
             self._current_joint_plan_epoch = None
@@ -5158,6 +5381,7 @@ class EmbeddedSGLangRuntime:
         self._current_online_joint_decision = None
         self._current_joint_plan_epoch = None
         self._current_semantic_residency_commit = None
+        self._current_predictive_residency_commit = None
         self._restore_authority_mode = RestoreAuthorityMode.RESTORE_DRAIN_ACTIVE
         self.audit.emit(
             "restore_authority_transition",
@@ -5294,6 +5518,24 @@ class EmbeddedSGLangRuntime:
         was_active = grace.active
         grace.cancel(now_ms=now_ms, reason=reason)
         if was_active:
+            transaction = getattr(self, "_restore_transactions", {}).get(
+                request_id
+            )
+            transaction_stage = None
+            if transaction is not None and not transaction.stage.terminal:
+                transaction_stage = {
+                    RestoreObligationState.SATISFIED: (
+                        RestoreTransactionStage.SATISFIED
+                    ),
+                    RestoreObligationState.CANCELLED: (
+                        RestoreTransactionStage.CANCELLED
+                    ),
+                    RestoreObligationState.FAILED: (
+                        RestoreTransactionStage.FAILED_UNRECOVERABLE
+                    ),
+                }.get(transaction.obligation.state)
+                if transaction_stage is not None:
+                    transaction.stage = transaction_stage
             self._restore_obligation_counts["service_grace_cancelled"] += 1
             self.audit.emit(
                 "restore_service_grace_terminal",
@@ -5304,6 +5546,9 @@ class EmbeddedSGLangRuntime:
                 reason=reason,
                 served_decode_tokens=grace.served_decode_tokens,
                 required_decode_tokens=grace.required_decode_tokens,
+                restore_transaction_stage=(
+                    transaction.stage.value if transaction is not None else None
+                ),
             )
 
     def _observe_restore_service_grace(
@@ -5638,6 +5883,9 @@ class EmbeddedSGLangRuntime:
                 causal_rank = 0
                 unblock_depth = 0
                 causal_known = False
+            frontier_annotation = self._frontier_retraction_annotation(
+                metadata.invocation_id
+            )
             candidates.append(
                 RunningRetractionCandidate(
                     request_id=request_id,
@@ -5665,6 +5913,7 @@ class EmbeddedSGLangRuntime:
                         and request_id not in protected_blocker_ids
                         and not self._metadata_scope_is_terminal(metadata)
                     ),
+                    **frontier_annotation,
                 )
             )
 
@@ -5803,6 +6052,18 @@ class EmbeddedSGLangRuntime:
         self._pending_running_retraction_transaction = transaction
         self._running_retraction_transactions.append(transaction)
         self._running_retraction_counts["planned"] += 1
+        if plan.reason == "frontier_joint_pause_authorized_lock_reclaim":
+            self.audit.emit(
+                "frontier_retraction_canary_bound",
+                now_ms,
+                transaction_id=transaction.transaction_id,
+                source_joint_plan_id=source_joint_plan_id,
+                request_ids=list(plan.request_ids),
+                replacement_request_ids=list(plan.replacement_request_ids),
+                canary_index=self._joint_predictive_counts.get(
+                    "frontier_retraction_canary_committed", 0
+                ),
+            )
         if restore_micro_gate_id is not None:
             self._update_restore_micro_gate(
                 "transaction_created",
@@ -5867,6 +6128,23 @@ class EmbeddedSGLangRuntime:
             for req in retracted_requests
             if str(getattr(req, "rid", ""))
         )
+        release_diagnostics = [
+            {
+                "request_id": str(getattr(req, "rid", "")),
+                **dict(diagnostics),
+            }
+            for req in retracted_requests
+            if isinstance(
+                (
+                    diagnostics := getattr(
+                        req,
+                        "beliefkv_retraction_release_diagnostics",
+                        None,
+                    )
+                ),
+                Mapping,
+            )
+        ]
         if transaction is None or transaction.plan is not plan:
             self.audit.emit(
                 "running_retraction_callback_stale",
@@ -6069,6 +6347,7 @@ class EmbeddedSGLangRuntime:
             stage=transaction.stage,
             planned_request_ids=list(plan.request_ids),
             actual_request_ids=list(actual_ids),
+            release_diagnostics=release_diagnostics,
             replacement_request_ids=(
                 list(plan.replacement_request_ids)
                 if transaction.stage == "reclaim_confirmed"
@@ -6571,6 +6850,16 @@ class EmbeddedSGLangRuntime:
                 else 0
             ),
             native_load_generation=native_load_epoch,
+            restore_lease_epoch=tuple(
+                (
+                    lease.lease_id,
+                    lease.request_id,
+                    lease.state.value,
+                    lease.reserved_tokens,
+                    lease.h2d_bytes,
+                )
+                for lease in self._restore_lease_index().active()
+            ),
         )
 
     def _restore_waiting_request(self, request_id: str) -> Any | None:
@@ -6783,33 +7072,94 @@ class EmbeddedSGLangRuntime:
         deficit_bytes: int,
     ) -> tuple[PhysicalBundlePreview | None, tuple[str, ...]]:
         observation = self._runtime_resource_observation(now_ms=now_ms)
-        protected_contexts = {
-            item.context_id for item in self._restore_obligation_index().active()
-        }
+        active_obligations = self._restore_obligation_index().active()
+        protected_contexts = {item.context_id for item in active_obligations}
+        active_obligation_ids = {item.obligation_id for item in active_obligations}
+        cursor_by_obligation = getattr(
+            self,
+            "_restore_funding_preview_cursor",
+            None,
+        )
+        if cursor_by_obligation is None:
+            cursor_by_obligation = {}
+            self._restore_funding_preview_cursor = cursor_by_obligation
+        for obligation_id in tuple(cursor_by_obligation):
+            if obligation_id not in active_obligation_ids:
+                del cursor_by_obligation[obligation_id]
         blockers: set[str] = set()
         candidates: list[PhysicalBundlePreview] = []
-        for context_id, context in sorted(self.controller.graph.contexts.items()):
-            if context_id in protected_contexts:
+        seen_bundles: set[str] = set()
+        preview_started_ns = time.perf_counter_ns()
+        page_index = self.controller.page_index
+        bundle_builder = self.controller.arbiter.bundle_builder
+        roots = page_index.migratable_gpu_pages()
+        root_budget = min(128, len(roots))
+        start = (
+            cursor_by_obligation.get(obligation.obligation_id, 0)
+            % len(roots)
+            if roots
+            else 0
+        )
+        roots_examined = 0
+        funding_found = False
+        for offset in range(root_budget):
+            root = roots[(start + offset) % len(roots)]
+            roots_examined += 1
+            owners = [
+                context_id
+                for context_id in sorted(root.owner_contexts)
+                if context_id not in protected_contexts
+                and context_id in self.controller.graph.contexts
+            ]
+            if not owners:
                 continue
-            previews = self.controller.arbiter.bundle_builder.previews_for_context(
+            context_id = owners[0]
+            context = self.controller.graph.contexts[context_id]
+            preview = bundle_builder.preview_offload_root(
                 CommandKind.OFFLOAD_CONTEXT,
                 context_id,
                 context.epoch,
+                root.handle,
                 now_ms=now_ms,
                 allow_ready_owners=True,
                 protected_context_id=obligation.context_id,
                 host_available_bytes=observation.host_free_bytes,
             )
-            for preview in previews:
-                if protected_contexts.intersection(
-                    preview.bundle.owner_context_ids
-                ):
-                    continue
-                if not preview.eligible:
-                    blockers.update(item.code.value for item in preview.blockers)
-                    continue
-                if preview.bundle.marginal_reclaimable_bytes > 0:
-                    candidates.append(preview)
+            if preview is None or preview.bundle.bundle_id in seen_bundles:
+                continue
+            seen_bundles.add(preview.bundle.bundle_id)
+            if protected_contexts.intersection(preview.bundle.owner_context_ids):
+                blockers.add("protected_restore_owner")
+                continue
+            if not preview.eligible:
+                blockers.update(item.code.value for item in preview.blockers)
+                continue
+            if preview.bundle.marginal_reclaimable_bytes <= 0:
+                continue
+            candidates.append(preview)
+            # Funding commits one physical bundle at a time. Once there is a
+            # bundle that closes the deficit, extra subtree enumeration cannot
+            # improve liveness enough to justify scheduler-path work.
+            if (
+                preview.bundle.marginal_reclaimable_bytes >= deficit_bytes
+                or len(candidates) >= 8
+            ):
+                funding_found = True
+                break
+        if roots:
+            cursor_by_obligation[obligation.obligation_id] = (
+                start + roots_examined
+            ) % len(roots)
+        if roots_examined < len(roots) and not funding_found:
+            blockers.add("funding_preview_scan_budget_exhausted")
+        elapsed_ms = (time.perf_counter_ns() - preview_started_ns) / 1_000_000.0
+        self._restore_obligation_counts["funding_preview_calls"] += 1
+        self._restore_obligation_counts[
+            "funding_preview_roots_scanned"
+        ] += roots_examined
+        self._restore_obligation_counts[
+            "funding_preview_us_total"
+        ] += int(round(elapsed_ms * 1000.0))
         if not candidates:
             return None, tuple(sorted(blockers or {"no_funding_bundle"}))
         selected = min(
@@ -6891,6 +7241,29 @@ class EmbeddedSGLangRuntime:
         if queued:
             return True, ()
         return False, ("restore_funding_queue_conflict",)
+
+    def _recover_failed_restore_lease_grant(
+        self,
+        obligation: RestoreObligation,
+        *,
+        now_ms: float,
+        attempt_stamp: tuple[object, ...],
+        h2d_bytes: int,
+    ) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
+        """Wait for the current lease or reclaim capacity for this debt."""
+
+        if self._active_restore_lease() is not None:
+            return False, ("restore_lease_busy",), ("restore_lease_terminal",)
+        queued, blockers = self._try_queue_restore_lease_funding(
+            obligation,
+            now_ms=now_ms,
+            attempt_stamp=attempt_stamp,
+            h2d_bytes=h2d_bytes,
+        )
+        return queued, blockers, (
+            "restore_funding_terminal",
+            "capacity_threshold_satisfied",
+        )
 
     def _queue_restore_obligation_command(
         self,
@@ -7220,8 +7593,8 @@ class EmbeddedSGLangRuntime:
                     )
                     if lease is None:
                         self._restart_physical_capture_epoch()
-                        queued, blockers = (
-                            self._try_queue_restore_lease_funding(
+                        queued, blockers, wake_conditions = (
+                            self._recover_failed_restore_lease_grant(
                                 obligation,
                                 now_ms=now_ms,
                                 attempt_stamp=stamp,
@@ -7235,6 +7608,7 @@ class EmbeddedSGLangRuntime:
                             now_ms=now_ms,
                             stamp=stamp,
                             blocker_codes=blockers,
+                            wake_conditions=wake_conditions,
                         )
                         continue
                     if not self._pin_restore_lease_prefix(
@@ -7396,15 +7770,25 @@ class EmbeddedSGLangRuntime:
                     )
                     if lease is None:
                         self._restart_physical_capture_epoch()
+                        queued, blockers, wake_conditions = (
+                            self._recover_failed_restore_lease_grant(
+                                obligation,
+                                now_ms=now_ms,
+                                attempt_stamp=stamp,
+                                h2d_bytes=eligible.copy_bytes,
+                            )
+                        )
+                        if queued:
+                            return
                         self._block_restore_obligation(
                             obligation,
                             now_ms=now_ms,
                             stamp=stamp,
-                            blocker_codes=("restore_lease_capacity",),
+                            blocker_codes=blockers,
                             external_progress_token=progress_token,
-                            wake_conditions=("capacity_threshold_satisfied",),
+                            wake_conditions=wake_conditions,
                         )
-                        return
+                        continue
                     transaction.capacity_reservation_id = lease.lease_id
                     if not self._pin_restore_lease_prefix(
                         obligation,
@@ -7529,11 +7913,13 @@ class EmbeddedSGLangRuntime:
                     if ready:
                         return
                     self._restart_physical_capture_epoch()
-                    queued, blockers = self._try_queue_restore_lease_funding(
-                        obligation,
-                        now_ms=now_ms,
-                        attempt_stamp=stamp,
-                        h2d_bytes=0,
+                    queued, blockers, wake_conditions = (
+                        self._recover_failed_restore_lease_grant(
+                            obligation,
+                            now_ms=now_ms,
+                            attempt_stamp=stamp,
+                            h2d_bytes=0,
+                        )
                     )
                     if queued:
                         return
@@ -7542,6 +7928,7 @@ class EmbeddedSGLangRuntime:
                         now_ms=now_ms,
                         stamp=stamp,
                         blocker_codes=blockers,
+                        wake_conditions=wake_conditions,
                     )
                     return
                 self._block_restore_obligation(
@@ -7726,8 +8113,17 @@ class EmbeddedSGLangRuntime:
             available_tokens = int(allocator.available_size())
         return max(0, available_tokens * self.config.kv_bytes_per_token)
 
-    def _joint_retraction_planner(self) -> ObservedRetractionPlanner:
-        planner = getattr(self, "_joint_retraction_solver", None)
+    def _joint_retraction_planner(
+        self,
+        *,
+        frontier_aware: bool = False,
+    ) -> ObservedRetractionPlanner:
+        attribute = (
+            "_frontier_retraction_solver"
+            if frontier_aware
+            else "_joint_retraction_solver"
+        )
+        planner = getattr(self, attribute, None)
         if planner is None:
             planner = ObservedRetractionPlanner(
                 ObservedRetractionConfig(
@@ -7740,10 +8136,86 @@ class EmbeddedSGLangRuntime:
                     maximum_retractions_per_request=(
                         self.config.running_batch_retraction_max_per_request
                     ),
+                    frontier_aware_enabled=frontier_aware,
                 )
             )
-            self._joint_retraction_solver = planner
+            setattr(self, attribute, planner)
         return planner
+
+    def _frontier_retraction_annotation(
+        self,
+        invocation_id: str,
+    ) -> dict[str, object]:
+        raw = getattr(self, "_last_frontier_predictions", {}).get(invocation_id)
+        if not isinstance(raw, Mapping):
+            return {
+                "frontier_class": "unknown",
+                "prediction_support": "unavailable",
+                "service_to_boundary_tokens": None,
+                "join_criticality": 0.0,
+            }
+        support = str(raw.get("support_level") or "unavailable")
+        if support not in {"exact", "backoff", "unavailable"}:
+            support = "unavailable"
+        boundary = raw.get("boundary_distribution")
+        boundary_distribution = (
+            {
+                str(name): float(probability)
+                for name, probability in boundary.items()
+            }
+            if isinstance(boundary, Mapping)
+            else {}
+        )
+        top_boundary = (
+            max(boundary_distribution, key=boundary_distribution.get)
+            if boundary_distribution
+            else "unknown"
+        )
+        top_probability = boundary_distribution.get(top_boundary, 0.0)
+        if support == "unavailable" or top_probability < 0.5:
+            frontier_class = "unknown"
+        elif top_boundary in {"tool", "spawn"}:
+            frontier_class = "expand"
+        elif top_boundary in {"return", "final"}:
+            frontier_class = "close"
+        elif top_boundary == "unknown":
+            frontier_class = "unknown"
+        else:
+            frontier_class = "hold"
+
+        service_to_boundary_tokens: float | None = None
+        demand = raw.get("remaining_decode_tokens")
+        if isinstance(demand, Mapping):
+            values = tuple(float(item) for item in demand.get("values", ()))
+            masses = tuple(
+                float(item) for item in demand.get("probability_mass", ())
+            )
+            if values and len(values) == len(masses):
+                cumulative = 0.0
+                for value, mass in zip(values, masses):
+                    cumulative += max(0.0, mass)
+                    if cumulative >= 0.5:
+                        service_to_boundary_tokens = max(0.0, value)
+                        break
+                if service_to_boundary_tokens is None:
+                    service_to_boundary_tokens = max(0.0, values[-1])
+
+        join_criticality = 0.0
+        for join in self.controller.graph.joins.values():
+            if join.satisfied or invocation_id not in join.member_invocation_ids:
+                continue
+            incomplete = join.member_invocation_ids - join.completed_member_ids
+            if invocation_id in incomplete:
+                join_criticality = max(
+                    join_criticality,
+                    1.0 / max(1, len(incomplete)),
+                )
+        return {
+            "frontier_class": frontier_class,
+            "prediction_support": support,
+            "service_to_boundary_tokens": service_to_boundary_tokens,
+            "join_criticality": join_criticality,
+        }
 
     def _update_restore_micro_gate(
         self,
@@ -8073,23 +8545,87 @@ class EmbeddedSGLangRuntime:
             else ()
         )
         if explicit_retractions:
-            selected_victim = explicit_retractions[0]
+            observed_victim = explicit_retractions[0]
+            frontier_victim = observed_victim
             intent_mode = "optimized"
         elif epoch is not None and epoch.planner_mode in {
             JointPlannerMode.BOUNDED_SEED,
             JointPlannerMode.EMERGENCY,
         }:
-            selected_victim = self._bounded_retraction_victim(snapshot)
+            observed_victim = self._bounded_retraction_victim(snapshot)
+            frontier_victim = self._bounded_retraction_victim(
+                snapshot,
+                frontier_aware=True,
+            )
             intent_mode = "emergency"
         else:
-            selected_victim = None
+            observed_victim = None
+            frontier_victim = None
             intent_mode = "optimized_no_intent"
-        pause_authorized = (
-            {selected_victim} if selected_victim is not None else set()
+
+        observed_decision = self._authorized_retraction_decision(
+            snapshot,
+            observed_victim,
+            frontier_aware=False,
         )
-        if not pause_authorized:
+        frontier_decision = self._authorized_retraction_decision(
+            snapshot,
+            frontier_victim,
+            frontier_aware=True,
+        )
+        observed_signature = self._retraction_decision_signature(observed_decision)
+        frontier_signature = self._retraction_decision_signature(frontier_decision)
+        frontier_changed = observed_signature != frontier_signature
+        frontier_observation_enabled = bool(
+            self.config.frontier_aware_retraction_shadow_enabled
+            or self.config.frontier_aware_retraction_canary_limit > 0
+        )
+        if frontier_observation_enabled:
+            self.audit.emit(
+                "frontier_retraction_shadow",
+                snapshot.observed_ts_ms,
+                source_joint_plan_id=source_plan_id,
+                intent_mode=intent_mode,
+                observed_victim_request_id=observed_victim,
+                frontier_victim_request_id=frontier_victim,
+                observed_reason=observed_decision.reason,
+                frontier_reason=frontier_decision.reason,
+                observed_signature=observed_signature,
+                frontier_signature=frontier_signature,
+                decision_changed=frontier_changed,
+                observed_expected_reclaim_bytes=(
+                    observed_decision.plan.expected_reclaim_capacity_bytes
+                    if observed_decision.plan is not None
+                    else 0
+                ),
+                frontier_expected_reclaim_bytes=(
+                    frontier_decision.plan.expected_reclaim_capacity_bytes
+                    if frontier_decision.plan is not None
+                    else 0
+                ),
+            )
+
+        canary_limit = self.config.frontier_aware_retraction_canary_limit
+        predictive_counts = getattr(self, "_joint_predictive_counts", None)
+        canary_used = int(
+            predictive_counts.get(
+                "frontier_retraction_canary_committed", 0
+            )
+            if predictive_counts is not None
+            else 0
+        )
+        use_frontier = bool(
+            frontier_changed
+            and frontier_decision.plan is not None
+            and canary_limit > canary_used
+        )
+        decision = frontier_decision if use_frontier else observed_decision
+        selected_victim = frontier_victim if use_frontier else observed_victim
+        if decision.plan is None or selected_victim is None:
             return (
-                ObservedRetractionDecision(
+                decision
+                if decision.reason != "replacement_absent"
+                else ObservedRetractionDecision(
                     plan=None,
                     reason="joint_plan_has_no_pause_authorized_running_request",
                     candidate_count=len(snapshot.candidates),
@@ -8118,6 +8654,52 @@ class EmbeddedSGLangRuntime:
                 request_id=selected_victim,
                 intent_mode=intent_mode,
                 source_joint_plan_id=source_plan_id,
+                frontier_aware=use_frontier,
+            )
+        if decision.plan is not None:
+            decision = replace(
+                decision,
+                plan=replace(
+                    decision.plan,
+                    reason=(
+                        "frontier_joint_pause_authorized_lock_reclaim"
+                        if use_frontier
+                        else "observed_joint_pause_authorized_lock_reclaim"
+                    ),
+                ),
+            )
+        if use_frontier:
+            if predictive_counts is None:
+                predictive_counts = Counter()
+                self._joint_predictive_counts = predictive_counts
+            predictive_counts["frontier_retraction_canary_committed"] += 1
+            self.audit.emit(
+                "frontier_retraction_canary_committed",
+                snapshot.observed_ts_ms,
+                source_joint_plan_id=source_plan_id,
+                request_ids=list(decision.plan.request_ids),
+                replacement_request_ids=list(
+                    decision.plan.replacement_request_ids
+                ),
+                observed_signature=observed_signature,
+                frontier_signature=frontier_signature,
+                canary_index=canary_used + 1,
+                canary_limit=canary_limit,
+            )
+        return decision, source_plan_id
+
+    def _authorized_retraction_decision(
+        self,
+        snapshot: ObservedRetractionSnapshot,
+        victim_request_id: str | None,
+        *,
+        frontier_aware: bool,
+    ) -> ObservedRetractionDecision:
+        if victim_request_id is None:
+            return ObservedRetractionDecision(
+                plan=None,
+                reason="joint_plan_has_no_pause_authorized_running_request",
+                candidate_count=len(snapshot.candidates),
             )
         restricted = replace(
             snapshot,
@@ -8126,31 +8708,41 @@ class EmbeddedSGLangRuntime:
                     candidate,
                     service_status=(
                         "stale"
-                        if candidate.request_id in pause_authorized
+                        if candidate.request_id == victim_request_id
                         else candidate.service_status
                     ),
                     policy_eligible=(
                         candidate.policy_eligible
-                        and candidate.request_id in pause_authorized
+                        and candidate.request_id == victim_request_id
                     ),
                 )
                 for candidate in snapshot.candidates
             ),
         )
-        decision = self._joint_retraction_planner().decide(restricted)
-        if decision.plan is not None:
-            decision = replace(
-                decision,
-                plan=replace(
-                    decision.plan,
-                    reason="observed_joint_pause_authorized_lock_reclaim",
-                ),
-            )
-        return decision, source_plan_id
+        return self._joint_retraction_planner(
+            frontier_aware=frontier_aware
+        ).decide(restricted)
+
+    @staticmethod
+    def _retraction_decision_signature(
+        decision: ObservedRetractionDecision,
+    ) -> dict[str, object]:
+        plan = decision.plan
+        return {
+            "request_ids": list(plan.request_ids) if plan is not None else [],
+            "replacement_request_ids": (
+                list(plan.replacement_request_ids) if plan is not None else []
+            ),
+            "expected_reclaim_capacity_bytes": (
+                plan.expected_reclaim_capacity_bytes if plan is not None else 0
+            ),
+        }
 
     def _bounded_retraction_victim(
         self,
         snapshot: ObservedRetractionSnapshot,
+        *,
+        frontier_aware: bool = False,
     ) -> str | None:
         unlock_bytes: Counter[str] = Counter()
         for extent in snapshot.locked_extents:
@@ -8163,13 +8755,33 @@ class EmbeddedSGLangRuntime:
             if item.policy_eligible
             and item.prior_retraction_count
             < self.config.running_batch_retraction_max_per_request
+            and not (
+                frontier_aware
+                and item.prediction_support == "exact"
+                and (
+                    item.frontier_class == "expand"
+                    or (
+                        item.frontier_class == "close"
+                        and item.join_criticality > 0.0
+                    )
+                )
+            )
         ]
         if not eligible:
             return None
         service_rank = {"stale": 0, "unknown": 1, "warming": 2, "recent": 3}
+        frontier_rank = {"hold": 0, "unknown": 1, "close": 2, "expand": 3}
         selected = min(
             eligible,
             key=lambda item: (
+                *(
+                    (
+                        frontier_rank[item.frontier_class],
+                        -(item.service_to_boundary_tokens or 0.0),
+                    )
+                    if frontier_aware
+                    else ()
+                ),
                 service_rank[item.service_status],
                 -unlock_bytes[item.request_id],
                 -item.private_kv_bytes,
@@ -8211,6 +8823,9 @@ class EmbeddedSGLangRuntime:
                         self.controller.visible_admission.get(
                             request_id
                         ).request.estimated_incremental_bytes
+                    ),
+                    **self._frontier_retraction_annotation(
+                        tagged_by_request[request_id][2].invocation_id
                     ),
                 )
                 for request_id in view.immediate_request_ids
@@ -8260,8 +8875,11 @@ class EmbeddedSGLangRuntime:
                         str(req.rid)
                     ).request.estimated_incremental_bytes
                 ),
+                **self._frontier_retraction_annotation(
+                    metadata.invocation_id
+                ),
             )
-            for _, req, _ in ordered
+            for _, req, metadata in ordered
         )
 
     def _native_reclaim_capacity_bytes(self) -> int:
@@ -9433,6 +10051,7 @@ class EmbeddedSGLangRuntime:
             self._gpu_service_sequence += 1
             sample_id = f"gpu-service-{self._gpu_service_sequence:09d}"
             request_samples = []
+            effective_sequence_tokens_before = []
             decode_steps = max(1, tokens // max(1, len(reqs)))
             for req, item, sequence_tokens in zip(
                 reqs, metadata, sequence_tokens_before
@@ -9441,6 +10060,20 @@ class EmbeddedSGLangRuntime:
                 output_ids = getattr(req, "output_ids", None)
                 output_tokens_before = (
                     len(output_ids) if output_ids is not None else None
+                )
+                origin_input_ids = getattr(req, "origin_input_ids", None)
+                effective_sequence_tokens = (
+                    (
+                        len(origin_input_ids)
+                        if origin_input_ids is not None
+                        else sequence_tokens
+                    )
+                    + (output_tokens_before or 0)
+                    if phase == "decode"
+                    else sequence_tokens
+                )
+                effective_sequence_tokens_before.append(
+                    effective_sequence_tokens
                 )
                 token_delta = (
                     decode_steps
@@ -9466,6 +10099,9 @@ class EmbeddedSGLangRuntime:
                         ),
                         "output_tokens_before": output_tokens_before,
                         "sequence_tokens_before": sequence_tokens,
+                        "effective_sequence_tokens_before": (
+                            effective_sequence_tokens
+                        ),
                     }
                 )
             descriptor = {
@@ -9480,6 +10116,12 @@ class EmbeddedSGLangRuntime:
                 "prefill_chunk_index": prefill_chunk_index,
                 "prefix_tokens_before": prefix_tokens_before,
                 "sequence_tokens_before": sequence_tokens_before,
+                "effective_sequence_tokens_before": (
+                    effective_sequence_tokens_before
+                ),
+                "max_effective_sequence_tokens_before": max(
+                    effective_sequence_tokens_before, default=0
+                ),
                 "max_sequence_tokens_before": max(
                     sequence_tokens_before, default=0
                 ),
@@ -10081,20 +10723,43 @@ class EmbeddedSGLangRuntime:
             self, "_restore_authority_mode", RestoreAuthorityMode.NORMAL_JOINT
         )
         if restore_authority_mode != RestoreAuthorityMode.NORMAL_JOINT:
-            restore_request_id = getattr(
-                self, "_restore_authority_request_id", None
+            restore_request_id, authority_target_reason = (
+                self._restore_authority_admission_target(
+                    entries, restore_ready_priority
+                )
             )
-            restore_entry = entries.get(restore_request_id)
             ordered_request_ids = (
                 (restore_request_id,)
                 if restore_request_id is not None
-                and restore_entry is not None
-                and restore_entry.state == AdmissionSideState.VISIBLE_PENDING
                 else ()
             )
             compile_max_requests = 1 if ordered_request_ids else 0
             ticket_source = "emergency_restore_coordinator"
-            ticket_reason = restore_authority_mode.value
+            ticket_reason = (
+                f"{restore_authority_mode.value}:{authority_target_reason}"
+            )
+            previous_dependency = getattr(
+                self, "_restore_authority_dependency_request_id", None
+            )
+            current_dependency = (
+                restore_request_id
+                if authority_target_reason == "restore_lease_dependency"
+                else None
+            )
+            if current_dependency != previous_dependency:
+                self._restore_authority_dependency_request_id = (
+                    current_dependency
+                )
+                self.audit.emit(
+                    "restore_authority_dependency_transition",
+                    now_ms,
+                    authority_request_id=getattr(
+                        self, "_restore_authority_request_id", None
+                    ),
+                    previous_dependency_request_id=previous_dependency,
+                    dependency_request_id=current_dependency,
+                    reason=authority_target_reason,
+                )
         self._retraction_priority_request_ids = ()
         restore_lease_credits = self._restore_lease_credit_bytes()
         candidate_limit = min(
@@ -10685,6 +11350,34 @@ class EmbeddedSGLangRuntime:
             and entries[obligation.request_id].state
             == AdmissionSideState.VISIBLE_PENDING
         )
+
+    def _restore_authority_admission_target(
+        self,
+        entries: Mapping[str, Any],
+        restore_ready_priority: tuple[str, ...],
+    ) -> tuple[str | None, str]:
+        """Select the owner or a lease blocker that must run before it."""
+
+        owner_request_id = getattr(
+            self, "_restore_authority_request_id", None
+        )
+        active_lease = self._active_restore_lease()
+        lease_request_id = (
+            active_lease.request_id if active_lease is not None else None
+        )
+        if (
+            lease_request_id != owner_request_id
+            and lease_request_id in restore_ready_priority
+        ):
+            return lease_request_id, "restore_lease_dependency"
+        owner_entry = entries.get(owner_request_id)
+        if (
+            owner_request_id is not None
+            and owner_entry is not None
+            and owner_entry.state == AdmissionSideState.VISIBLE_PENDING
+        ):
+            return owner_request_id, "restore_owner"
+        return None, "restore_owner_not_ready"
 
     def _sync_visible_gate_state(
         self,
@@ -11624,16 +12317,28 @@ class EmbeddedSGLangRuntime:
             return
         direction = TransferDirection(str(record["direction"]))
         node_ids = tuple(int(value) for value in record.get("node_ids", ()))
-        owner_context_ids: set[str] = set()
-        for node_id in node_ids:
-            handle = self.registry.current_handle(node_id)
-            page = (
-                self.controller.page_index.pages.get(handle)
-                if handle is not None
-                else None
-            )
-            if page is not None:
-                owner_context_ids.update(page.owner_contexts)
+        submit_page_handles = tuple(
+            PageHandle(int(page_id), int(generation))
+            for page_id, generation in record.get("page_handles", ())
+        )
+        submit_owner_context_ids = record.get("owner_context_ids")
+        owner_context_ids = {
+            str(value) for value in (submit_owner_context_ids or ()) if value
+        }
+        if submit_owner_context_ids is None:
+            for index, node_id in enumerate(node_ids):
+                handle = (
+                    submit_page_handles[index]
+                    if index < len(submit_page_handles)
+                    else self.registry.current_handle(node_id)
+                )
+                page = (
+                    self.controller.page_index.pages.get(handle)
+                    if handle is not None
+                    else None
+                )
+                if page is not None:
+                    owner_context_ids.update(page.owner_contexts)
         context_id = (
             next(iter(owner_context_ids)) if len(owner_context_ids) == 1 else None
         )
@@ -11642,8 +12347,37 @@ class EmbeddedSGLangRuntime:
             if context_id is not None
             else None
         )
+        submit_owner_context_epochs = {
+            str(owner): int(epoch)
+            for owner, epoch in record.get("owner_context_epochs", ())
+        }
+        context_epoch = (
+            submit_owner_context_epochs.get(context_id)
+            if context_id is not None
+            else None
+        )
+        if context_epoch is None and context is not None:
+            context_epoch = context.epoch
         token_count = max(0, int(record.get("token_count", 0)))
         actual_bytes = token_count * self.config.kv_bytes_per_token
+        submit_extent_sizes = record.get("extent_bytes")
+        extent_sizes = sorted(
+            int(value) for value in (submit_extent_sizes or ()) if int(value) > 0
+        )
+        if submit_extent_sizes is None:
+            extent_sizes = sorted(
+                page.size_bytes
+                for index, node_id in enumerate(node_ids)
+                if (
+                    handle := (
+                        submit_page_handles[index]
+                        if index < len(submit_page_handles)
+                        else self.registry.current_handle(int(node_id))
+                    )
+                ) is not None
+                and (page := self.controller.page_index.pages.get(handle)) is not None
+            )
+        small_extent_threshold_bytes = 64 * 1024 * 1024
         submit_ts_ms = max(0.0, float(record["submit_ts_ms"]))
         complete_ts_ms = max(submit_ts_ms, float(record["complete_ts_ms"]))
         telemetry = TransferTelemetry(
@@ -11663,7 +12397,7 @@ class EmbeddedSGLangRuntime:
             reason=str(record.get("reason", "")),
             page_count=len(node_ids),
             context_id=context_id,
-            context_epoch=context.epoch if context is not None else None,
+            context_epoch=context_epoch,
             command_kind=source,
             compute_phase="native_hicache",
             host_copy_state=str(record.get("host_copy_state", "unknown")),
@@ -11686,18 +12420,82 @@ class EmbeddedSGLangRuntime:
                 0.0, float(self._now_ms()) - complete_ts_ms
             ),
             start_timestamp_semantics="unavailable",
+            extent_count=len(extent_sizes),
+            extent_bytes_min=extent_sizes[0] if extent_sizes else 0,
+            extent_bytes_p50=int(median(extent_sizes)) if extent_sizes else 0,
+            extent_bytes_max=extent_sizes[-1] if extent_sizes else 0,
+            small_extent_ratio=(
+                sum(size < small_extent_threshold_bytes for size in extent_sizes)
+                / len(extent_sizes)
+                if extent_sizes
+                else 0.0
+            ),
+            small_extent_threshold_bytes=small_extent_threshold_bytes,
         )
         self._emit_transfer_telemetry(
             telemetry,
             telemetry_origin="native_hicache_callback",
             backend_operation_id=record.get("backend_operation_id"),
             radix_node_ids=node_ids,
+            radix_page_handles=tuple(
+                (handle.page_id, handle.allocation_generation)
+                for handle in submit_page_handles
+            ),
             owner_context_ids=tuple(sorted(owner_context_ids)),
+            owner_context_epochs=tuple(sorted(submit_owner_context_epochs.items())),
+            ownership_attribution_semantics=(
+                "submit_snapshot"
+                if submit_owner_context_ids is not None
+                else "completion_lookup"
+            ),
+            ownership_revision=record.get("ownership_revision"),
+            generation_attribution_complete=(
+                len(submit_page_handles) == len(node_ids)
+            ),
+            owner_attribution_complete=(submit_owner_context_ids is not None),
+            extent_attribution_complete=(submit_extent_sizes is not None),
             native_inflight_operation_count_at_submit=record.get(
                 "native_inflight_operation_count"
             ),
             start_timestamp_observed=False,
         )
+
+    def on_hicache_transfer_submitted(
+        self, record: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Freeze ownership before native HiCache mutates the live Radix tree."""
+
+        owner_context_ids: set[str] = set()
+        owner_context_epochs: dict[str, int] = {}
+        extent_bytes: list[int] = []
+        page_handles: list[tuple[int, int]] = []
+        for value in record.get("node_ids", ()):
+            handle = self.registry.current_handle(int(value))
+            if handle is not None:
+                page_handles.append(
+                    (handle.page_id, handle.allocation_generation)
+                )
+            page = (
+                self.controller.page_index.pages.get(handle)
+                if handle is not None
+                else None
+            )
+            if page is None:
+                continue
+            extent_bytes.append(page.size_bytes)
+            for context_id, context_epoch in page.owner_contexts.items():
+                owner_context_ids.add(context_id)
+                owner_context_epochs[context_id] = max(
+                    context_epoch,
+                    owner_context_epochs.get(context_id, context_epoch),
+                )
+        return {
+            "owner_context_ids": tuple(sorted(owner_context_ids)),
+            "owner_context_epochs": tuple(sorted(owner_context_epochs.items())),
+            "extent_bytes": tuple(extent_bytes),
+            "page_handles": tuple(page_handles),
+            "ownership_revision": self.controller.page_index.revision,
+        }
 
     def _mark_context_dirty(self, context_id: str) -> None:
         dirty_contexts = getattr(self, "_dirty_context_ids", None)
@@ -11735,6 +12533,27 @@ class EmbeddedSGLangRuntime:
     def _process_events(self, events: tuple[RuntimeEvent, ...]) -> None:
         committed_events, adjustments = self._commit_event_times(events)
         self.controller.process_runtime_events(committed_events)
+        ledger = self._predictive_action_ledger()
+        for event in committed_events:
+            if event.kind in {
+                RuntimeEventKind.RETURN,
+                RuntimeEventKind.INVOCATION_CANCEL,
+            } and event.context_id is not None:
+                ledger.terminal_context(
+                    event.context_id,
+                    context_epoch=event.context_epoch,
+                    now_ms=event.ts_ms,
+                    reason=event.kind.value,
+                )
+            elif event.kind == RuntimeEventKind.WORKFLOW_END:
+                for invocation in self.controller.graph.invocations.values():
+                    if invocation.workflow_id == event.workflow_id:
+                        ledger.terminal_context(
+                            invocation.context_id,
+                            context_epoch=None,
+                            now_ms=event.ts_ms,
+                            reason="workflow_end",
+                        )
         for event in committed_events:
             if (
                 event.kind == RuntimeEventKind.CONTEXT_COMPACT
@@ -12381,6 +13200,12 @@ class EmbeddedSGLangRuntime:
             "allocator_submit_ms": telemetry.allocator_submit_ms,
             "callback_overhead_ms": telemetry.callback_overhead_ms,
             "start_timestamp_semantics": telemetry.start_timestamp_semantics,
+            "extent_count": telemetry.extent_count,
+            "extent_bytes_min": telemetry.extent_bytes_min,
+            "extent_bytes_p50": telemetry.extent_bytes_p50,
+            "extent_bytes_max": telemetry.extent_bytes_max,
+            "small_extent_ratio": telemetry.small_extent_ratio,
+            "small_extent_threshold_bytes": telemetry.small_extent_threshold_bytes,
             **extra_fields,
         }
         observed_ts_ms = max(float(self._now_ms()), telemetry.complete_ts_ms)
@@ -12726,6 +13551,7 @@ class EmbeddedSGLangRuntime:
             lease_revision=liveness.lease_revision,
             grace_revision=liveness.grace_revision,
             parser_frontier_revision=action_frontier.revision,
+            admission_revision=self.controller.admission.revision,
         )
         elapsed = (
             float("inf")
@@ -12862,6 +13688,30 @@ class EmbeddedSGLangRuntime:
                 telemetry = tuple(
                     telemetry_history[self._shadow_telemetry_sequence :]
                 )
+                critical_event_kinds = {
+                    RuntimeEventKind.SPAWN,
+                    RuntimeEventKind.TOOL_START,
+                    RuntimeEventKind.TOOL_END,
+                    RuntimeEventKind.RETURN,
+                    RuntimeEventKind.JOIN_SATISFIED,
+                    RuntimeEventKind.REACTIVATE,
+                }
+                predictive_critical = any(
+                    event.kind in critical_event_kinds
+                    for event in event_delta.events
+                ) or bool(telemetry)
+                pressure_now = (
+                    observation.hbm_used_bytes
+                    >= int(
+                        observation.hbm_capacity_bytes
+                        * self.config.observed_admission_active_kv_high_watermark_ratio
+                    )
+                )
+                if pressure_now and not getattr(
+                    self, "_last_predictive_pressure_state", False
+                ):
+                    predictive_critical = True
+                self._last_predictive_pressure_state = pressure_now
                 urgent_d2h, urgent_h2d = self.controller.transfer_backlog_bytes()
                 published_observation = replace(
                     observation,
@@ -12899,11 +13749,16 @@ class EmbeddedSGLangRuntime:
                     transfer_telemetry=telemetry,
                     capabilities=self._policy_capabilities(),
                     stamp=stamp,
-                    trigger=trigger,
+                    trigger=(
+                        f"{trigger}+predictive_critical"
+                        if predictive_critical
+                        else trigger
+                    ),
                     captured_monotonic_ms=time.monotonic_ns() / 1_000_000.0,
                     frontier_predictions=dict(
                         self._last_frontier_predictions or {}
                     ),
+                    frontier_model_version=self._last_frontier_model_version,
                 )
                 submission = worker.submit_delta(delta)
             except Exception as error:
@@ -12967,6 +13822,13 @@ class EmbeddedSGLangRuntime:
                 self._last_policy_snapshot_ms = observation.ts_ms
 
         if result is None:
+            self._drain_predictive_risk_result(
+                observation,
+                current_policy_input=getattr(
+                    self, "_latest_observed_policy_input", None
+                ),
+                current_transfer_epoch=stamp.transfer_epoch,
+            )
             return
         self._last_joint_shadow_result_sequence = result.sequence
         policy_input = result.policy_input
@@ -12981,6 +13843,69 @@ class EmbeddedSGLangRuntime:
                 application_connected=self.config.joint_policy_enabled,
             )
             return
+        self._latest_observed_policy_input = policy_input
+        self._drain_predictive_risk_result(
+            observation,
+            current_policy_input=policy_input,
+            current_transfer_epoch=stamp.transfer_epoch,
+        )
+
+        predictive_worker = getattr(self, "predictive_risk_worker", None)
+        predictive_trigger = "predictive_critical" in result.trigger.split("+")
+        if (
+            predictive_worker is not None
+            and result.plan is not None
+            and predictive_trigger
+        ):
+            try:
+                predictive_submission = predictive_worker.submit(result)
+            except Exception as error:
+                self._joint_predictive_counts["submission_failed"] += 1
+                self.audit.emit(
+                    "predictive_risk_submit_failed",
+                    observation.ts_ms,
+                    source_joint_sequence=result.sequence,
+                    source_snapshot_id=policy_input.snapshot_id,
+                    error=f"{type(error).__name__}: {error}",
+                    prediction_used=False,
+                )
+            else:
+                eligibility = predictive_submission.eligibility
+                self._joint_predictive_counts["eligibility_checked"] += 1
+                if predictive_submission.enqueued:
+                    eligibility_outcome = "eligibility_enqueued"
+                elif predictive_submission.suppression_reason == (
+                    "unchanged_action_bucket"
+                ):
+                    eligibility_outcome = "eligibility_unchanged_bucket"
+                else:
+                    eligibility_outcome = "eligibility_no_candidate"
+                self._joint_predictive_counts[eligibility_outcome] += 1
+                self._joint_shadow_timing_samples.setdefault(
+                    "predictive_eligibility_ms", deque(maxlen=65_536)
+                ).append(eligibility.probe_ms)
+                self.audit.emit(
+                    "predictive_risk_eligibility",
+                    observation.ts_ms,
+                    worker_sequence=predictive_submission.sequence,
+                    source_joint_sequence=result.sequence,
+                    source_joint_plan_id=result.plan.plan_id,
+                    source_snapshot_id=policy_input.snapshot_id,
+                    eligibility_ms=eligibility.probe_ms,
+                    enqueue_ms=predictive_submission.enqueue_ms,
+                    enqueued=predictive_submission.enqueued,
+                    prefetch_target_count=len(eligibility.prefetch_targets),
+                    prepare_host_victim_count=len(
+                        eligibility.prepare_host_victims
+                    ),
+                    replaced_sequence=predictive_submission.replaced_sequence,
+                    suppression_reason=(
+                        predictive_submission.suppression_reason
+                    ),
+                    prediction_used=False,
+                )
+        elif predictive_worker is not None and result.plan is not None:
+            self._joint_predictive_counts["noncritical_trigger_skipped"] += 1
 
         sequence = 0
         trace_enqueue_ms = 0.0
@@ -13072,6 +13997,284 @@ class EmbeddedSGLangRuntime:
             coarse_stamp_reasons=extra_readset,
             current_runnable=additional_runnable,
             current_control_state=control_state,
+        )
+
+    def _drain_predictive_risk_result(
+        self,
+        observation: RuntimeResourceObservation,
+        *,
+        current_policy_input: PolicyInput | None,
+        current_transfer_epoch: int,
+    ) -> None:
+        worker = getattr(self, "predictive_risk_worker", None)
+        if worker is None:
+            return
+        result = worker.latest(
+            after_sequence=self._last_predictive_risk_result_sequence
+        )
+        if result is None:
+            return
+        self._last_predictive_risk_result_sequence = result.sequence
+        self._joint_shadow_timing_samples.setdefault(
+            "predictive_risk_queue_wait_ms", deque(maxlen=65_536)
+        ).append(result.queue_wait_ms)
+        self._joint_shadow_timing_samples.setdefault(
+            "predictive_risk_shadow_ms", deque(maxlen=65_536)
+        ).append(result.compute_ms)
+        if result.shadow is not None:
+            shadow_payload = result.shadow.to_dict()
+            self._maybe_persist_predictive_candidate_snapshot(
+                result,
+                shadow_payload,
+                observation=observation,
+            )
+            selected_action = str(shadow_payload.get("selected_action"))
+            if self.config.predictive_joint_overlay_enabled:
+                previous_intent = getattr(self, "_latest_predictive_intent", None)
+                candidate_intent = result.shadow.predictive_intent
+                publish_reasons: tuple[str, ...] = ()
+                if candidate_intent is not None:
+                    if current_policy_input is None:
+                        publish_reasons += ("current_policy_input_unavailable",)
+                    else:
+                        publish_reasons += validate_predictive_causal_certificate(
+                            candidate_intent.causal_certificate,
+                            current_policy_input.runtime_graph.state,
+                            current_model_version=(
+                                getattr(self, "_last_frontier_model_version", None)
+                                or ""
+                            ),
+                        )
+                next_intent = candidate_intent if not publish_reasons else None
+                previous_intent_id = (
+                    previous_intent.intent_id
+                    if previous_intent is not None
+                    else None
+                )
+                next_intent_id = (
+                    next_intent.intent_id if next_intent is not None else None
+                )
+                intent_changed = previous_intent_id != next_intent_id
+                self._latest_predictive_intent = next_intent
+                if (
+                    candidate_intent is not None
+                    and not publish_reasons
+                    and intent_changed
+                ):
+                    self._joint_predictive_counts["semantic_intent_published"] += 1
+                    self.audit.emit(
+                        "predictive_semantic_intent_published",
+                        observation.ts_ms,
+                        worker_sequence=result.sequence,
+                        source_joint_sequence=result.source_joint_sequence,
+                        **candidate_intent.to_dict(),
+                    )
+                elif candidate_intent is not None and publish_reasons:
+                    self._joint_predictive_counts[
+                        "semantic_intent_publish_rejected"
+                    ] += 1
+                    if previous_intent is not None:
+                        self._joint_predictive_counts[
+                            "semantic_intent_withdrawn"
+                        ] += 1
+                    for reason in publish_reasons:
+                        self._joint_predictive_counts[
+                            f"semantic_publish_reject_{reason}"
+                        ] += 1
+                    self.audit.emit(
+                        "predictive_semantic_intent_publish_rejected",
+                        observation.ts_ms,
+                        worker_sequence=result.sequence,
+                        source_joint_sequence=result.source_joint_sequence,
+                        intent_id=candidate_intent.intent_id,
+                        action=candidate_intent.action.value,
+                        context_id=candidate_intent.context_id,
+                        reasons=list(publish_reasons),
+                        fallback="observed_joint_plan",
+                    )
+                elif (
+                    candidate_intent is not None
+                    and not intent_changed
+                ):
+                    self._joint_predictive_counts[
+                        "semantic_intent_refresh_unchanged"
+                    ] += 1
+                elif previous_intent is not None:
+                    self._joint_predictive_counts["semantic_intent_withdrawn"] += 1
+                if intent_changed:
+                    # Publish, replace, or withdraw is a semantic state change.
+                    # An empty/rejected result with no prior intent must not
+                    # churn the reusable observed JointPlan.
+                    self._current_online_joint_decision = None
+                    self._last_joint_decision_plan_id = None
+            for field_name in (
+                "belief_compose_ms",
+                "candidate_generation_ms",
+                "deterministic_preflight_ms",
+                "scenario_risk_ms",
+            ):
+                self._joint_shadow_timing_samples.setdefault(
+                    f"predictive_{field_name}", deque(maxlen=65_536)
+                ).append(float(shadow_payload.get(field_name, 0.0)))
+            validation_started_ns = time.perf_counter_ns()
+            certificate_count = 0
+            fresh_count = 0
+            stale_count = 0
+            stale_reasons: Counter[str] = Counter()
+            for summary in shadow_payload.get("candidate_summaries", ()):
+                if not isinstance(summary, Mapping):
+                    continue
+                certificate = summary.get("action_certificate")
+                if not isinstance(certificate, Mapping):
+                    continue
+                certificate_count += 1
+                reasons = (
+                    validate_predictive_certificate(
+                        certificate,
+                        current_policy_input,
+                        current_transfer_epoch=current_transfer_epoch,
+                    )
+                    if current_policy_input is not None
+                    else ("current_policy_input_unavailable",)
+                )
+                if reasons:
+                    stale_count += 1
+                    stale_reasons.update(reasons)
+                else:
+                    fresh_count += 1
+            validation_ms = (
+                time.perf_counter_ns() - validation_started_ns
+            ) / 1_000_000.0
+            trigger_to_validation_ms = max(
+                0.0,
+                time.monotonic_ns() / 1_000_000.0
+                - result.submitted_monotonic_ms,
+            )
+            self._joint_shadow_timing_samples.setdefault(
+                "predictive_action_validation_ms", deque(maxlen=65_536)
+            ).append(validation_ms)
+            self._joint_shadow_timing_samples.setdefault(
+                "predictive_trigger_to_validation_ms", deque(maxlen=65_536)
+            ).append(trigger_to_validation_ms)
+            self._joint_predictive_counts[
+                "action_certificate_fresh"
+            ] += fresh_count
+            self._joint_predictive_counts[
+                "action_certificate_stale"
+            ] += stale_count
+            self._joint_predictive_counts["risk_shadow_evaluated"] += 1
+            self._joint_predictive_counts[
+                f"risk_shadow_selected_{selected_action}"
+            ] += 1
+            self.audit.emit(
+                "predictive_risk_shadow",
+                observation.ts_ms,
+                worker_sequence=result.sequence,
+                source_joint_sequence=result.source_joint_sequence,
+                queue_wait_ms=result.queue_wait_ms,
+                compute_ms=result.compute_ms,
+                eligibility_ms=result.eligibility_ms,
+                action_certificate_count=certificate_count,
+                action_certificate_fresh_count=fresh_count,
+                action_certificate_stale_count=stale_count,
+                action_certificate_stale_reasons=dict(stale_reasons),
+                action_certificate_validation_ms=validation_ms,
+                trigger_to_validation_ms=trigger_to_validation_ms,
+                observed_worker_independent=True,
+                **shadow_payload,
+            )
+        elif result.error is not None:
+            self._joint_predictive_counts["risk_shadow_failed"] += 1
+            self.audit.emit(
+                "predictive_risk_shadow_failed",
+                observation.ts_ms,
+                worker_sequence=result.sequence,
+                source_joint_sequence=result.source_joint_sequence,
+                source_snapshot_id=result.source_snapshot_id,
+                queue_wait_ms=result.queue_wait_ms,
+                compute_ms=result.compute_ms,
+                eligibility_ms=result.eligibility_ms,
+                error=result.error,
+                observed_worker_independent=True,
+                prediction_used=False,
+            )
+
+    def _maybe_persist_predictive_candidate_snapshot(
+        self,
+        result: PredictiveRiskWorkerResult,
+        shadow_payload: Mapping[str, object],
+        *,
+        observation: RuntimeResourceObservation,
+    ) -> None:
+        """Persist one exact replay point per distinct positive opportunity."""
+
+        snapshot_log = getattr(self, "policy_snapshot_log", None)
+        if snapshot_log is None or not snapshot_log.enabled:
+            return
+        summaries = shadow_payload.get("candidate_summaries", ())
+        if not isinstance(summaries, (list, tuple)):
+            return
+        signatures: list[tuple[object, ...]] = []
+        for raw in summaries:
+            if not isinstance(raw, Mapping):
+                continue
+            benefit = float(raw.get("expected_benefit_ms") or 0.0)
+            if benefit <= 0:
+                continue
+            certificate = raw.get("action_certificate")
+            if not isinstance(certificate, Mapping):
+                continue
+            action = str(raw.get("action") or "unknown")
+            target_context_id = str(
+                certificate.get("target_context_id") or "unknown"
+            )
+            required_bytes = max(
+                int(certificate.get("required_hbm_free_bytes") or 0),
+                int(certificate.get("required_host_free_bytes") or 0),
+            )
+            signatures.append(
+                (
+                    action,
+                    target_context_id,
+                    required_bytes // (16 << 20),
+                    bool(raw.get("eligible")),
+                    tuple(sorted(str(item) for item in raw.get("reasons", ()))),
+                )
+            )
+        if not signatures:
+            return
+        signature = tuple(sorted(set(signatures)))
+        seen = getattr(self, "_predictive_candidate_snapshot_signatures", None)
+        if seen is None:
+            seen = {}
+            self._predictive_candidate_snapshot_signatures = seen
+        if signature in seen:
+            self._joint_predictive_counts["candidate_snapshot_deduplicated"] += 1
+            return
+        dropped_before = snapshot_log.dropped_count
+        sequence = snapshot_log.emit(
+            result.policy_input,
+            trigger="predictive_positive_candidate",
+        )
+        if not sequence:
+            if snapshot_log.dropped_count > dropped_before:
+                self._joint_predictive_counts["candidate_snapshot_dropped"] += 1
+            return
+        seen[signature] = observation.ts_ms
+        # Bound control-plane memory without making adjacent epochs duplicate.
+        if len(seen) > 4096:
+            oldest = min(seen, key=seen.__getitem__)
+            del seen[oldest]
+        self._joint_predictive_counts["candidate_snapshot_persisted"] += 1
+        self.audit.emit(
+            "predictive_candidate_snapshot_recorded",
+            observation.ts_ms,
+            snapshot_sequence=sequence,
+            snapshot_id=result.policy_input.snapshot_id,
+            worker_sequence=result.sequence,
+            opportunity_count=len(signature),
+            trigger="predictive_positive_candidate",
+            prediction_used=False,
         )
 
     @staticmethod
@@ -13503,6 +14706,8 @@ class EmbeddedSGLangRuntime:
             self._online_joint_counts["safe_point_decision_reused"] += 1
             return cached
         commit_started_ns = time.perf_counter_ns()
+        observed_commit_ms = 0.0
+        predictive_commit_ms = 0.0
         try:
             observation = self._runtime_resource_observation(now_ms=now_ms)
             current_runnable = self._policy_runtime_runnable(now_ms)
@@ -13534,6 +14739,60 @@ class EmbeddedSGLangRuntime:
                     decision,
                     now_ms=now_ms,
                 )
+            observed_commit_ms = (
+                time.perf_counter_ns() - commit_started_ns
+            ) / 1_000_000.0
+            observed_decision = decision
+            if (
+                self.config.predictive_joint_overlay_enabled
+                and decision.view is not None
+                and self._latest_predictive_intent is not None
+            ):
+                predictive_started_ns = time.perf_counter_ns()
+                try:
+                    decision = self._physical_commit_predictive_intent(
+                        result.plan,
+                        decision,
+                        now_ms=now_ms,
+                    )
+                except Exception as predictive_error:
+                    self._current_predictive_residency_commit = None
+                    self._latest_predictive_intent = None
+                    decision = observed_decision
+                    self._joint_predictive_counts[
+                        "safe_point_validation_error"
+                    ] += 1
+                    self.audit.emit(
+                        "predictive_safe_point_fallback",
+                        now_ms,
+                        plan_id=result.plan.plan_id,
+                        error=(
+                            f"{type(predictive_error).__name__}: "
+                            f"{predictive_error}"
+                        ),
+                        fallback="observed_joint_plan",
+                    )
+                predictive_commit_ms = (
+                    time.perf_counter_ns() - predictive_started_ns
+                ) / 1_000_000.0
+                if (
+                    predictive_commit_ms
+                    > self.config.joint_physical_commit_budget_ms
+                ):
+                    self._current_predictive_residency_commit = None
+                    self._latest_predictive_intent = None
+                    decision = observed_decision
+                    self._joint_predictive_counts[
+                        "safe_point_budget_fallback"
+                    ] += 1
+                    self.audit.emit(
+                        "predictive_safe_point_fallback",
+                        now_ms,
+                        plan_id=result.plan.plan_id,
+                        elapsed_ms=predictive_commit_ms,
+                        budget_ms=self.config.joint_physical_commit_budget_ms,
+                        fallback="observed_joint_plan",
+                    )
         except Exception as error:
             self._online_joint_counts["fallback_validation_error"] += 1
             self.audit.emit(
@@ -13546,14 +14805,17 @@ class EmbeddedSGLangRuntime:
             return OnlineJointPlanDecision(None, "current_state_validation_error")
         commit_ms = (time.perf_counter_ns() - commit_started_ns) / 1_000_000.0
         self._joint_shadow_timing_samples["physical_commit_ms"].append(commit_ms)
-        if commit_ms > self.config.joint_physical_commit_budget_ms:
+        self._joint_shadow_timing_samples.setdefault(
+            "predictive_safe_point_commit_ms", deque(maxlen=65_536)
+        ).append(predictive_commit_ms)
+        if observed_commit_ms > self.config.joint_physical_commit_budget_ms:
             self._online_joint_counts["physical_commit_budget_exceeded"] += 1
             self._record_joint_decision_cache(now_ms=now_ms)
             self.audit.emit(
                 "online_joint_physical_commit_budget_exceeded",
                 now_ms,
                 plan_id=result.plan.plan_id,
-                elapsed_ms=commit_ms,
+                elapsed_ms=observed_commit_ms,
                 budget_ms=self.config.joint_physical_commit_budget_ms,
                 action="publish_safe_point_seed",
             )
@@ -13682,6 +14944,7 @@ class EmbeddedSGLangRuntime:
         if decision.view is None or decision.epoch is None:
             return decision
         self._current_semantic_residency_commit = None
+        self._current_predictive_residency_commit = None
         checked_slices: list[ActionSlice] = []
         host_available = self.controller.signals.host_free_bytes
         device_available = max(
@@ -13812,6 +15075,442 @@ class EmbeddedSGLangRuntime:
             epoch,
         )
 
+    def _physical_commit_predictive_intent(
+        self,
+        plan: Any,
+        decision: OnlineJointPlanDecision,
+        *,
+        now_ms: float,
+    ) -> OnlineJointPlanDecision:
+        """Rematerialize one non-destructive predictive intent at a safe point."""
+
+        self._current_predictive_residency_commit = None
+        intent = getattr(self, "_latest_predictive_intent", None)
+        if intent is None or decision.view is None or decision.epoch is None:
+            return decision
+
+        reasons: list[str] = []
+        observed_residency_actions = any(
+            item.action != ResidencyAction.KEEP for item in plan.residency
+        ) or bool(plan.semantic_residency)
+        if observed_residency_actions or self._current_semantic_residency_commit:
+            reasons.append("observed_residency_has_priority")
+        if getattr(self, "_pending_online_joint_residency", None) is not None:
+            reasons.append("residency_transaction_inflight")
+        if self.controller.has_pending_transfer_work():
+            reasons.append("pcie_dispatch_busy")
+        backend = getattr(self, "backend", None)
+        native_inflight_bytes = (
+            backend._native_inflight_bytes()
+            if backend is not None
+            and hasattr(backend, "_native_inflight_bytes")
+            else 0
+        )
+        if native_inflight_bytes > 0:
+            reasons.append("native_hicache_inflight")
+        if self._restore_obligation_index().active():
+            reasons.append("urgent_restore_active")
+
+        age_ms = max(0.0, now_ms - intent.generated_ts_ms)
+        remaining_ms = max(0.0, intent.remaining_window_low_ms - age_ms)
+        if age_ms > self.config.predictive_intent_max_age_ms:
+            reasons.append("intent_expired")
+        current_model_version = getattr(
+            self, "_last_frontier_model_version", None
+        )
+        if (
+            current_model_version is not None
+            and current_model_version != intent.model_version
+        ):
+            reasons.append("belief_model_version_changed")
+        causal_reasons = validate_predictive_causal_certificate(
+            intent.causal_certificate,
+            self.controller.graph.snapshot(),
+            current_model_version=current_model_version or "",
+        )
+        reasons.extend(f"causal:{reason}" for reason in causal_reasons)
+        head_support = dict(intent.prediction_head_support)
+        if any(
+            head_support.get(name) in {None, "unavailable"}
+            for name in intent.required_prediction_heads
+        ):
+            reasons.append("required_prediction_head_unavailable")
+        effective_transfer_ms = intent.transfer_p95_ms
+        live_shape_fingerprint: str | None = None
+        live_shape_changed: bool | None = None
+        live_morphology_slack_ms: float | None = None
+        current_transfer = None
+
+        context = self.controller.graph.contexts.get(intent.context_id)
+        invocation = self.controller.graph.invocations.get(intent.invocation_id)
+        if context is None:
+            reasons.append("context_missing")
+        elif context.epoch != intent.context_epoch:
+            reasons.append("context_epoch_changed")
+        if invocation is None:
+            reasons.append("invocation_missing")
+        elif invocation.context_id != intent.context_id:
+            reasons.append("invocation_context_changed")
+        elif invocation.state.value != intent.expected_invocation_state:
+            reasons.append("invocation_state_changed")
+
+        if intent.action == PredictiveActionKind.PREPARE_HOST:
+            if not self.config.predictive_prepare_host_enabled:
+                reasons.append("predictive_prepare_host_disabled")
+            prepare_limit = self.config.predictive_prepare_host_canary_limit
+            if (
+                prepare_limit > 0
+                and self._joint_predictive_counts["prepare_host_queued"]
+                >= prepare_limit
+            ):
+                reasons.append("predictive_prepare_canary_limit")
+            action = ResidencyAction.PREPARE_HOST
+        elif intent.action == PredictiveActionKind.PREFETCH_GPU:
+            action = ResidencyAction.PREFETCH_GPU
+            if not self.config.predictive_prefetch_canary_enabled:
+                reasons.append("predictive_prefetch_canary_disabled")
+            if (
+                intent.future_hbm_feasibility_probability
+                < self.config.predictive_prefetch_min_hbm_feasibility
+            ):
+                reasons.append("future_hbm_confidence")
+        else:
+            action = ResidencyAction.KEEP
+            reasons.append("destructive_predictive_action_deferred")
+
+        target = SemanticResidencyTarget(
+            context_id=intent.context_id,
+            context_epoch=intent.context_epoch,
+            action=action,
+            target_bytes_hint=intent.target_bytes_hint,
+            deadline_ms=max(
+                now_ms,
+                intent.generated_ts_ms
+                + intent.remaining_window_low_ms
+                - self.config.predictive_commit_guard_ms,
+            ),
+            reason=f"predictive_overlay:{intent.intent_id}",
+        ) if action != ResidencyAction.KEEP else None
+        command_kind = (
+            self._online_residency_command_kind(action)
+            if target is not None
+            else None
+        )
+        if command_kind is None:
+            reasons.append("no_physical_action")
+
+        preview: PhysicalBundlePreview | None = None
+        blockers: set[str] = set()
+        if not reasons and command_kind is not None and target is not None:
+            host_available = self.controller.signals.host_free_bytes
+            device_available = max(
+                0,
+                self.config.hbm_capacity_bytes
+                - self.controller.actual_hbm_used_bytes
+                - self.controller.admission.reserved_bytes,
+            )
+            expected_actions = self._online_residency_expected_page_actions(action)
+            candidates: list[PhysicalBundlePreview] = []
+            envelope_blockers: set[str] = set()
+            for candidate in (
+                self.controller.arbiter.bundle_builder.previews_for_context(
+                    command_kind,
+                    target.context_id,
+                    target.context_epoch,
+                    now_ms=now_ms,
+                    host_available_bytes=host_available,
+                    device_available_bytes=device_available,
+                )
+            ):
+                if not {
+                    item.action for item in candidate.page_actions
+                }.intersection(expected_actions):
+                    continue
+                if candidate.eligible:
+                    candidate_envelope_reasons = (
+                        _predictive_bundle_envelope_reasons(intent, candidate)
+                    )
+                    if candidate_envelope_reasons:
+                        envelope_blockers.update(candidate_envelope_reasons)
+                        continue
+                    candidates.append(candidate)
+                else:
+                    blockers.update(item.code.value for item in candidate.blockers)
+            if candidates:
+                preview = min(
+                    candidates,
+                    key=lambda item: (
+                        abs(item.copy_bytes - target.target_bytes_hint),
+                        item.bundle.cross_context_action_bytes,
+                        item.copy_bytes,
+                        item.bundle.bundle_id,
+                    ),
+                )
+            else:
+                reasons.extend(
+                    f"envelope:{item}" for item in sorted(envelope_blockers)
+                )
+                reasons.extend(f"physical:{item}" for item in sorted(blockers))
+                if not blockers and not envelope_blockers:
+                    reasons.append("physical_preview_unavailable")
+
+        if preview is not None:
+            direction = (
+                TransferDirection.H2D
+                if intent.action == PredictiveActionKind.PREFETCH_GPU
+                else TransferDirection.D2H
+            )
+            transfer_kwargs = {
+                "command_kind": (
+                    "offload_context"
+                    if intent.action == PredictiveActionKind.PREPARE_HOST
+                    else command_kind.value if command_kind is not None else ""
+                ),
+                "host_copy_state": (
+                    "present"
+                    if direction == TransferDirection.H2D
+                    else "missing"
+                ),
+                "pinned_host": True,
+                "native_concurrent_bytes": native_inflight_bytes,
+            }
+            current_transfer = self.controller.service_curve.estimate(
+                direction,
+                preview.copy_bytes,
+                page_count=len(preview.page_actions),
+                **transfer_kwargs,
+            )
+            effective_transfer_ms = max(
+                effective_transfer_ms,
+                current_transfer.estimated_completion_p90_ms,
+            )
+            if intent.action == PredictiveActionKind.PREPARE_HOST:
+                live_shape_fingerprint = _predictive_live_shape_fingerprint(
+                    self.controller.policy_snapshot_builder,
+                    preview,
+                    now_ms=now_ms,
+                )
+                live_shape_changed = (
+                    live_shape_fingerprint != intent.shape_fingerprint
+                    or len(preview.page_actions) != intent.predicted_extent_count
+                )
+                if not current_transfer.shape_supported:
+                    reasons.append("shape_unsupported_at_safe_point")
+                if (
+                    current_transfer.estimated_completion_p90_ms
+                    > intent.maximum_transfer_ms
+                ):
+                    reasons.append("shape_transfer_envelope_exceeded")
+                current_stall = current_transfer.estimated_unhidden_stall_p90_ms
+                if current_stall is None:
+                    reasons.append("shape_stall_unavailable_at_safe_point")
+                elif current_stall > intent.maximum_stall_ms:
+                    reasons.append("shape_stall_envelope_exceeded")
+                live_morphology_slack_ms = (
+                    intent.morphology_slack_ms
+                    - age_ms
+                    - max(
+                        0.0,
+                        current_transfer.estimated_completion_p90_ms
+                        - intent.transfer_p95_ms,
+                    )
+                )
+                if live_morphology_slack_ms <= 0:
+                    reasons.append("morphology_slack_expired")
+        if remaining_ms <= (
+            effective_transfer_ms + self.config.predictive_commit_guard_ms
+        ):
+            reasons.append("transfer_cannot_finish_before_low_window")
+        if (
+            intent.action == PredictiveActionKind.PREFETCH_GPU
+            and remaining_ms
+            > effective_transfer_ms
+            + self.config.predictive_prefetch_desired_lead_ms
+        ):
+            reasons.append("prefetch_too_early")
+
+        if (
+            preview is not None
+            and intent.action == PredictiveActionKind.PREFETCH_GPU
+            and preview.copy_bytes
+            > int(
+                self.config.hbm_capacity_bytes
+                * self.config.predictive_prefetch_canary_max_hbm_ratio
+            )
+        ):
+            reasons.append("prefetch_canary_hbm_cap")
+
+        if reasons or preview is None or target is None:
+            self._latest_predictive_intent = None
+            self._joint_predictive_counts["semantic_intent_rejected"] += 1
+            for reason in set(reasons):
+                self._joint_predictive_counts[f"semantic_reject_{reason}"] += 1
+            self.audit.emit(
+                "predictive_semantic_intent_rejected",
+                now_ms,
+                plan_id=plan.plan_id,
+                intent_id=intent.intent_id,
+                action=intent.action.value,
+                context_id=intent.context_id,
+                age_ms=age_ms,
+                remaining_window_low_ms=remaining_ms,
+                intent_transfer_p95_ms=intent.transfer_p95_ms,
+                safe_point_transfer_bound_ms=effective_transfer_ms,
+                predicted_extent_count=intent.predicted_extent_count,
+                live_extent_count=(
+                    len(preview.page_actions) if preview is not None else None
+                ),
+                predicted_shape_fingerprint=intent.shape_fingerprint,
+                live_shape_fingerprint=live_shape_fingerprint,
+                live_shape_changed=live_shape_changed,
+                maximum_transfer_ms=intent.maximum_transfer_ms,
+                maximum_stall_ms=intent.maximum_stall_ms,
+                live_transfer_p90_ms=(
+                    current_transfer.estimated_completion_p90_ms
+                    if current_transfer is not None
+                    else None
+                ),
+                live_stall_p90_ms=(
+                    current_transfer.estimated_unhidden_stall_p90_ms
+                    if current_transfer is not None
+                    else None
+                ),
+                live_morphology_slack_ms=live_morphology_slack_ms,
+                native_hicache_inflight_bytes=native_inflight_bytes,
+                reasons=sorted(set(reasons)),
+                physical_blockers=sorted(blockers),
+                fallback="observed_joint_plan",
+                transfer_model="extent_count_aware",
+                live_transfer_source=(
+                    current_transfer.source
+                    if current_transfer is not None
+                    else None
+                ),
+            )
+            return decision
+
+        slice_ = ActionSlice(
+            slice_id=f"predictive-residency:{intent.intent_id}",
+            kind="predictive_residency",
+            action_key=intent.context_id,
+            dependency_keys=(),
+            committed=True,
+        )
+        liveness_tracker = getattr(
+            self, "_persistent_liveness_revisions", None
+        )
+        if liveness_tracker is None:
+            liveness_tracker = PersistentLivenessRevisionTracker()
+            self._persistent_liveness_revisions = liveness_tracker
+        lease_index = getattr(self, "_restore_leases", None)
+        liveness = liveness_tracker.observe(
+            obligations=self._restore_obligation_index().all(),
+            leases=lease_index.all() if lease_index is not None else (),
+            graces=tuple(
+                getattr(self, "_restore_service_grace_by_request", {}).values()
+            ),
+        )
+        group = ActionGroup(
+            group_id=f"predictive-group:{intent.intent_id}",
+            atomicity=ActionGroupAtomicity.ALL_OR_NOTHING,
+            actions=(slice_,),
+            dependency_dag=(),
+            resource_certificate=ActionGroupResourceCertificate(
+                required_hbm_bytes=(
+                    preview.copy_bytes
+                    if action == ResidencyAction.PREFETCH_GPU
+                    else 0
+                ),
+                required_host_bytes=(
+                    preview.copy_bytes
+                    if action == ResidencyAction.PREPARE_HOST
+                    else 0
+                ),
+                planned_pcie_bytes=preview.copy_bytes,
+                topology_revision=self.controller.page_index.topology_revision,
+                allocator_revision=self.controller.page_index.revision,
+                obligation_revision=liveness.obligation_revision,
+                lease_revision=liveness.lease_revision,
+                grace_revision=liveness.grace_revision,
+                physical_generation_fingerprints=((
+                    preview.bundle.bundle_id,
+                    preview.bundle.generation_fingerprint,
+                ),),
+                restore_path_proven=True,
+                finite_future_risk_bound=(
+                    action == ResidencyAction.PREPARE_HOST
+                    or intent.future_hbm_feasibility_probability
+                    >= self.config.predictive_prefetch_min_hbm_feasibility
+                ),
+            ),
+            compensation=("discard_semantic_intent_before_dispatch",),
+            committed=True,
+            evidence_read_set=(
+                ("intent_id", intent.intent_id),
+                ("model_version", intent.model_version),
+                ("source_joint_plan_id", intent.source_joint_plan_id),
+            ),
+        )
+        epoch = replace(
+            decision.epoch,
+            action_slices=decision.epoch.action_slices + (slice_,),
+            source_action_count=decision.epoch.source_action_count + 1,
+            committed_action_count=decision.epoch.committed_action_count + 1,
+            action_groups=decision.epoch.action_groups + (group,),
+        )
+        self._current_predictive_residency_commit = _PredictiveResidencyCommit(
+            plan_id=plan.plan_id,
+            intent=intent,
+            target=target,
+            preview=preview,
+            live_shape_fingerprint=(
+                live_shape_fingerprint or "not_applicable"
+            ),
+            live_extent_count=len(preview.page_actions),
+        )
+        self._joint_predictive_counts["semantic_intent_committed"] += 1
+        self.audit.emit(
+            "predictive_semantic_intent_committed",
+            now_ms,
+            plan_id=plan.plan_id,
+            intent_id=intent.intent_id,
+            source_predictive_joint_plan_id=intent.source_joint_plan_id,
+            action=intent.action.value,
+            context_id=intent.context_id,
+            context_epoch=intent.context_epoch,
+            physical_bundle_id=preview.bundle.bundle_id,
+            physical_closure_bytes=preview.bundle.closure_bytes,
+            copy_bytes=preview.copy_bytes,
+            age_ms=age_ms,
+            remaining_window_low_ms=remaining_ms,
+            intent_transfer_p95_ms=intent.transfer_p95_ms,
+            safe_point_transfer_bound_ms=effective_transfer_ms,
+            predicted_extent_count=intent.predicted_extent_count,
+            live_extent_count=len(preview.page_actions),
+            predicted_shape_fingerprint=intent.shape_fingerprint,
+            live_shape_fingerprint=live_shape_fingerprint,
+            live_shape_changed=live_shape_changed,
+            maximum_transfer_ms=intent.maximum_transfer_ms,
+            maximum_stall_ms=intent.maximum_stall_ms,
+            live_transfer_p90_ms=(
+                current_transfer.estimated_completion_p90_ms
+                if current_transfer is not None
+                else None
+            ),
+            live_stall_p90_ms=(
+                current_transfer.estimated_unhidden_stall_p90_ms
+                if current_transfer is not None
+                else None
+            ),
+            live_morphology_slack_ms=live_morphology_slack_ms,
+            native_hicache_inflight_bytes=native_inflight_bytes,
+            transfer_model="extent_count_aware",
+            live_transfer_source=(
+                current_transfer.source if current_transfer is not None else None
+            ),
+        )
+        return OnlineJointPlanDecision(decision.view, decision.reason, epoch)
+
     def _safe_point_seed_decision(
         self, *, now_ms: float
     ) -> OnlineJointPlanDecision:
@@ -13890,6 +15589,47 @@ class EmbeddedSGLangRuntime:
             ),
             restore_requirements=restore_requirements,
         )
+        if (
+            self.config.predictive_joint_overlay_enabled
+            and decision.view is not None
+            and self._latest_predictive_intent is not None
+        ):
+            observed_decision = decision
+            predictive_started_ns = time.perf_counter_ns()
+            try:
+                decision = self._physical_commit_predictive_intent(
+                    _PredictiveOverlaySeedPlan(decision.view.plan_id),
+                    decision,
+                    now_ms=now_ms,
+                )
+            except Exception as error:
+                self._current_predictive_residency_commit = None
+                self._latest_predictive_intent = None
+                decision = observed_decision
+                self._joint_predictive_counts[
+                    "seed_safe_point_validation_error"
+                ] += 1
+                self.audit.emit(
+                    "predictive_safe_point_fallback",
+                    now_ms,
+                    plan_id=decision.view.plan_id,
+                    error=f"{type(error).__name__}: {error}",
+                    source="bounded_seed",
+                    fallback="observed_joint_plan",
+                )
+            elapsed_ms = (
+                time.perf_counter_ns() - predictive_started_ns
+            ) / 1_000_000.0
+            self._joint_shadow_timing_samples.setdefault(
+                "predictive_safe_point_commit_ms", deque(maxlen=65_536)
+            ).append(elapsed_ms)
+            if elapsed_ms > self.config.joint_physical_commit_budget_ms:
+                self._current_predictive_residency_commit = None
+                self._latest_predictive_intent = None
+                decision = observed_decision
+                self._joint_predictive_counts[
+                    "seed_safe_point_budget_fallback"
+                ] += 1
         self._current_joint_plan_epoch = decision.epoch
         self._online_joint_counts["safe_point_seed_epoch"] += 1
         return decision
@@ -14040,6 +15780,11 @@ class EmbeddedSGLangRuntime:
         if self.controller.has_pending_transfer_work():
             self._online_joint_counts["residency_wait_existing_transfer"] += 1
             return
+        if self._queue_predictive_joint_residency(
+            view.plan_id,
+            now_ms=now_ms,
+        ):
+            return
         result = self._online_joint_result
         source = self._online_joint_source
         if (
@@ -14060,6 +15805,7 @@ class EmbeddedSGLangRuntime:
                 now_ms=now_ms,
             )
             return
+
         for intent_index in self._online_residency_intent_order(view):
             intent = plan.residency[intent_index]
             if intent.action == ResidencyAction.KEEP:
@@ -14234,6 +15980,7 @@ class EmbeddedSGLangRuntime:
                 command_id=command_id,
                 command_kind=command_kind,
                 context_id=preview.context_id,
+                context_epoch=preview.context_epoch,
                 physical_bundle_id=preview.bundle.bundle_id,
                 created_ts_ms=now_ms,
             )
@@ -14257,6 +16004,147 @@ class EmbeddedSGLangRuntime:
                 copy_bytes=preview.copy_bytes,
             )
             return
+
+    def _queue_predictive_joint_residency(
+        self,
+        plan_id: str,
+        *,
+        now_ms: float,
+    ) -> bool:
+        committed = getattr(
+            self, "_current_predictive_residency_commit", None
+        )
+        if committed is None or committed.plan_id != plan_id:
+            return False
+        intent = committed.intent
+        target = committed.target
+        preview = committed.preview
+        command_kind = self._online_residency_command_kind(target.action)
+        if command_kind is None:
+            self._current_predictive_residency_commit = None
+            self._latest_predictive_intent = None
+            return True
+        self._online_joint_residency_sequence += 1
+        transaction_id = (
+            f"predictive-residency-{self._online_joint_residency_sequence}"
+        )
+        command_id = f"{transaction_id}-command"
+        command = ControlCommand(
+            command_id=command_id,
+            kind=command_kind,
+            created_ts_ms=now_ms,
+            context_id=preview.context_id,
+            context_epoch=preview.context_epoch,
+            target_bytes=preview.bundle.closure_bytes,
+            priority=4.0e9,
+            deadline_ms=target.deadline_ms,
+            queue_class=(
+                CommandQueueClass.SHADOW
+                if command_kind == CommandKind.SHADOW_CONTEXT
+                else CommandQueueClass.URGENT
+            ),
+            metadata={
+                "reason": "predictive_joint_overlay",
+                "joint_plan_id": plan_id,
+                "source_predictive_joint_plan_id": intent.source_joint_plan_id,
+                "predictive_intent_id": intent.intent_id,
+                "predictive_package_id": intent.package_id,
+                "predictive_model_version": intent.model_version,
+                "predictive_action": intent.action.value,
+                "predictive_required_heads": list(
+                    intent.required_prediction_heads
+                ),
+                "predictive_head_support": [
+                    list(item) for item in intent.prediction_head_support
+                ],
+                "predictive_remaining_window_low_ms": (
+                    intent.remaining_window_low_ms
+                ),
+                "predictive_transfer_p95_ms": intent.transfer_p95_ms,
+                "predictive_shape_fingerprint": intent.shape_fingerprint,
+                "predictive_extent_count": intent.predicted_extent_count,
+                "predictive_maximum_transfer_ms": intent.maximum_transfer_ms,
+                "predictive_maximum_stall_ms": intent.maximum_stall_ms,
+                "predictive_morphology_slack_ms": intent.morphology_slack_ms,
+                "predictive_transfer_model": "extent_count_aware",
+                "physical_bundle_scope": preview.bundle.scope.value,
+                "physical_exclusive_action_bytes": (
+                    preview.bundle.exclusive_action_bytes
+                ),
+                "physical_cross_context_action_bytes": (
+                    preview.bundle.cross_context_action_bytes
+                ),
+            },
+            physical_bundle=preview.intent(),
+        )
+        enqueue_outcome = self.controller.enqueue_control_command(command)
+        if enqueue_outcome.status != EnqueueStatus.ENQUEUED:
+            self._joint_predictive_counts["dispatch_conflict"] += 1
+            self.audit.emit(
+                "predictive_joint_residency_dispatch_rejected",
+                now_ms,
+                plan_id=plan_id,
+                intent_id=intent.intent_id,
+                context_id=intent.context_id,
+                enqueue_status=enqueue_outcome.status.value,
+                fallback="observed_joint_plan_next_epoch",
+            )
+            self._current_predictive_residency_commit = None
+            self._latest_predictive_intent = None
+            return True
+        transaction = _OnlineJointResidencyTransaction(
+            transaction_id=transaction_id,
+            plan_id=plan_id,
+            intent_index=-1,
+            source_bundle_id=f"predictive:{intent.intent_id}",
+            action=target.action,
+            command_id=command_id,
+            command_kind=command_kind,
+            context_id=preview.context_id,
+            context_epoch=preview.context_epoch,
+            physical_bundle_id=preview.bundle.bundle_id,
+            created_ts_ms=now_ms,
+            predictive_intent_id=intent.intent_id,
+        )
+        self._pending_online_joint_residency = transaction
+        self._online_joint_residency_history.append(transaction)
+        self._joint_predictive_counts["residency_queued"] += 1
+        if intent.action == PredictiveActionKind.PREPARE_HOST:
+            self._joint_predictive_counts["prepare_host_queued"] += 1
+        self._predictive_action_ledger().register(
+            intent_id=intent.intent_id,
+            action=intent.action.value,
+            context_id=preview.context_id,
+            context_epoch=preview.context_epoch,
+            command_id=command_id,
+            now_ms=now_ms,
+        )
+        self.audit.emit(
+            "online_joint_residency_queued",
+            now_ms,
+            transaction_id=transaction_id,
+            plan_id=plan_id,
+            intent_index=-1,
+            intent_kind="predictive_semantic_target",
+            predictive_intent_id=intent.intent_id,
+            source_predictive_joint_plan_id=intent.source_joint_plan_id,
+            action=target.action.value,
+            command_id=command_id,
+            command_kind=command_kind.value,
+            context_id=preview.context_id,
+            physical_bundle_id=preview.bundle.bundle_id,
+            physical_closure_bytes=preview.bundle.closure_bytes,
+            copy_bytes=preview.copy_bytes,
+            predicted_extent_count=intent.predicted_extent_count,
+            live_extent_count=committed.live_extent_count,
+            predicted_shape_fingerprint=intent.shape_fingerprint,
+            live_shape_fingerprint=committed.live_shape_fingerprint,
+            source_joint_plan_id=plan_id,
+            transfer_model="extent_count_aware",
+        )
+        self._current_predictive_residency_commit = None
+        self._latest_predictive_intent = None
+        return True
 
     def _queue_semantic_joint_residency(
         self,
@@ -14343,6 +16231,7 @@ class EmbeddedSGLangRuntime:
             command_id=command_id,
             command_kind=command_kind,
             context_id=preview.context_id,
+            context_epoch=preview.context_epoch,
             physical_bundle_id=preview.bundle.bundle_id,
             created_ts_ms=now_ms,
         )
@@ -14400,6 +16289,24 @@ class EmbeddedSGLangRuntime:
             self._online_joint_counts[
                 f"residency_{ack.status.value}"
             ] += 1
+        if transaction.predictive_intent_id is not None:
+            self._predictive_action_ledger().transfer_terminal(
+                transaction.predictive_intent_id,
+                completed=ack.status == CommandStatus.COMPLETED,
+                actual_bytes=ack.actual_bytes,
+                now_ms=now_ms,
+                reason=ack.reason,
+            )
+        elif (
+            transaction.action == ResidencyAction.COMMIT_CPU
+            and ack.status == CommandStatus.COMPLETED
+        ):
+            self._predictive_action_ledger().consume_context(
+                transaction.context_id,
+                context_epoch=transaction.context_epoch,
+                now_ms=now_ms,
+                reason="observed_pressure_commit",
+            )
         self.audit.emit(
             "online_joint_residency_terminal",
             now_ms,
@@ -14410,6 +16317,7 @@ class EmbeddedSGLangRuntime:
             command_id=transaction.command_id,
             command_kind=transaction.command_kind.value,
             source_bundle_id=transaction.source_bundle_id,
+            predictive_intent_id=transaction.predictive_intent_id,
             physical_bundle_id=transaction.physical_bundle_id,
             context_id=transaction.context_id,
             status=ack.status.value,
@@ -14445,6 +16353,7 @@ class EmbeddedSGLangRuntime:
         self._current_online_joint_decision = None
         self._current_joint_plan_epoch = None
         self._current_semantic_residency_commit = None
+        self._current_predictive_residency_commit = None
         self._online_joint_counts[f"invalidated_{reason}"] += 1
         if emit:
             self.audit.emit(
@@ -14929,7 +16838,7 @@ class EmbeddedSGLangRuntime:
     ) -> tuple[RunnableInvocation, ...]:
         result: dict[str, RunnableInvocation] = {}
         frontier_predictions: dict[str, Any] = {}
-        if getattr(self.config, "joint_predictive_enabled", False):
+        if getattr(self.config, "predictive_risk_shadow_enabled", False):
             predictor = getattr(self.controller, "predictor", None)
             if (
                 predictor is not None
@@ -14954,15 +16863,19 @@ class EmbeddedSGLangRuntime:
                     # critical path; fall back to observed-only planning.
                     frontier_predictions = {}
         self._last_frontier_predictions = {
-            invocation_id: {
-                "remaining_decode_tokens_p50": prediction.remaining_decode_tokens.quantile(0.5),
-                "remaining_external_wait_ms_p50": prediction.remaining_external_wait.quantile(0.5),
-                "next_output_tokens_p50": prediction.next_output_tokens.quantile(0.5),
-                "support_level": prediction.support_level,
-                "ood_reasons": tuple(prediction.ood_reasons),
-            }
+            invocation_id: prediction.to_dict()
             for invocation_id, prediction in frontier_predictions.items()
         }
+        frontier_model = getattr(
+            getattr(self.controller, "predictor", None),
+            "frontier_model",
+            None,
+        )
+        self._last_frontier_model_version = (
+            str(frontier_model.model_version)
+            if frontier_model is not None and frontier_predictions
+            else None
+        )
         raw_waiting_queue = getattr(self.scheduler, "waiting_queue", None)
         waiting_queue = (
             tuple(raw_waiting_queue) if raw_waiting_queue is not None else ()

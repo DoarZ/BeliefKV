@@ -212,6 +212,7 @@ class ExternalProgressToken:
     command_ownership_epoch: tuple[object, ...]
     guard_generation: int
     native_load_generation: tuple[object, ...]
+    restore_lease_epoch: tuple[object, ...] = ()
 
     def __post_init__(self) -> None:
         if self.guard_generation < 0:

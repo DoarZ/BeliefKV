@@ -45,6 +45,8 @@ class BeliefKVConfig:
     resource_telemetry_interval_ms: float = 50.0
     service_curve_window: int = 256
     service_curve_min_samples: int = 8
+    transfer_service_model_path: str | None = None
+    transfer_service_hardware_key: str | None = None
     queue_service_observer_enabled: bool = False
     queue_service_observer_include_runtime_batches: bool = False
     queue_service_observer_max_samples: int = 65_536
@@ -66,7 +68,26 @@ class BeliefKVConfig:
     joint_policy_enabled: bool = False
     joint_policy_shadow_mode: bool = True
     joint_observed_mode_enabled: bool = True
+    # Deprecated compatibility flag. Frontier predictions never modify the P5
+    # observed planner; predictive actions are evaluated by the read-only P6
+    # risk shadow path below.
     joint_predictive_enabled: bool = False
+    predictive_risk_shadow_enabled: bool = False
+    predictive_joint_overlay_enabled: bool = False
+    predictive_prepare_host_enabled: bool = True
+    predictive_prepare_host_canary_limit: int = 0
+    predictive_prefetch_canary_enabled: bool = False
+    predictive_prefetch_canary_max_inflight: int = 1
+    predictive_prefetch_canary_max_hbm_ratio: float = 0.05
+    predictive_prefetch_min_hbm_feasibility: float = 0.95
+    predictive_commit_guard_ms: float = 25.0
+    predictive_prefetch_desired_lead_ms: float = 100.0
+    predictive_intent_max_age_ms: float = 60_000.0
+    gpu_service_model_path: str | None = None
+    predictive_risk_particle_count: int = 128
+    predictive_risk_top_k: int = 8
+    predictive_risk_max_candidates: int = 8
+    predictive_risk_min_calibration_coverage: float = 0.9
     observed_admission_scheduling_enabled: bool = False
     observed_admission_active_kv_high_watermark_ratio: float = 0.8
     observed_admission_min_active_requests: int = 1
@@ -78,6 +99,8 @@ class BeliefKVConfig:
     running_batch_retraction_max_per_request: int = 3
     running_batch_retraction_transaction_timeout_ms: float = 5000.0
     running_batch_retraction_allow_recompute_drop: bool = False
+    frontier_aware_retraction_shadow_enabled: bool = False
+    frontier_aware_retraction_canary_limit: int = 0
     restore_obligation_max_active: int = 8
     restore_obligation_escalation_ms: float = 2000.0
     restore_obligation_max_blocked_ms: float = 30_000.0
@@ -92,6 +115,7 @@ class BeliefKVConfig:
         "restore-micro-gate:replacement"
     )
     restore_micro_gate_min_private_bytes: int = 64 * 1024 * 1024
+    workload_subagent_fanout_profile: str = "natural"
     fairness_lag_budget_ms: float = 50.0
     residency_hysteresis_ms: float = 100.0
     joint_emergency_hbm_ratio: float = 0.98
@@ -169,12 +193,79 @@ class BeliefKVConfig:
             raise ValueError(
                 "service_curve_min_samples must be within the service curve window"
             )
+        for field_name in (
+            "transfer_service_model_path",
+            "transfer_service_hardware_key",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"{field_name} must be a non-empty string or null")
         if self.queue_service_observer_max_samples <= 0:
             raise ValueError("queue_service_observer_max_samples must be positive")
         if self.request_token_trace_path is not None and not isinstance(
             self.request_token_trace_path, str
         ):
             raise ValueError("request_token_trace_path must be a string or null")
+        if self.gpu_service_model_path is not None and not isinstance(
+            self.gpu_service_model_path, str
+        ):
+            raise ValueError("gpu_service_model_path must be a string or null")
+        if min(
+            self.predictive_risk_particle_count,
+            self.predictive_risk_top_k,
+            self.predictive_risk_max_candidates,
+        ) <= 0:
+            raise ValueError("predictive risk limits must be positive")
+        if self.predictive_risk_top_k > self.predictive_risk_particle_count:
+            raise ValueError("predictive risk top_k cannot exceed particle count")
+        if not 0 <= self.predictive_risk_min_calibration_coverage <= 1:
+            raise ValueError(
+                "predictive_risk_min_calibration_coverage must be in [0, 1]"
+            )
+        if self.predictive_risk_shadow_enabled and not self.predictor_model_path:
+            raise ValueError(
+                "predictive risk shadow requires predictor_model_path"
+            )
+        if self.predictive_risk_shadow_enabled and not self.gpu_service_model_path:
+            raise ValueError(
+                "predictive risk shadow requires gpu_service_model_path"
+            )
+        if self.predictive_joint_overlay_enabled and not (
+            self.joint_policy_enabled and self.predictive_risk_shadow_enabled
+        ):
+            raise ValueError(
+                "predictive JointPlan overlay requires online observed JointPlan "
+                "and predictive risk planning"
+            )
+        if (
+            self.predictive_prefetch_canary_enabled
+            and not self.predictive_joint_overlay_enabled
+        ):
+            raise ValueError(
+                "predictive prefetch canary requires predictive JointPlan overlay"
+            )
+        if self.predictive_prepare_host_canary_limit < 0:
+            raise ValueError("predictive prepare canary limit must be non-negative")
+        if self.predictive_prefetch_canary_max_inflight != 1:
+            raise ValueError(
+                "the first predictive prefetch canary supports exactly one inflight action"
+            )
+        if not 0 < self.predictive_prefetch_canary_max_hbm_ratio <= 0.05:
+            raise ValueError(
+                "predictive prefetch canary may consume at most 5% of the KV pool"
+            )
+        if not 0 <= self.predictive_prefetch_min_hbm_feasibility <= 1:
+            raise ValueError("predictive prefetch HBM feasibility must be in [0, 1]")
+        for field_name in (
+            "predictive_commit_guard_ms",
+            "predictive_prefetch_desired_lead_ms",
+            "predictive_intent_max_age_ms",
+        ):
+            value = float(getattr(self, field_name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{field_name} must be finite and non-negative")
+        if self.predictive_intent_max_age_ms <= 0:
+            raise ValueError("predictive intent max age must be positive")
         if self.transfer_retry_max_same_snapshot_attempts <= 0:
             raise ValueError(
                 "transfer_retry_max_same_snapshot_attempts must be positive"
@@ -274,6 +365,25 @@ class BeliefKVConfig:
             raise ValueError("minimum retraction reclaim bytes must be positive")
         if self.running_batch_retraction_max_per_request <= 0:
             raise ValueError("maximum retractions per request must be positive")
+        if self.frontier_aware_retraction_canary_limit < 0:
+            raise ValueError("frontier retraction canary limit must be non-negative")
+        if (
+            self.frontier_aware_retraction_shadow_enabled
+            or self.frontier_aware_retraction_canary_limit > 0
+        ) and not (
+            self.running_batch_retraction_enabled
+            and self.predictive_risk_shadow_enabled
+            and self.predictor_model_path
+        ):
+            raise ValueError(
+                "frontier-aware retraction requires running retraction and a "
+                "configured FrontierBelief predictor"
+            )
+        if self.workload_subagent_fanout_profile not in {
+            "natural",
+            "parallel_analysis_2to3",
+        }:
+            raise ValueError("unsupported workload subagent fan-out profile")
         if self.restore_obligation_max_active <= 0:
             raise ValueError("maximum active restore obligations must be positive")
         if self.restore_lease_max_active <= 0:

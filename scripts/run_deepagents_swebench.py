@@ -63,6 +63,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--instance", action="append", default=[])
     parser.add_argument("--max-workflows", type=int, default=4)
     parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--workflow-arrival-interval-ms", type=float, default=0.0)
+    parser.add_argument(
+        "--subagent-fanout-profile",
+        choices=("natural", "parallel_analysis_2to3"),
+        default="natural",
+    )
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--pool-tokens", type=int, default=163_840)
     parser.add_argument("--max-completion-tokens", type=int, default=2048)
@@ -101,10 +107,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--sandbox-preflight-command",
-        default=SYMPY_SANDBOX_PREFLIGHT,
-        help="Offline command that must pass before any model request is issued",
+        default=None,
+        help=(
+            "Optional repository-specific sandbox preflight. Generic runs only "
+            "verify the workspace and testbed Python; specialized dependency "
+            "checks must come from the workload manifest or this flag."
+        ),
     )
     parser.add_argument("--completion-repair-attempts", type=int, default=2)
+    parser.add_argument(
+        "--disable-completion-gate",
+        action="store_true",
+        help=(
+            "Treat a normal model/runtime terminal result as a completed workflow "
+            "without applying the local SWE correctness protocol."
+        ),
+    )
     parser.add_argument(
         "--gate",
         choices=("system", "native", "task-correctness"),
@@ -149,15 +167,18 @@ def main() -> int:
         instance_ids=tuple(args.instance),
         max_workflows=args.max_workflows,
         concurrency=args.concurrency,
+        workflow_arrival_interval_ms=args.workflow_arrival_interval_ms,
         gpu_index=args.gpu,
         pool_tokens=args.pool_tokens,
         max_completion_tokens=args.max_completion_tokens,
         sampling_seed=args.sampling_seed,
+        subagent_fanout_profile=args.subagent_fanout_profile,
         recursion_limit=args.recursion_limit,
         request_timeout_s=args.request_timeout,
         sandbox_command_timeout_s=args.sandbox_command_timeout,
         sandbox_test_env_path=args.sandbox_test_env,
         sandbox_preflight_command=args.sandbox_preflight_command or None,
+        completion_gate_enabled=not args.disable_completion_gate,
         completion_repair_attempts=args.completion_repair_attempts,
         context_lifecycle=ContextLifecyclePolicy(
             window_tokens=args.context_window_tokens,

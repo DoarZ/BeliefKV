@@ -1,0 +1,94 @@
+{
+  "artifacts": {
+    "gpu_service": {
+      "model_version": null,
+      "path": "/home/longhao/experiment/BeliefKV/experiments/models/gpu_service_curve_cluster_cal_qwen3coder30b_rtx6000ada_20260804T060824Z.json",
+      "schema_version": 3,
+      "sha256": "fe9aae3706de3df3d634824a3268ea97689cdb3662b10265caa28ce7ee338af7"
+    },
+    "predictor": {
+      "model_version": "p6-mvp-v6",
+      "path": "/home/longhao/experiment/BeliefKV/experiments/models/frontier_belief_mvp_v6_calibrated_dev.json",
+      "schema_version": 2,
+      "sha256": "51a50b896ab63668551eeefd876c5ea866470b3c34a0f8a53860d3a91d43e456"
+    },
+    "transfer_service": {
+      "model_version": null,
+      "path": "/home/longhao/experiment/BeliefKV/experiments/models/transfer_service_morphology_gpu0_dev_v2.json",
+      "schema_version": 2,
+      "sha256": "0d908fa9774f78b620816ca4a45394bb23d47b73297e87cd6c9bd224efa7db17"
+    }
+  },
+  "collection": {
+    "arrival_policy": "single_frozen_batch_concurrency_8",
+    "batch_id": "p6-016-train-mixed-r0",
+    "concurrency": 8,
+    "instance_ids": [
+      "pydata__xarray-3095",
+      "pydata__xarray-3677",
+      "pydata__xarray-3993",
+      "pydata__xarray-6461",
+      "pydata__xarray-6599",
+      "pydata__xarray-6721",
+      "pydata__xarray-6744",
+      "pydata__xarray-6938"
+    ],
+    "plan_path": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/collection_plan.json",
+    "plan_sha256": "d5f3c6364e3b49960c8680a59a8d95a9220d7e69f96e2a22ec1c90c03aab8a6e",
+    "projects": [
+      "pydata/xarray"
+    ],
+    "rollout_index": [
+      0
+    ],
+    "split": "train",
+    "workflow_count": 8,
+    "workload_manifest_path": "/home/longhao/experiment/BeliefKV/configs/p6/collection_v4/workload_manifests/p6-016-train-mixed-r0.json",
+    "workload_manifest_sha256": "851f5ea53568c03346cc8922b4c07b5c959576e74905aaf2030ca49746909dce"
+  },
+  "frozen": true,
+  "manifest_payload_sha256": "d160fd40cf609ff8c082d91fa0bba9adc56707280b375e20b8468ac2707b418f",
+  "predictor_fit_projects": [
+    "django/django",
+    "mwaskom/seaborn",
+    "pallets/flask",
+    "psf/requests",
+    "pylint-dev/pylint",
+    "pytest-dev/pytest"
+  ],
+  "risk_policy": {
+    "commit_guard_ms": 25.0,
+    "max_candidates": 8,
+    "min_calibration_coverage": 0.9,
+    "particle_count": 128,
+    "prefetch_desired_lead_ms": 100.0,
+    "prefetch_min_hbm_feasibility": 0.95,
+    "prepare_host_enabled": true,
+    "top_k": 8
+  },
+  "runtime_policy": {
+    "context_length": 262144,
+    "gpu_index": 0,
+    "host_cache_gib": 96,
+    "joint_workflow_active_window": 8,
+    "max_running_requests": 16,
+    "mode": "p5_observed_plus_p6_read_only_risk_shadow",
+    "pool_tokens": 163840,
+    "port": 18000,
+    "predictive_actions_enabled": false
+  },
+  "runtime_source_fingerprint": {
+    "algorithm": "sha256(path\\0sha256(content))",
+    "digest": "b173cf830a3f07bcc61e9377f63c8c7730e6a078be6d4a587111a77f874937b1",
+    "file_count": 171
+  },
+  "schema_version": 1,
+  "selection_contract": {
+    "adaptive_trace_selection": false,
+    "decision_rule": "report every paired candidate; do not add tasks after observing promotion, veto, or selected-action outcomes",
+    "predeclared_task_batch": true,
+    "sealed_test_id_opened": false
+  },
+  "study_id": "p6-decision-relevance-xarray-v1",
+  "target_project_overlap_with_predictor_fit_projects": []
+}
